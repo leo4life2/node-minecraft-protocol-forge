@@ -5,15 +5,17 @@ const mineflayer = require('mineflayer')
 const pathfinder = require('mineflayer-pathfinder')
 const autoVersionForge = require('../../src/client/autoVersionForge')
 
-const host = "server's IP"
-const port = "server's port"
-const username = "bot's username"
+// const host = "localhost"
+const host = "192.168.50.131"
+const port = "5555"
+const username = "create_test"
 
 const bot = mineflayer.createBot({
-  version: false,
+  version: '1.20.1',
   host,
   port,
-  username
+  username,
+  skipValidation: true
 })
 
 // leave options empty for guessing, otherwise specify the mods,
@@ -32,9 +34,17 @@ console.info('Started mineflayer')
 
 // set up logging
 bot.on('connect', function () {
-  console.info('connected')
+  console.info('I connected')
 })
 
 bot.on('spawn', function () {
   console.info('I spawned')
+})
+
+bot.on('kicked', (reason, loggedIn) => {
+  console.error(`I was kicked for ${JSON.stringify(reason, null, 2)} while ${loggedIn ? 'logged in' : 'not logged in'}`)
+})
+
+bot.on('error', (err) => {
+  console.error('An error occurred:', err)
 })
