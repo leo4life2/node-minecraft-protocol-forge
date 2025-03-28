@@ -56,6 +56,8 @@ module.exports = function (client, options) {
       return // not ours
     }
 
+    return; // Shit's broken for 1.18+ rn, fuck.
+
     // For 1.18+, the mod list and channel list are compressed in forgeData["d"]
     const encodedData = response.forgeData.d;
     
