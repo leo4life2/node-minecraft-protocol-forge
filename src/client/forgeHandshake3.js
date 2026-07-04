@@ -1,265 +1,269 @@
-const ProtoDef = require('protodef').ProtoDef
 const debug = require('debug')('minecraft-protocol-forge')
 
-// Channels
-const FML_CHANNELS = {
-  LOGINWRAPPER: 'fml:loginwrapper',
-  HANDSHAKE: 'fml:handshake'
+// FML3 login handshake (Forge for Minecraft 1.18 - 1.20.1, fmlNetworkVersion 3).
+//
+// The server drives the handshake through vanilla login_plugin_request packets on
+// the 'fml:loginwrapper' channel. Each wrapped payload is an 'fml:handshake'
+// message: a one-byte discriminator followed by the message body
+// (net.minecraftforge.network.HandshakeMessages):
+//
+//   1  S2CModList            -> reply 2 C2SModListReply (mirror mods/channels/registries)
+//   3  S2CRegistry           -> reply 99 C2SAcknowledge
+//   4  S2CConfigData         -> reply 99 C2SAcknowledge
+//   5  S2CModData            -> informational (server expects no specific reply)
+//   6  S2CChannelMismatchData-> only sent while rejecting us
+//   99 C2SAcknowledge        -> clientbound never
+//
+// We never apply registry/config payloads - we only acknowledge them so the login
+// completes. Message bodies other than ModList are deliberately not parsed: their
+// exact layout has changed between Forge versions (e.g. registry snapshots) and
+// parsing them is not needed to get through the handshake.
+
+const DISCRIMINATOR = {
+  MOD_LIST: 1,
+  MOD_LIST_REPLY: 2,
+  SERVER_REGISTRY: 3,
+  ACKNOWLEDGEMENT: 99
 }
 
-const PROTODEF_TYPES = {
-  LOGINWRAPPER: 'fml_loginwrapper',
-  HANDSHAKE: 'fml_handshake'
+// Forge registries whose id->name snapshot is worth keeping so the bot can name
+// modded content the vanilla protocol reports as `unknown`. Maps the on-wire
+// registry name to the short key stashed on client.forgeRegistries.
+const SNAPSHOT_REGISTRIES = {
+  'minecraft:item': 'item',
+  'minecraft:block': 'block',
+  'minecraft:entity_type': 'entity_type'
 }
 
-// Initialize Proto
-const proto = new ProtoDef(false)
+// --- FriendlyByteBuf-compatible primitives ---
 
-// copied from ../../dist/transforms/serializer.js
-proto.addType('string', [
-  'pstring',
-  {
-    countType: 'varint'
+function readVarInt (buffer, offset) {
+  let result = 0
+  let bytesRead = 0
+  let currentByte
+  do {
+    if (offset + bytesRead >= buffer.length) throw new Error(`buffer ended while reading VarInt at ${offset}`)
+    currentByte = buffer[offset + bytesRead]
+    result |= (currentByte & 0x7F) << (7 * bytesRead)
+    bytesRead++
+    if (bytesRead > 5) throw new Error('VarInt too big')
+  } while ((currentByte & 0x80) !== 0)
+  return { value: result, size: bytesRead }
+}
+
+function writeVarInt (value) {
+  const bytes = []
+  do {
+    let b = value & 0x7F
+    value >>>= 7
+    if (value !== 0) b |= 0x80
+    bytes.push(b)
+  } while (value !== 0)
+  return Buffer.from(bytes)
+}
+
+function readString (buffer, offset) {
+  const len = readVarInt(buffer, offset)
+  const start = offset + len.size
+  if (start + len.value > buffer.length) throw new Error(`buffer ended while reading string at ${offset}`)
+  return { value: buffer.toString('utf8', start, start + len.value), size: len.size + len.value }
+}
+
+function writeString (str) {
+  const utf8 = Buffer.from(str, 'utf8')
+  return Buffer.concat([writeVarInt(utf8.length), utf8])
+}
+
+// --- fml:loginwrapper framing: string channel + varint-length-prefixed payload ---
+
+function parseLoginWrapper (buffer) {
+  let offset = 0
+  const channel = readString(buffer, offset)
+  offset += channel.size
+  const len = readVarInt(buffer, offset)
+  offset += len.size
+  return { channel: channel.value, data: buffer.slice(offset, offset + len.value) }
+}
+
+function wrapLoginPayload (channel, payload) {
+  return Buffer.concat([writeString(channel), writeVarInt(payload.length), payload])
+}
+
+// --- fml:handshake messages ---
+
+// S2CModList: mods (string list), channels (name+version pairs), registries
+// (name list) and, on 1.19+, dataPackRegistries (name list). The trailing field
+// is parsed only if bytes remain, so both layouts work.
+function parseModList (buffer, offset) {
+  const readList = (reader) => {
+    const count = readVarInt(buffer, offset)
+    offset += count.size
+    const out = []
+    for (let i = 0; i < count.value; i++) out.push(reader())
+    return out
   }
-])
+  const readStr = () => {
+    const s = readString(buffer, offset)
+    offset += s.size
+    return s.value
+  }
 
-// copied from node-minecraft-protocol
-proto.addTypes({
-  restBuffer: [
-    (buffer, offset) => {
-      return {
-        value: buffer.slice(offset),
-        size: buffer.length - offset
-      }
-    },
-    (value, buffer, offset) => {
-      value.copy(buffer, offset)
-      return offset + value.length
-    },
-    (value) => {
-      return value.length
-    }
-  ]
-})
+  const mods = readList(readStr)
+  const channels = readList(() => {
+    const name = readStr()
+    const marker = readStr()
+    return { name, marker }
+  })
+  const registries = readList(readStr)
+  const dataPackRegistries = offset < buffer.length ? readList(readStr) : []
+  return { mods, channels, registries, dataPackRegistries }
+}
 
-proto.addProtocol(require('./data/fml3.json'), ['fml3'])
+function encodeModListReply (reply) {
+  const parts = [writeVarInt(DISCRIMINATOR.MOD_LIST_REPLY)]
+  parts.push(writeVarInt(reply.mods.length))
+  for (const mod of reply.mods) parts.push(writeString(mod))
+  parts.push(writeVarInt(reply.channels.length))
+  for (const channel of reply.channels) {
+    parts.push(writeString(channel.name), writeString(channel.marker))
+  }
+  parts.push(writeVarInt(reply.registries.length))
+  for (const registry of reply.registries) {
+    parts.push(writeString(registry.name), writeString(registry.marker))
+  }
+  return Buffer.concat(parts)
+}
+
+function encodeAcknowledgement () {
+  return writeVarInt(DISCRIMINATOR.ACKNOWLEDGEMENT)
+}
+
+// S2CRegistry (disc 3) body: registryName (string), hasSnapshot (bool), then a
+// ForgeRegistry.Snapshot. Only the leading `ids` map (varint count, then
+// count x (string name, varint id)) is read - that's enough to name modded
+// content; the trailing aliases/overrides/blocked lists are not needed. (There
+// is no `dummied` field on the wire, despite older protodef schemas.) The
+// parsed id->name Map is stashed on client.forgeRegistries[key]. Best-effort:
+// callers wrap this so a parse failure just falls through to a plain ack.
+function parseServerRegistry (client, buffer, offset) {
+  const name = readString(buffer, offset)
+  offset += name.size
+  const key = SNAPSHOT_REGISTRIES[name.value]
+  if (!key) return // not a registry we name from
+  const hasSnapshot = buffer[offset] !== 0
+  offset += 1
+  if (!hasSnapshot) return
+
+  const count = readVarInt(buffer, offset)
+  offset += count.size
+  const ids = new Map()
+  for (let i = 0; i < count.value; i++) {
+    const entryName = readString(buffer, offset)
+    offset += entryName.size
+    const id = readVarInt(buffer, offset)
+    offset += id.size
+    ids.set(id.value, entryName.value)
+  }
+  client.forgeRegistries = client.forgeRegistries || {}
+  client.forgeRegistries[key] = ids
+  debug(`parsed ${name.value} registry snapshot: ${ids.size} ids`)
+}
 
 /**
- * FML3 handshake to the server.
- * ! There is no wiki for it.
+ * Installs the FML3 handshake responder on a connecting client, so a modless
+ * protocol client can log into a Forge 1.18-1.20.1 server by mirroring the
+ * server's own mod list back at it.
+ *
  * @param {import('minecraft-protocol').Client} client client that is connecting to the server.
  * @param {{
- *  forgeMods: Array.<string> | undefined,
- *  channels: Object.<string, string> | undefined,
- *  registries: Object.<string, string> | undefined
+ *  forgeMods: Array.<string> | undefined,      // override mod ids sent in the reply
+ *  channels: Object.<string, string> | undefined,  // override channel name -> version
+ *  registries: Object.<string, string> | undefined, // override registry name -> marker
+ *  pingModVersions: Object.<string, string> | undefined // mod id -> version, for the forgeMods event
  * }} options
  */
 module.exports = function (client, options) {
-  const modNames = options.forgeMods
-  const channels = options.channels
-  const registries = options.registries
+  options = options || {}
 
-  // passed to src/client/setProtocol.js, signifies client supports FML2/Forge
+  // passed to src/client/setProtocol.js; marks the connection as a Forge FML3
+  // client in the set_protocol server address field
   client.tagHost = '\0FML3\0'
-  debug('initialized FML3 handler')
-  if (!modNames) {
-    debug("trying to guess modNames by reflecting the servers'")
-  } else {
-    debug('modNames:', modNames)
-  }
-  if (!channels) {
-    debug("trying to guess channels by reflecting the servers'")
-  } else {
-    Object.entries(channels).forEach((name, marker) => {
-      debug('channel', name, marker)
-    })
-  }
-  if (!registries) {
-    debug("trying to guess registries by reflecting the servers'")
-  } else {
-    Object.entries(registries).forEach((name, marker) => {
-      debug('registry', name, marker)
-    })
+  debug('FML3 handshake handler installed')
+
+  // remove nmp's default login_plugin_request listener, which would answer
+  // everything with "not understood" and get us kicked
+  const nmpListener = client.listeners('login_plugin_request').find((fn) => fn.name === 'onLoginPluginRequest')
+  if (nmpListener) client.removeListener('login_plugin_request', nmpListener)
+
+  function respond (messageId, data) {
+    client.write('login_plugin_response', { messageId, data })
   }
 
-  client.registerChannel('fml:loginwrapper', proto.types.fml_loginwrapper, false)
+  client.on('login_plugin_request', (packet) => {
+    if (packet.channel !== 'fml:loginwrapper') {
+      // a mod talking on its own raw login channel; we can't speak it, so give
+      // the vanilla "not understood" response
+      debug(`unknown login channel ${packet.channel}, replying not-understood`)
+      client.write('login_plugin_response', { messageId: packet.messageId })
+      return
+    }
 
-  // remove default login_plugin_request listener which would answer with an empty packet
-  // and make the server disconnect us
-  const nmplistener = client.listeners('login_plugin_request').find((fn) => fn.name === 'onLoginPluginRequest')
-  client.removeListener('login_plugin_request', nmplistener)
+    try {
+      const wrapper = parseLoginWrapper(packet.data)
+      const disc = readVarInt(wrapper.data, 0)
 
-  client.on('login_plugin_request', (data) => {
-    if (data.channel === 'fml:loginwrapper') {
-      // parse buffer
-      const { data: loginwrapper } = proto.parsePacketBuffer(
-        PROTODEF_TYPES.LOGINWRAPPER,
-        data.data
-      )
+      if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.MOD_LIST) {
+        const modList = parseModList(wrapper.data, disc.size)
+        debug(`server ModList: ${modList.mods.length} mods, ${modList.channels.length} channels, ${modList.registries.length} registries`)
+        client.forgeModList = modList
 
-      if (!loginwrapper.channel) {
-        console.error(loginwrapper)
-      }
+        const pingVersions = options.pingModVersions || {}
+        client.emit('forgeMods', modList.mods.map((id) =>
+          pingVersions[id] ? { modid: id, version: pingVersions[id] } : id
+        ))
 
-      switch (loginwrapper.channel) {
-        case 'fml:handshake': {
-          const { data: handshake } = proto.parsePacketBuffer(
-            PROTODEF_TYPES.HANDSHAKE,
-            loginwrapper.data
-          )
-
-          let loginwrapperpacket = Buffer.alloc(0)
-          switch (handshake.discriminator) {
-            // respond with ModListResponse
-            case 'ModList': {
-              const modlist = handshake.data
-
-              const modlistreply = {
-                modNames,
-                channels: [],
-                registries: []
-              }
-
-              if (!options.modNames) {
-                modlistreply.modNames = modlist.modNames
-              }
-
-              if (!options.channels) {
-                for (const { name, marker } of modlist.channels) {
-                  if (marker !== 'FML3') {
-                    modlistreply.channels.push({ name, marker })
-                  }
-                }
-              } else {
-                for (const channel in channels) {
-                  modlistreply.channels.push({
-                    name: channel,
-                    marker: channels[channel]
-                  })
-                }
-              }
-
-              if (!options.registries) {
-                for (const { name } of modlist.registries) {
-                  modlistreply.registries.push({ name, marker: '1.0' })
-                }
-              } else {
-                for (const registry in registries) {
-                  modlistreply.registries.push({
-                    name: registry,
-                    marker: registries[registry]
-                  })
-                }
-              }
-
-              const modlistreplypacket = proto.createPacketBuffer(
-                PROTODEF_TYPES.HANDSHAKE,
-                {
-                  discriminator: 'ModListReply',
-                  data: modlistreply
-                }
-              )
-
-              loginwrapperpacket = proto.createPacketBuffer(
-                PROTODEF_TYPES.LOGINWRAPPER,
-                {
-                  channel: FML_CHANNELS.HANDSHAKE,
-                  data: modlistreplypacket
-                }
-              )
-              break
-            }
-
-            // this shouldn't happen
-            case 'ModListReply':
-              throw Error('received clientbound-only ModListReply from server')
-
-            // respond with Ack
-            case 'ServerRegistry': {
-              loginwrapperpacket = proto.createPacketBuffer(
-                PROTODEF_TYPES.LOGINWRAPPER,
-                {
-                  channel: FML_CHANNELS.HANDSHAKE,
-                  data: proto.createPacketBuffer(PROTODEF_TYPES.HANDSHAKE, {
-                    discriminator: 'Acknowledgement',
-                    data: {}
-                  })
-                }
-              )
-              break
-            }
-
-            // respond with Ack
-            case 'ConfigurationData': {
-              loginwrapperpacket = proto.createPacketBuffer(
-                PROTODEF_TYPES.LOGINWRAPPER,
-                {
-                  channel: FML_CHANNELS.HANDSHAKE,
-                  data: proto.createPacketBuffer(PROTODEF_TYPES.HANDSHAKE, {
-                    discriminator: 'Acknowledgement',
-                    data: {}
-                  })
-                }
-              )
-              break
-            }
-
-            // respond with Ack
-            case 'ModData': {
-              loginwrapperpacket = proto.createPacketBuffer(
-                PROTODEF_TYPES.LOGINWRAPPER,
-                {
-                  channel: FML_CHANNELS.HANDSHAKE,
-                  data: proto.createPacketBuffer(PROTODEF_TYPES.HANDSHAKE, {
-                    discriminator: 'Acknowledgement',
-                    data: {}
-                  })
-                }
-              )
-              break
-            }
-
-            // respond with Ack ?
-            case 'ChannelMismatchData': {
-              loginwrapperpacket = proto.createPacketBuffer(
-                PROTODEF_TYPES.LOGINWRAPPER,
-                {
-                  channel: FML_CHANNELS.HANDSHAKE,
-                  data: proto.createPacketBuffer(PROTODEF_TYPES.HANDSHAKE, {
-                    discriminator: 'Acknowledgement',
-                    data: {}
-                  })
-                }
-              )
-              break
-            }
-
-            // this shouldn't happen
-            case 'Acknowledgement':
-              throw Error('received clientbound-only Acknowledgement from server')
-          }
-
-          client.write('login_plugin_response', {
-            messageId: data.messageId,
-            data: loginwrapperpacket
-          })
-          break
+        // Mirror the server's own mods, channels and registries back at it so
+        // NetworkRegistry.validateClientChannels finds nothing to complain about.
+        const reply = {
+          mods: options.forgeMods || modList.mods,
+          channels: options.channels
+            ? Object.entries(options.channels).map(([name, marker]) => ({ name, marker }))
+            : modList.channels,
+          registries: options.registries
+            ? Object.entries(options.registries).map(([name, marker]) => ({ name, marker }))
+            : modList.registries.map((name) => ({ name, marker: '1.0' }))
         }
-
-        default:
-          try {
-            console.log('other loginwrapperchannel', loginwrapper.channel, 'received, sending acknowledgement packet')
-            const AcknowledgementPacket = proto.createPacketBuffer(PROTODEF_TYPES.HANDSHAKE, { discriminator: 'Acknowledgement' })
-            const loginWrapperPacket = proto.createPacketBuffer(PROTODEF_TYPES.LOGINWRAPPER, { channel: FML_CHANNELS.HANDSHAKE, data: AcknowledgementPacket })
-            client.write('login_plugin_response', { messageId: data.messageId, data: loginWrapperPacket })
-            break
-          } catch (error) {
-            console.error(error)
-          }
-          break
+        respond(packet.messageId, wrapLoginPayload('fml:handshake', encodeModListReply(reply)))
+        return
       }
-    } else {
-      console.log('other channel', data.channel, 'received')
+
+      // ServerRegistry (disc 3): keep the id->name snapshot for item/block/
+      // entity registries so the bot can name modded content, then still ack.
+      // Parsing is best-effort - never let it break the handshake.
+      if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.SERVER_REGISTRY) {
+        try {
+          parseServerRegistry(client, wrapper.data, disc.size)
+        } catch (err) {
+          debug(`failed to parse ServerRegistry snapshot (${err.message}), acking anyway`)
+        }
+      }
+
+      // Registry snapshots, config data, mod data, unknown fml:handshake
+      // messages and mod login payloads wrapped in the loginwrapper: just
+      // acknowledge so the negotiation keeps moving.
+      debug(`acknowledging loginwrapper message channel=${wrapper.channel} discriminator=${disc.value} length=${wrapper.data.length}`)
+      respond(packet.messageId, wrapLoginPayload('fml:handshake', encodeAcknowledgement()))
+    } catch (err) {
+      // A request left unanswered hangs the login until the server times us
+      // out, so an acknowledgement is always the least-bad answer.
+      debug(`failed to handle loginwrapper payload (${err.message}), acknowledging anyway`)
+      respond(packet.messageId, wrapLoginPayload('fml:handshake', encodeAcknowledgement()))
     }
   })
 }
+
+// FriendlyByteBuf primitives, shared with the config-phase handshake (1.20.2+)
+module.exports.readVarInt = readVarInt
+module.exports.writeVarInt = writeVarInt
+module.exports.readString = readString
+module.exports.writeString = writeString
