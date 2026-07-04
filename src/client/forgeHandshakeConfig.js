@@ -1,5 +1,6 @@
 const debug = require('debug')('minecraft-protocol-forge')
 const { readVarInt, writeVarInt, readString, writeString } = require('./forgeHandshake3')
+const installTolerantPlayParser = require('./tolerantPlayParser')
 
 // Forge configuration-phase handshake (Minecraft 1.20.2+, protocol >= 764).
 //
@@ -78,40 +79,6 @@ function encodeModVersions (mods) {
 
 function encodeAcknowledge (token) {
   return Buffer.concat([writeVarInt(DISCRIMINATOR.ACKNOWLEDGE), writeVarInt(token)])
-}
-
-// Play packets whose drop means the bot's inventory view is now wrong.
-const INVENTORY_PACKETS = new Set(['window_items', 'set_slot', 'entity_equipment'])
-
-// Resolve a clientbound play packet id to its name via minecraft-data (the same
-// mapping nmp compiles), cached per version on the client. Used only for
-// human-readable drop diagnostics, so any failure degrades to a hex id.
-function resolvePlayPacketName (client, packetId) {
-  try {
-    if (!client._forgePlayPacketNames) {
-      const mcData = require('minecraft-data')(client.version)
-      const mapper = mcData.protocol.play.toClient.types.packet[1][0].type[1]
-      const byId = {}
-      for (const [key, name] of Object.entries(mapper.mappings)) byId[parseInt(key, 16)] = name
-      client._forgePlayPacketNames = byId
-    }
-    return client._forgePlayPacketNames[packetId] || null
-  } catch (err) {
-    return null
-  }
-}
-
-// protodef throws PartialReadError (err.partialReadError / name / message) when
-// a packet runs off the end of the buffer - the dominant modded failure, since
-// a mod-registered data-component patch on an item makes the whole window_items
-// unreadable against the vanilla protocol.
-function isPartialReadError (err) {
-  return !!(err && (
-    err.partialReadError === true ||
-    err.name === 'PartialReadError' ||
-    (err.constructor && err.constructor.name === 'PartialReadError') ||
-    (typeof err.message === 'string' && (err.message.includes('Read error') || err.message.includes('buffer end') || err.message.includes('Reached end of buffer')))
-  ))
 }
 
 /**
@@ -249,63 +216,10 @@ module.exports = function (client, options) {
     client.write('pong', { id: packet.id })
   })
 
-  // 1.20.5+ item stacks are typed data components, and a modded server remaps
-  // the data_component_type registry ids, so slot-bearing play packets (e.g.
-  // update_recipes at join) can be unparseable against the vanilla protocol.
-  // protodef's FullPacketParser passes such errors to its transform callback,
-  // which destroys the stream and silently kills the connection. Swallow the
-  // parse failure and surface the packet under a synthetic name instead, so
-  // one exotic packet cannot take the session down.
-  client.on('state', (newState) => {
-    if (newState !== 'play') return
-    const deserializer = client.deserializer
-    if (!deserializer || deserializer._forgeTolerant) return
-    deserializer._forgeTolerant = true
-    const parse = deserializer.parsePacketBuffer.bind(deserializer)
-    deserializer.parsePacketBuffer = (buffer) => {
-      try {
-        const packet = parse(buffer)
-        if (packet.metadata && packet.metadata.size !== buffer.length) {
-          // partially-read packet (e.g. declare_commands with modded argument
-          // parsers): keep the readable prefix, but stop FullPacketParser from
-          // console-dumping the whole packet as hex
-          debug(`partially parsed play packet ${packet.data && packet.data.name} (${packet.metadata.size}/${buffer.length} bytes)`)
-          packet.metadata.size = buffer.length
-        }
-        return packet
-      } catch (err) {
-        // Handle protodef PartialReadError IDENTICALLY to a hard error: it is
-        // the dominant real failure (a modded item's mod-registered data-
-        // component patch makes the whole window_items unparseable). Rethrowing
-        // it lets FullPacketParser destroy the stream and silently empty the
-        // inventory with no event - so synthesize the drop, never rethrow.
-        let packetId = -1
-        try {
-          packetId = readVarInt(buffer, 0).value
-        } catch (ignored) {}
-        const packetName = resolvePlayPacketName(client, packetId)
-        const label = packetName || `0x${packetId.toString(16)}`
-
-        client._forgeDropCounts = client._forgeDropCounts || {}
-        const count = (client._forgeDropCounts[packetId] = (client._forgeDropCounts[packetId] || 0) + 1)
-        if (count === 1) {
-          // exactly one warn per packet-id per session
-          console.warn(`[forge] dropped unparseable ${label} packet (modded data the vanilla protocol can't read); ${count} so far`)
-        }
-        debug(`dropping unparseable play packet ${label} id=0x${packetId.toString(16)} length=${buffer.length} partialRead=${isPartialReadError(err)}: ${err.message}`)
-
-        // Inventory packets: the bot's item view is now wrong; let MinePal flag
-        // it dirty. Non-inventory drops keep the pre-existing synthetic name.
-        if (packetName && INVENTORY_PACKETS.has(packetName)) {
-          client.emit('forge_inventory_unreliable', { packet: packetName, id: packetId })
-        }
-        return {
-          data: { name: 'forge_unparseable_packet', params: { id: packetId } },
-          metadata: { size: buffer.length },
-          buffer,
-          fullBuffer: buffer
-        }
-      }
-    }
-  })
+  // Modded play packets (e.g. data-component-bearing slots on 1.20.5+) can be
+  // unparseable against the vanilla protocol; the shared tolerant deserializer
+  // drops them instead of letting protodef destroy the stream. MinePal already
+  // installs it per-client at creation (client._tolerantPlayParser), in which
+  // case this is a no-op; direct library users get it installed here.
+  installTolerantPlayParser(client)
 }

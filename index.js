@@ -17,5 +17,6 @@ module.exports = {
   forgeHandshakeConfig: require('./src/client/forgeHandshakeConfig'),
   autoVersionForge: require('./src/client/autoVersionForge'),
   decodeOptimized: require('./src/client/decodeOptimized'),
+  installTolerantPlayParser: require('./src/client/tolerantPlayParser'),
   resolveForgeItemName
 }
