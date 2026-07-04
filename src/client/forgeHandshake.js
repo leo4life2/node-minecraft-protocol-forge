@@ -174,8 +174,10 @@ function fmlHandshakeStep (client, data, options) {
   const parsed = proto.parsePacketBuffer('FML|HS', data)
   debug('FML|HS', parsed)
 
+  // The FML1 handshake opens with the server's ServerHello, which the START
+  // state handles; defaulting to RESET made the first message assert-fail.
   const fmlHandshakeState =
-    client.fmlHandshakeState || FMLHandshakeClientState.RESET
+    client.fmlHandshakeState || FMLHandshakeClientState.START
 
   switch (fmlHandshakeState) {
     case FMLHandshakeClientState.START: {
@@ -243,7 +245,6 @@ function fmlHandshakeStep (client, data, options) {
         `expected RegistryData in WAITINGSERVERCOMPLETE, got ${parsed.data.discriminator}`
       )
       debug('RegistryData', parsed.data)
-      console.log('RegistryData', parsed)
       if (
         client.version === '1.7.10' || // actually ModIdData packet, and there is only one of those TODO: avoid hardcoding version, allow earlier
         parsed.data.hasMore === false
