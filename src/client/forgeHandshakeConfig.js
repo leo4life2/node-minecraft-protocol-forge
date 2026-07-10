@@ -1,5 +1,5 @@
 const debug = require('debug')('minecraft-protocol-forge')
-const { readVarInt, writeVarInt, readString, writeString } = require('./forgeHandshake3')
+const { readVarInt, writeVarInt, readString, writeString, readRegistryIdMap, SNAPSHOT_REGISTRIES } = require('./forgeHandshake3')
 const installTolerantPlayParser = require('./tolerantPlayParser')
 
 // Forge configuration-phase handshake (Minecraft 1.20.2+, protocol >= 764).
@@ -79,6 +79,24 @@ function encodeModVersions (mods) {
 
 function encodeAcknowledge (token) {
   return Buffer.concat([writeVarInt(DISCRIMINATOR.ACKNOWLEDGE), writeVarInt(token)])
+}
+
+// RegistryData (disc 4) body: token (varint, consumed by the caller for the
+// ack), registryName (string), then a ForgeRegistry.Snapshot with the same
+// inner layout as FML3's S2CRegistry - ids map first - but with NO hasSnapshot
+// boolean before it (confirmed against live Forge 1.21.1 bytes). Keeping the
+// id->name map lets the bot name modded content the vanilla protocol reports
+// as `unknown`. Best-effort: the caller wraps this so a parse failure still
+// falls through to the ack.
+function parseRegistryData (client, buffer, offset) {
+  const name = readString(buffer, offset)
+  offset += name.size
+  const key = SNAPSHOT_REGISTRIES[name.value]
+  if (!key) return // not a registry we name from
+  const ids = readRegistryIdMap(buffer, offset)
+  client.forgeRegistries = client.forgeRegistries || {}
+  client.forgeRegistries[key] = ids.value
+  debug(`parsed ${name.value} registry snapshot: ${ids.value.size} ids`)
 }
 
 /**
@@ -179,6 +197,15 @@ module.exports = function (client, options) {
         case DISCRIMINATOR.REGISTRY_DATA: {
           const token = readVarInt(packet.data, disc.size)
           lastActivity = `${disc.value === DISCRIMINATOR.REGISTRY_LIST ? 'RegistryList(3)' : 'RegistryData(4)'} token=${token.value}`
+          // Snapshot parsing is a nice-to-have; the ack below is what keeps
+          // the handshake alive, so it must go out no matter what.
+          if (disc.value === DISCRIMINATOR.REGISTRY_DATA) {
+            try {
+              parseRegistryData(client, packet.data, disc.size + token.size)
+            } catch (err) {
+              debug(`failed to parse RegistryData snapshot (${err.message}), acking anyway`)
+            }
+          }
           debug(`acknowledging ${disc.value === DISCRIMINATOR.REGISTRY_LIST ? 'RegistryList' : 'RegistryData'} token=${token.value}`)
           send(encodeAcknowledge(token.value))
           break

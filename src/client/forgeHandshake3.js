@@ -64,6 +64,10 @@ function writeVarInt (value) {
 
 function readString (buffer, offset) {
   const len = readVarInt(buffer, offset)
+  // a 5-byte varint can decode negative; accepting it would move the read
+  // cursor BACKWARD (size = len.size + len.value), letting a malformed packet
+  // loop over the same bytes forever without ever hitting the bounds check
+  if (len.value < 0) throw new Error(`negative string length at ${offset}`)
   const start = offset + len.size
   if (start + len.value > buffer.length) throw new Error(`buffer ended while reading string at ${offset}`)
   return { value: buffer.toString('utf8', start, start + len.value), size: len.size + len.value }
@@ -138,13 +142,37 @@ function encodeAcknowledgement () {
   return writeVarInt(DISCRIMINATOR.ACKNOWLEDGEMENT)
 }
 
+// Leading `ids` map of a ForgeRegistry.Snapshot: varint count, then count x
+// (string name, varint id). That's enough to name modded content; the trailing
+// aliases/overrides/blocked lists are not needed. Same inner layout on FML3
+// (login) and 1.20.2+ (config-phase) registry messages.
+function readRegistryIdMap (buffer, offset) {
+  const count = readVarInt(buffer, offset)
+  let size = count.size
+  // every entry costs >= 2 bytes (1-byte string length + 1-byte id), so a
+  // count the buffer can't possibly hold is malformed; reject it up front
+  // instead of iterating - this parse runs synchronously inside the packet
+  // handler, where a spun loop freezes the whole event loop (no timer or
+  // watchdog can preempt it)
+  if (count.value < 0 || count.value * 2 > buffer.length - offset - size) {
+    throw new Error(`registry id map count ${count.value} exceeds buffer at ${offset}`)
+  }
+  const ids = new Map()
+  for (let i = 0; i < count.value; i++) {
+    const entryName = readString(buffer, offset + size)
+    size += entryName.size
+    const id = readVarInt(buffer, offset + size)
+    size += id.size
+    ids.set(id.value, entryName.value)
+  }
+  return { value: ids, size }
+}
+
 // S2CRegistry (disc 3) body: registryName (string), hasSnapshot (bool), then a
-// ForgeRegistry.Snapshot. Only the leading `ids` map (varint count, then
-// count x (string name, varint id)) is read - that's enough to name modded
-// content; the trailing aliases/overrides/blocked lists are not needed. (There
-// is no `dummied` field on the wire, despite older protodef schemas.) The
-// parsed id->name Map is stashed on client.forgeRegistries[key]. Best-effort:
-// callers wrap this so a parse failure just falls through to a plain ack.
+// ForgeRegistry.Snapshot whose leading ids map is kept. (There is no `dummied`
+// field on the wire, despite older protodef schemas.) The parsed id->name Map
+// is stashed on client.forgeRegistries[key]. Best-effort: callers wrap this so
+// a parse failure just falls through to a plain ack.
 function parseServerRegistry (client, buffer, offset) {
   const name = readString(buffer, offset)
   offset += name.size
@@ -154,19 +182,10 @@ function parseServerRegistry (client, buffer, offset) {
   offset += 1
   if (!hasSnapshot) return
 
-  const count = readVarInt(buffer, offset)
-  offset += count.size
-  const ids = new Map()
-  for (let i = 0; i < count.value; i++) {
-    const entryName = readString(buffer, offset)
-    offset += entryName.size
-    const id = readVarInt(buffer, offset)
-    offset += id.size
-    ids.set(id.value, entryName.value)
-  }
+  const ids = readRegistryIdMap(buffer, offset)
   client.forgeRegistries = client.forgeRegistries || {}
-  client.forgeRegistries[key] = ids
-  debug(`parsed ${name.value} registry snapshot: ${ids.size} ids`)
+  client.forgeRegistries[key] = ids.value
+  debug(`parsed ${name.value} registry snapshot: ${ids.value.size} ids`)
 }
 
 /**
@@ -262,8 +281,11 @@ module.exports = function (client, options) {
   })
 }
 
-// FriendlyByteBuf primitives, shared with the config-phase handshake (1.20.2+)
+// FriendlyByteBuf primitives and registry-snapshot helpers, shared with the
+// config-phase handshake (1.20.2+)
 module.exports.readVarInt = readVarInt
 module.exports.writeVarInt = writeVarInt
 module.exports.readString = readString
 module.exports.writeString = writeString
+module.exports.readRegistryIdMap = readRegistryIdMap
+module.exports.SNAPSHOT_REGISTRIES = SNAPSHOT_REGISTRIES
