@@ -11,7 +11,9 @@ const debug = require('debug')('minecraft-protocol-forge')
 //   3  S2CRegistry           -> reply 99 C2SAcknowledge
 //   4  S2CConfigData         -> reply 99 C2SAcknowledge
 //   5  S2CModData            -> informational (server expects no specific reply)
-//   6  S2CChannelMismatchData-> only sent while rejecting us
+//   6  S2CChannelMismatchData-> only sent while rejecting us; parsed (names the
+//                               rejected channels) and re-emitted as the
+//                               'forgeChannelMismatch' client event
 //   99 C2SAcknowledge        -> clientbound never
 //
 // We never apply registry/config payloads - we only acknowledge them so the login
@@ -23,6 +25,7 @@ const DISCRIMINATOR = {
   MOD_LIST: 1,
   MOD_LIST_REPLY: 2,
   SERVER_REGISTRY: 3,
+  CHANNEL_MISMATCH: 6,
   ACKNOWLEDGEMENT: 99
 }
 
@@ -142,6 +145,33 @@ function encodeAcknowledgement () {
   return writeVarInt(DISCRIMINATOR.ACKNOWLEDGEMENT)
 }
 
+// S2CChannelMismatchData (disc 6) body: a FriendlyByteBuf map — varint count,
+// then count x (string channelName, string reason) — of the channels
+// NetworkRegistry.validateServerChannels rejected. The server sends it ONLY
+// while rejecting us, and on 1.20.1 then closes the socket RAW
+// (Connection#disconnect during login sends no login-disconnect packet), so
+// the client otherwise sees nothing but ECONNRESET. This message is the one
+// record of WHY the join failed.
+function parseChannelMismatch (buffer, offset) {
+  const count = readVarInt(buffer, offset)
+  offset += count.size
+  // every entry costs >= 2 bytes (two 1-byte string length prefixes); a count
+  // the buffer can't hold is malformed — reject before looping (same rationale
+  // as readRegistryIdMap: this runs synchronously inside the packet handler)
+  if (count.value < 0 || count.value * 2 > buffer.length - offset) {
+    throw new Error(`channel mismatch count ${count.value} exceeds buffer at ${offset}`)
+  }
+  const mismatched = {}
+  for (let i = 0; i < count.value; i++) {
+    const name = readString(buffer, offset)
+    offset += name.size
+    const reason = readString(buffer, offset)
+    offset += reason.size
+    mismatched[name.value] = reason.value
+  }
+  return mismatched
+}
+
 // Leading `ids` map of a ForgeRegistry.Snapshot: varint count, then count x
 // (string name, varint id). That's enough to name modded content; the trailing
 // aliases/overrides/blocked lists are not needed. Same inner layout on FML3
@@ -227,8 +257,9 @@ module.exports = function (client, options) {
       return
     }
 
+    let wrapper
     try {
-      const wrapper = parseLoginWrapper(packet.data)
+      wrapper = parseLoginWrapper(packet.data)
       const disc = readVarInt(wrapper.data, 0)
 
       if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.MOD_LIST) {
@@ -267,16 +298,40 @@ module.exports = function (client, options) {
         }
       }
 
+      // ChannelMismatchData (disc 6): the server is REJECTING us and this is
+      // the only packet that names the offending channels — log it and hand it
+      // to the embedding app before the raw socket close erases the evidence.
+      // Parsing is best-effort; we still fall through to the ack either way
+      // (the server disconnects regardless, an ack is harmless).
+      if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.CHANNEL_MISMATCH) {
+        try {
+          const mismatched = parseChannelMismatch(wrapper.data, disc.size)
+          const names = Object.keys(mismatched)
+          console.warn(`[forge] server rejected our mod channels (${names.length}): ` +
+            names.map((n) => (mismatched[n] ? `${n} (${mismatched[n]})` : n)).join(', '))
+          client.forgeChannelMismatch = mismatched
+          client.emit('forgeChannelMismatch', mismatched)
+        } catch (err) {
+          debug(`failed to parse S2CChannelMismatchData (${err.message})`)
+        }
+      }
+
       // Registry snapshots, config data, mod data, unknown fml:handshake
       // messages and mod login payloads wrapped in the loginwrapper: just
-      // acknowledge so the negotiation keeps moving.
+      // acknowledge so the negotiation keeps moving. The ack goes back in the
+      // ORIGINATING inner channel: the server-side LoginWrapper routes the
+      // reply to whichever channel the response names, so wrapping a mod
+      // channel's reply in fml:handshake would deliver it to the FML handshake
+      // handler ("unexpected index") while the real channel waits forever.
       debug(`acknowledging loginwrapper message channel=${wrapper.channel} discriminator=${disc.value} length=${wrapper.data.length}`)
-      respond(packet.messageId, wrapLoginPayload('fml:handshake', encodeAcknowledgement()))
+      respond(packet.messageId, wrapLoginPayload(wrapper.channel, encodeAcknowledgement()))
     } catch (err) {
       // A request left unanswered hangs the login until the server times us
-      // out, so an acknowledgement is always the least-bad answer.
+      // out, so an acknowledgement is always the least-bad answer. If even the
+      // outer wrapper failed to parse there is no originating channel to name,
+      // so fall back to fml:handshake.
       debug(`failed to handle loginwrapper payload (${err.message}), acknowledging anyway`)
-      respond(packet.messageId, wrapLoginPayload('fml:handshake', encodeAcknowledgement()))
+      respond(packet.messageId, wrapLoginPayload(wrapper ? wrapper.channel : 'fml:handshake', encodeAcknowledgement()))
     }
   })
 }
