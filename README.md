@@ -56,6 +56,37 @@ This will automatically install the `forgeHandshake` plugin, with the appropriat
 if the server advertises itself as Forge/FML. Useful for connecting to servers you don't
 know if they are Forge or not, or what mods they are using.
 
+## Modded login sub-protocols and local jar derivation
+
+Many mods (and, through Sinytra Connector, Fabric mods) run their own login
+sub-protocols during the Forge handshake — owo-lib channel/controller
+fingerprints, and per-mod `SimpleChannel` login "Acknowledge" messages
+(TACZ, MrCrayfish Framework, …). Their required replies are content
+fingerprints of the mod's own code that never cross the wire, so they cannot
+be echoed back from what the server sends. To answer them, the handshake
+responder can **statically derive the replies from the mod jars in the
+player's local instance `mods/` folder**, supplied via the `modsPaths` option
+(a jar file, a directory of jars, or an array), or the
+`MINEPAL_FORGE_MODS_DIR` environment variable:
+
+```javascript
+autoVersionForge(client, { modsPaths: ['/path/to/instance/mods'] });
+```
+
+Resolution order for a wrapped login channel is: a hand-verified protocol
+table entry first, then the jar-derived `SimpleChannel` login ack
+(`loginAckDerivation.js`), then the generic FML acknowledge. owo handshakes
+derive their required fingerprints from the same folder.
+
+**What the derivation reads, and what it does not.** It reads the mod `.jar`
+files on the local machine and statically parses their bytecode to extract
+only how each mod registers its network channels (channel ids, message
+registration indices, particle-system counts) — the signatures needed to
+complete the server's mod handshake. It runs entirely on the local machine:
+the mod list is never uploaded anywhere, and mod code is never classloaded or
+executed — the jars are read and parsed, never run. (Enforced by
+`test/privacyLaws.test.js`.)
+
 ## Installation
 
 `npm install minecraft-protocol-forge`

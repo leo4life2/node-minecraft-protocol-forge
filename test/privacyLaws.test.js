@@ -1,0 +1,170 @@
+/* eslint-env mocha */
+// PRIVACY LAWS AS CODE (owner-ratified design laws for the jar-derivation path).
+// These are executable assertions, not documentation: a change that makes the
+// analyzer phone home, classload/execute mod code, or reach beyond
+// network-registration signatures fails this suite.
+//
+//   LAW 1  LOCAL-ONLY   - the derivation performs ZERO network I/O. Proven by
+//                         arming every Node network primitive to throw, then
+//                         running a full derivation: it must still succeed.
+//   LAW 2  READ-ONLY,   - static bytecode parsing only. Proven by source
+//          JARS-ONLY      audit: no child_process/exec/eval/vm/Module load
+//                         APIs anywhere in the derivation modules, and no
+//                         filesystem WRITES (only read/stat/readdir).
+//   LAW 3  PURPOSE-      - the analyzer depends on nothing but fs/path/zlib/
+//          LIMITED        debug; it cannot import a backend/telemetry client.
+const assert = require('assert')
+const fs = require('fs')
+const os = require('os')
+const path = require('path')
+const net = require('net')
+const tls = require('tls')
+const http = require('http')
+const https = require('https')
+const dgram = require('dgram')
+
+const { buildClass, buildJar } = require('./helpers/synthJar')
+
+const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js']
+const SRC = path.join(__dirname, '..', 'src', 'client')
+
+// build a synthetic mod that DOES derive, so the network-spy test exercises
+// the real read+parse+bytecode-walk path end to end
+function synthDerivableJar () {
+  const RL = 'net/minecraft/resources/ResourceLocation'
+  const SC = 'net/minecraftforge/network/simple/SimpleChannel'
+  const MB = 'net/minecraftforge/network/simple/SimpleChannel$MessageBuilder'
+  const AI = 'java/util/concurrent/atomic/AtomicInteger'
+  const NR = 'net/minecraftforge/network/NetworkRegistry'
+  const FBB = 'net/minecraft/network/FriendlyByteBuf'
+  const owner = 'synth/priv/Net'
+  const ack = 'synth/priv/Ack'
+  const net_ = buildClass({
+    name: owner,
+    methods: [
+      {
+        name: '<clinit>',
+        desc: '()V',
+        flags: 0x0008,
+        code: (a) => a
+          .new_(RL).dup().ldcStr('priv').ldcStr('handshake')
+          .invokespecial(RL, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V')
+          .invokestatic(NR, 'newSimpleChannel', `(L${RL};)L${SC};`)
+          .putstatic(owner, 'CHANNEL', `L${SC};`)
+          .new_(AI).dup().iconst(1).invokespecial(AI, '<init>', '(I)V')
+          .putstatic(owner, 'COUNT', `L${AI};`).ret()
+      },
+      {
+        name: 'init',
+        desc: '()V',
+        code: (a) => a
+          .getstatic(owner, 'CHANNEL', `L${SC};`).ldcCls(ack)
+          .getstatic(owner, 'COUNT', `L${AI};`).invokevirtual(AI, 'getAndIncrement', '()I')
+          .invokevirtual(SC, 'messageBuilder', `(Ljava/lang/Class;I)L${MB};`)
+          .invokevirtual(MB, 'loginIndex', `(Ljava/util/function/Function;Ljava/util/function/BiConsumer;)L${MB};`)
+          .invokevirtual(MB, 'add', '()V').ret()
+      }
+    ]
+  })
+  const ackCls = buildClass({ name: ack, methods: [{ name: 'encode', desc: `(L${ack};L${FBB};)V`, code: (a) => a.ret() }] })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'privlaw-'))
+  fs.writeFileSync(path.join(dir, 'priv.jar'), buildJar([
+    { name: `${owner}.class`, data: net_ },
+    { name: `${ack}.class`, data: ackCls }
+  ]))
+  return dir
+}
+
+describe('PRIVACY LAW 1 - local-only (no network I/O)', function () {
+  it('a full derivation makes ZERO network calls', () => {
+    const calls = []
+    const patched = []
+    const arm = (obj, name) => {
+      const orig = obj[name]
+      if (typeof orig !== 'function') return
+      obj[name] = function (...args) { calls.push(`${name}`); throw new Error(`network call blocked: ${name}`) }
+      patched.push(() => { obj[name] = orig })
+    }
+    // every primitive a covert exfiltration could use
+    arm(net, 'connect'); arm(net, 'createConnection'); arm(net.Socket.prototype, 'connect')
+    arm(tls, 'connect')
+    arm(http, 'request'); arm(http, 'get')
+    arm(https, 'request'); arm(https, 'get')
+    arm(dgram, 'createSocket')
+    const origFetch = global.fetch
+    global.fetch = () => { calls.push('fetch'); throw new Error('network call blocked: fetch') }
+
+    try {
+      // fresh module instance so the derive-cache does not short-circuit
+      const modPath = require.resolve('../src/client/loginAckDerivation')
+      delete require.cache[modPath]
+      const { deriveLoginAck } = require('../src/client/loginAckDerivation')
+      const dir = synthDerivableJar()
+      const r = deriveLoginAck('priv:handshake', [dir])
+      assert.ok(r, 'derivation must succeed with network armed to throw')
+      assert.strictEqual(r.index, 1)
+    } finally {
+      for (const undo of patched) undo()
+      global.fetch = origFetch
+    }
+    assert.deepStrictEqual(calls, [], `no network primitive may be invoked, saw: ${calls.join(', ')}`)
+  })
+})
+
+describe('PRIVACY LAW 2 - read-only, jars-only (parse, never execute)', function () {
+  const forbidden = [
+    { re: /require\(\s*['"]child_process['"]\s*\)/, why: 'child_process (would execute code)' },
+    { re: /\bexec(Sync|File|FileSync)?\s*\(/, why: 'exec* (process execution)' },
+    { re: /\bspawn(Sync)?\s*\(/, why: 'spawn* (process execution)' },
+    { re: /\beval\s*\(/, why: 'eval (dynamic code execution)' },
+    { re: /new\s+Function\s*\(/, why: 'new Function (dynamic code execution)' },
+    { re: /require\(\s*['"]vm['"]\s*\)/, why: 'vm (sandboxed execution is still execution)' },
+    { re: /createRequire|Module\._(load|compile)/, why: 'module loading of scanned code' }
+  ]
+  for (const mod of MODULES) {
+    it(`${mod} contains no classloading/execution API`, () => {
+      const src = fs.readFileSync(path.join(SRC, mod), 'utf8')
+      // strip line and block comments so prose ("never executed") does not trip the audit
+      const code = src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n')
+      for (const f of forbidden) assert.ok(!f.re.test(code), `${mod} must not use ${f.why}`)
+    })
+  }
+
+  it('the derivation writes NOTHING to disk (fs write APIs never called)', () => {
+    // build the fixture jar BEFORE arming the write spies (the analyzer is
+    // what must not write; the test fixture legitimately does)
+    const dir = synthDerivableJar()
+    const writeApis = ['writeFile', 'writeFileSync', 'appendFile', 'appendFileSync', 'createWriteStream', 'mkdir', 'mkdirSync', 'rename', 'renameSync', 'unlink', 'unlinkSync', 'rmdir', 'rmdirSync', 'rm', 'rmSync', 'copyFile', 'copyFileSync', 'writev']
+    const calls = []
+    const undo = []
+    for (const name of writeApis) {
+      if (typeof fs[name] !== 'function') continue
+      const orig = fs[name]
+      fs[name] = function (...a) { calls.push(name); throw new Error(`fs write blocked: ${name}`) }
+      undo.push(() => { fs[name] = orig })
+    }
+    try {
+      const modPath = require.resolve('../src/client/loginAckDerivation')
+      delete require.cache[modPath]
+      const { deriveLoginAck } = require('../src/client/loginAckDerivation')
+      const r = deriveLoginAck('priv:handshake', [dir])
+      assert.ok(r)
+    } finally {
+      for (const u of undo) u()
+    }
+    assert.deepStrictEqual(calls, [], `derivation must not write to disk, saw: ${calls.join(', ')}`)
+  })
+})
+
+describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function () {
+  for (const mod of MODULES.concat(['jarAnalysis.js'])) {
+    it(`${mod} imports only local parsing deps`, () => {
+      const src = fs.readFileSync(path.join(SRC, mod), 'utf8')
+      const requires = [...src.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1])
+      const allowed = new Set(['fs', 'path', 'zlib', 'debug', './jarAnalysis', './loginAckDerivation'])
+      for (const r of requires) {
+        assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
+      }
+    })
+  }
+})
