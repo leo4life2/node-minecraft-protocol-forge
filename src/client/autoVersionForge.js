@@ -101,6 +101,11 @@ module.exports = function (client, options) {
       forgeMods: options.forgeMods,
       channels: options.channels,
       registries: options.registries,
+      // local instance mods folder(s): source for jar-DERIVED mod login
+      // replies (owo fingerprints, SimpleChannel login acks). The embedding
+      // app resolves it (or the MINEPAL_FORGE_MODS_DIR env var applies
+      // downstream). Previously dropped here, which orphaned owoModsPaths.
+      modsPaths: options.modsPaths || options.owoModsPaths,
       pingModVersions
     })
   })

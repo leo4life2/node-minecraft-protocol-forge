@@ -664,13 +664,22 @@ function scanOwoFingerprints (paths) {
   return out
 }
 
+// The local mods folder(s) every jar-derived reply draws from: the general
+// `modsPaths` option (resolved by the embedding app — see MinePal's
+// src/utils/modsDirResolver.js), its historical owo-specific alias
+// `owoModsPaths`, then the MINEPAL_FORGE_MODS_DIR env var.
+function modsPathsFor (options) {
+  const raw = (options && (options.modsPaths || options.owoModsPaths)) ||
+    process.env.MINEPAL_FORGE_MODS_DIR || ''
+  return (Array.isArray(raw) ? raw : String(raw).split(path.delimiter))
+    .map((s) => s.trim()).filter(Boolean)
+}
+
 // One scan per source list per process: the scan is synchronous (it runs
 // inside the login handler while the server waits) and reconnects reuse it.
 const owoFingerprintCache = new Map()
 function owoFingerprintsFor (options) {
-  const raw = (options && options.owoModsPaths) || process.env.MINEPAL_FORGE_MODS_DIR || ''
-  const paths = (Array.isArray(raw) ? raw : String(raw).split(path.delimiter))
-    .map((s) => s.trim()).filter(Boolean)
+  const paths = modsPathsFor(options)
   const key = paths.join('|')
   if (owoFingerprintCache.has(key)) return owoFingerprintCache.get(key)
   let fingerprints = { channels: {}, controllers: {}, optional: {} }
