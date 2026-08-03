@@ -177,6 +177,16 @@ const WRAPPED_LOGIN_PROTOCOLS = {
   // Acknowledge; byte 99 is an invalid discriminator in tacz's index space
   // ("Received invalid discriminator byte 99" -> unexpected_query_response).
   'tacz:handshake': () => Buffer.from([0x01]),
+  // MrCrayfish Framework (framework:handshake, the library behind the
+  // Refurbished Furniture ecosystem): ForgeNetworkBuilder#build resets
+  // idCount to 1 and registers Acknowledge FIRST — index 1, empty body
+  // (S2CLoginData=2, S2CLoginConfigData=3), so the correct reply to every
+  // Framework login message is the single byte 0x01. The FML byte 99 is an
+  // invalid discriminator in Framework's IndexedMessageCodec ("Received
+  // invalid discriminator byte 99 on channel framework:handshake" ->
+  // "Unexpected custom data from client" kick). Verified against
+  // framework-forge-1.20.1-0.7.15 bytecode and live (Liminal Industries).
+  'framework:handshake': () => Buffer.from([0x01]),
   // Zeta (zeta:main, the library behind Quark): the server sends S2CLoginFlag
   // (index 98) carrying a flags BitSet + expectedLength + expectedHash, and
   // SyncedFlagHandler validates that C2SLoginFlag (index 99) carries the SAME
