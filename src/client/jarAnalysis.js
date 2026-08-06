@@ -66,14 +66,22 @@ function parseClassFile (b) {
       case 4: o += 5; break
       case 9: case 10: case 11: cp[i] = { tag, classIndex: b.readUInt16BE(o + 1), natIndex: b.readUInt16BE(o + 3) }; o += 5; break
       case 12: cp[i] = { tag, nameIndex: b.readUInt16BE(o + 1), descIndex: b.readUInt16BE(o + 3) }; o += 5; break
-      case 17: case 18: o += 5; break
+      case 17: case 18: cp[i] = { tag, bsmIndex: b.readUInt16BE(o + 1), natIndex: b.readUInt16BE(o + 3) }; o += 5; break // Dynamic/InvokeDynamic
       case 5: case 6: o += 9; i++; break // long/double take two slots
       default: return null // unknown tag: not a class file we can read
     }
   }
   const className = cp[cp[b.readUInt16BE(o + 2)].nameIndex].str
+  const superIndex = b.readUInt16BE(o + 4)
+  const superName = superIndex && cp[superIndex] ? cpUtf8(cp, cp[superIndex].nameIndex) : null
   o += 6 // access_flags, this_class, super_class
-  o += 2 + b.readUInt16BE(o) * 2 // interfaces
+  const interfaceCount = b.readUInt16BE(o)
+  const interfaces = []
+  for (let i = 0; i < interfaceCount; i++) {
+    const ci = b.readUInt16BE(o + 2 + i * 2)
+    if (cp[ci]) interfaces.push(cpUtf8(cp, cp[ci].nameIndex))
+  }
+  o += 2 + interfaceCount * 2 // interfaces
   const readMembers = () => {
     const n = b.readUInt16BE(o); o += 2
     const out = []
@@ -105,7 +113,7 @@ function parseClassFile (b) {
     const codeLen = b.readUInt32BE(code.start + 4)
     codes.push({ method: m.name, desc: m.desc, flags: m.flags, code: b.slice(code.start + 8, code.start + 8 + codeLen) })
   }
-  return { className, cp, codes }
+  return { className, superName, interfaces, cp, codes }
 }
 
 // JVM bytecode walk: fixed instruction lengths, with the four variable-length

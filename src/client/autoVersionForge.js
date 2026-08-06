@@ -1,10 +1,58 @@
 'use strict'
 
+const fs = require('fs')
+const path = require('path')
 const forgeHandshake = require('./forgeHandshake')
 const forgeHandshake2 = require('./forgeHandshake2')
 const forgeHandshake3 = require('./forgeHandshake3')
 const forgeHandshakeConfig = require('./forgeHandshakeConfig')
 const decodeOptimized = require('./decodeOptimized')
+const { deriveNeoForgeComponents } = require('./neoForgePayloadDerivation')
+const { installNeoForgeConfigNegotiation } = require('./neoForgeConfig')
+
+// top-level jars in the resolved local mods folder(s)
+function listModJars (modsPaths) {
+  const jars = []
+  for (const dir of modsPaths || []) {
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (f.endsWith('.jar')) jars.push(path.join(dir, f))
+      }
+    } catch { /* unreadable dir: honest miss */ }
+  }
+  return jars
+}
+
+// The neoforge universal jar carries NetworkInitialization (the built-in
+// channel registrations that opt into registry sync + data-map negotiation).
+// Launchers keep it in a `libraries` tree near the instance: vanilla
+// launcher .minecraft/libraries, CurseForge minecraft/Install/libraries,
+// servers ./libraries. Walk a few levels up from the mods folder and take
+// the newest universal jar found. Missing is tolerated (mod channels alone
+// still negotiate; registry sync is then skipped by the server).
+function findNeoForgeLoaderJars (modsPaths) {
+  for (const modsDir of modsPaths || []) {
+    let dir = path.resolve(modsDir)
+    for (let depth = 0; depth < 5; depth++) {
+      dir = path.dirname(dir)
+      for (const libRoot of [path.join(dir, 'libraries'), path.join(dir, 'Install', 'libraries')]) {
+        const neoRoot = path.join(libRoot, 'net', 'neoforged', 'neoforge')
+        try {
+          const versions = fs.readdirSync(neoRoot).sort().reverse()
+          for (const v of versions) {
+            const jar = path.join(neoRoot, v, `neoforge-${v}-universal.jar`)
+            if (fs.existsSync(jar)) {
+              debug(`neoforge universal jar located: ${jar}`)
+              return [jar]
+            }
+          }
+        } catch { /* no libraries tree here */ }
+      }
+    }
+  }
+  debug('no neoforge universal jar found near the mods folder(s) — built-in channels unclaimed')
+  return []
+}
 
 // 1.20.2 moved the Forge handshake from the login state into the vanilla
 // configuration state; everything at or above this protocol uses the
@@ -110,11 +158,48 @@ module.exports = function (client, options) {
     })
   })
 
+  // NeoForge 1.20.5+: the ping carries isModded with NO forgeData (NeoForge
+  // dropped the FML ping payload after 1.20.1) and the join is decided by the
+  // config-phase modded-network negotiation (neoforge:register /
+  // neoforge:network). The component tuples the negotiator demands are
+  // derived STATICALLY from the local instance's jars (options.modsPaths, the
+  // same folder the login-phase derivations use) plus the neoforge universal
+  // jar when it can be found near the instance. Without jars this stays a
+  // plain vanilla attempt (servers whose modded channels are all optional
+  // accept those; ones with required channels reject us exactly as before).
+  client.autoVersionHooks.push(function (response) {
+    if (response.forgeData || response.modinfo) return // Forge hooks own those
+    const protocol = (response.version && response.version.protocol) || 0
+    if (response.isModded !== true || protocol < PROTOCOL_1_20_2) return
+    if (options.forgeSpoof === false) {
+      debug('NeoForge 1.20.5+ server detected but forgeSpoof is disabled, connecting as vanilla')
+      return
+    }
+    const modsPaths = options.modsPaths || options.owoModsPaths || []
+    const jarPaths = listModJars(modsPaths)
+    const loaderJars = options.neoForgeLoaderJars || findNeoForgeLoaderJars(modsPaths)
+    if (jarPaths.length === 0) {
+      debug('NeoForge 1.20.5+ server detected but no local mod jars resolved — attempting vanilla join')
+      return
+    }
+    try {
+      const { components, diagnostics } = deriveNeoForgeComponents([...jarPaths, ...loaderJars])
+      // channels the transport does not implement must not be claimed:
+      // neoforge:split would invite split payloads this responder cannot
+      // reassemble yet.
+      for (const proto of Object.keys(components)) {
+        components[proto] = components[proto].filter((c) => c.id !== 'neoforge:split')
+      }
+      debug(`NeoForge 1.20.5+ server detected — claiming ${components.configuration.length} configuration + ${components.play.length} play jar-derived components (${jarPaths.length} mod jars, ${loaderJars.length} loader jars, ${diagnostics.abstains.length} abstains)`)
+      installNeoForgeConfigNegotiation(client, { components })
+      client.emit('neoForgeDerivation', { components, diagnostics })
+    } catch (err) {
+      debug(`NeoForge component derivation failed (${err.message}) — attempting vanilla join`)
+    }
+  })
+
   // Config-phase Forge (1.20.2+): forgeData is still in the ping, but the
-  // handshake happens in the configuration state. NeoForge is deliberately not
-  // handled here: its ping carries no forgeData and its config phase needs
-  // nothing beyond the vanilla pong (which mineflayer already sends); servers
-  // with mandatory modded payloads reject modless clients regardless.
+  // handshake happens in the configuration state.
   client.autoVersionHooks.push(function (response) {
     const forgeData = response.forgeData
     if (!forgeData) return // not ours
