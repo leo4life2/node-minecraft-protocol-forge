@@ -26,7 +26,7 @@ const dgram = require('dgram')
 const { buildClass, buildJar } = require('./helpers/synthJar')
 
 const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js',
-  'neoForgePayloadDerivation.js', 'neoForgeConfig.js']
+  'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js']
 const SRC = path.join(__dirname, '..', 'src', 'client')
 
 // build a synthetic mod that DOES derive, so the network-spy test exercises
@@ -76,6 +76,60 @@ function synthDerivableJar () {
   return dir
 }
 
+// minimal shape-derivable mod jar (DeferredRegister + noCollission plant),
+// so the block-shape derivation's full read+parse+walk path runs under the
+// armed spies too
+function synthShapeJar () {
+  const DR = 'net/minecraftforge/registries/DeferredRegister'
+  const RO = 'net/minecraftforge/registries/RegistryObject'
+  const PROPS = 'net/minecraft/world/level/block/state/BlockBehaviour$Properties'
+  const BLOCK = 'net/minecraft/world/level/block/Block'
+  const owner = 'privsynth/ShapeBlocks'
+  const reg = buildClass({
+    name: owner,
+    bootstrapMethods: [{ refKind: 6, owner, name: 'lambda$static$0', desc: `()L${BLOCK};` }],
+    methods: [
+      {
+        name: '<clinit>',
+        desc: '()V',
+        flags: 0x0008,
+        code: (a) => a
+          .ldcStr('privshapes')
+          .invokestatic(DR, 'create', `(Ljava/lang/String;)L${DR};`)
+          .putstatic(owner, 'BLOCKS', `L${DR};`)
+          .getstatic(owner, 'BLOCKS', `L${DR};`)
+          .ldcStr('ghost_plant')
+          .invokedynamic(0, 'get', '()Ljava/util/function/Supplier;')
+          .invokevirtual(DR, 'register', `(Ljava/lang/String;Ljava/util/function/Supplier;)L${RO};`)
+          .pop().ret()
+      },
+      {
+        name: 'lambda$static$0',
+        desc: `()L${BLOCK};`,
+        flags: 0x000a,
+        code: (a) => a
+          .new_('privsynth/GhostPlant').dup()
+          .invokestatic(PROPS, 'm_284310_', `()L${PROPS};`)
+          .invokevirtual(PROPS, 'm_60910_', `()L${PROPS};`)
+          .invokespecial('privsynth/GhostPlant', '<init>', `(L${PROPS};)V`)
+          .areturn()
+      }
+    ]
+  })
+  const plant = buildClass({
+    name: 'privsynth/GhostPlant',
+    superName: 'net/minecraft/world/level/block/FlowerBlock',
+    methods: [{ name: '<init>', desc: `(L${PROPS};)V`, flags: 0x0001, code: (a) => a.ret() }]
+  })
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'privlaw-shapes-'))
+  const jar = path.join(dir, 'privshapes.jar')
+  fs.writeFileSync(jar, buildJar([
+    { name: 'privsynth/ShapeBlocks.class', data: reg },
+    { name: 'privsynth/GhostPlant.class', data: plant }
+  ]))
+  return jar
+}
+
 describe('PRIVACY LAW 1 - local-only (no network I/O)', function () {
   it('a full derivation makes ZERO network calls', () => {
     const calls = []
@@ -104,6 +158,33 @@ describe('PRIVACY LAW 1 - local-only (no network I/O)', function () {
       const r = deriveLoginAck('priv:handshake', [dir])
       assert.ok(r, 'derivation must succeed with network armed to throw')
       assert.strictEqual(r.index, 1)
+    } finally {
+      for (const undo of patched) undo()
+      global.fetch = origFetch
+    }
+    assert.deepStrictEqual(calls, [], `no network primitive may be invoked, saw: ${calls.join(', ')}`)
+  })
+
+  it('a full block-shape derivation makes ZERO network calls', () => {
+    const jar = synthShapeJar()
+    const calls = []
+    const patched = []
+    const arm = (obj, name) => {
+      const orig = obj[name]
+      if (typeof orig !== 'function') return
+      obj[name] = function (...args) { calls.push(`${name}`); throw new Error(`network call blocked: ${name}`) }
+      patched.push(() => { obj[name] = orig })
+    }
+    arm(net, 'connect'); arm(net, 'createConnection'); arm(net.Socket.prototype, 'connect')
+    arm(tls, 'connect'); arm(http, 'request'); arm(http, 'get')
+    arm(https, 'request'); arm(https, 'get'); arm(dgram, 'createSocket')
+    const origFetch = global.fetch
+    global.fetch = (...a) => { calls.push('fetch'); throw new Error('network call blocked: fetch') }
+    try {
+      const { deriveBlockShapes } = require('../src/client/blockShapeDerivation')
+      const r = deriveBlockShapes([jar])
+      assert.strictEqual(r.blocks.get('privshapes:ghost_plant').shape, 'nonsolid',
+        'derivation must fully succeed with network armed to throw')
     } finally {
       for (const undo of patched) undo()
       global.fetch = origFetch
@@ -155,6 +236,27 @@ describe('PRIVACY LAW 2 - read-only, jars-only (parse, never execute)', function
     }
     assert.deepStrictEqual(calls, [], `derivation must not write to disk, saw: ${calls.join(', ')}`)
   })
+
+  it('the block-shape derivation writes NOTHING to disk', () => {
+    const jar = synthShapeJar()
+    const writeApis = ['writeFile', 'writeFileSync', 'appendFile', 'appendFileSync', 'createWriteStream', 'mkdir', 'mkdirSync', 'rename', 'renameSync', 'unlink', 'unlinkSync', 'rmdir', 'rmdirSync', 'rm', 'rmSync', 'copyFile', 'copyFileSync', 'writev']
+    const calls = []
+    const undo = []
+    for (const name of writeApis) {
+      if (typeof fs[name] !== 'function') continue
+      const orig = fs[name]
+      fs[name] = function (...a) { calls.push(name); throw new Error(`fs write blocked: ${name}`) }
+      undo.push(() => { fs[name] = orig })
+    }
+    try {
+      const { deriveBlockShapes } = require('../src/client/blockShapeDerivation')
+      const r = deriveBlockShapes([jar])
+      assert.strictEqual(r.blocks.size, 1)
+    } finally {
+      for (const u of undo) u()
+    }
+    assert.deepStrictEqual(calls, [], `derivation must not write to disk, saw: ${calls.join(', ')}`)
+  })
 })
 
 describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function () {
@@ -162,7 +264,8 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
     it(`${mod} imports only local parsing deps`, () => {
       const src = fs.readFileSync(path.join(SRC, mod), 'utf8')
       const requires = [...src.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1])
-      const allowed = new Set(['fs', 'path', 'zlib', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation'])
+      const allowed = new Set(['fs', 'path', 'zlib', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation',
+        './data/blockShapeTables.json'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

@@ -87,6 +87,24 @@ the mod list is never uploaded anywhere, and mod code is never classloaded or
 executed — the jars are read and parsed, never run. (Enforced by
 `test/privacyLaws.test.js`.)
 
+### Modded block shapes (`blockShapeDerivation.js`)
+
+The same local jars also answer a perception question the wire protocol
+cannot: **which modded blocks have no collision** (plants, crops, signs) and
+**how many block states each one registers**, so a modless client can resolve
+modded palette ids to passable blocks instead of treating every modded block
+as a solid cube. `deriveBlockShapes(jarPaths)` statically extracts, per
+registered block: the registry name, the block class's superclass chain, its
+`BlockBehaviour.Properties` no-collision evidence (`noCollission()` /
+`copy()` of a provably no-collision vanilla block), and its state-definition
+property product. All vocabulary is mapping-level (generated from the real
+deobfuscated vanilla jar and published SRG/intermediary mappings by
+`tools/genBlockShapeTables.js` — nothing per-mod), and ambiguous or dynamic
+evidence always ABSTAINS to the conservative solid interpretation. Same
+privacy laws as above: local-only, read-only, never executes mod code, output
+goes only to the embedding client's perception layer. (Enforced by
+`test/privacyLaws.test.js`.)
+
 ## Installation
 
 `npm install minecraft-protocol-forge`

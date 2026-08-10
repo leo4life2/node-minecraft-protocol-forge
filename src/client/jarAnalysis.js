@@ -61,7 +61,7 @@ function parseClassFile (b) {
       case 7: cp[i] = { tag, nameIndex: b.readUInt16BE(o + 1) }; o += 3; break
       case 8: cp[i] = { tag, strIndex: b.readUInt16BE(o + 1) }; o += 3; break
       case 16: case 19: case 20: o += 3; break
-      case 15: o += 4; break
+      case 15: cp[i] = { tag, refKind: b[o + 1], refIndex: b.readUInt16BE(o + 2) }; o += 4; break // MethodHandle
       case 3: cp[i] = { tag, int: b.readInt32BE(o + 1) }; o += 5; break
       case 4: o += 5; break
       case 9: case 10: case 11: cp[i] = { tag, classIndex: b.readUInt16BE(o + 1), natIndex: b.readUInt16BE(o + 3) }; o += 5; break
@@ -105,7 +105,7 @@ function parseClassFile (b) {
     }
     return out
   }
-  readMembers() // fields (skipped)
+  const fields = readMembers().map((f) => ({ name: f.name, desc: f.desc, flags: f.flags }))
   const codes = []
   for (const m of readMembers()) {
     const code = m.attrs.find((a) => a.name === 'Code')
@@ -113,7 +113,95 @@ function parseClassFile (b) {
     const codeLen = b.readUInt32BE(code.start + 4)
     codes.push({ method: m.name, desc: m.desc, flags: m.flags, code: b.slice(code.start + 8, code.start + 8 + codeLen) })
   }
-  return { className, superName, interfaces, cp, codes }
+  // class-level attributes: BootstrapMethods is how invokedynamic call sites
+  // (lambda suppliers in DeferredRegister registrations) resolve to their
+  // implementation methods.
+  let bootstrapMethods = null
+  if (o + 2 <= b.length) {
+    const attrCount = b.readUInt16BE(o); o += 2
+    for (let a = 0; a < attrCount; a++) {
+      if (o + 6 > b.length) break
+      const name = cpUtf8(cp, b.readUInt16BE(o))
+      const len = b.readUInt32BE(o + 2)
+      if (name === 'BootstrapMethods') {
+        const start = o + 6
+        const n = b.readUInt16BE(start)
+        bootstrapMethods = []
+        let p = start + 2
+        for (let i = 0; i < n && p + 4 <= b.length; i++) {
+          const ref = b.readUInt16BE(p)
+          const argc = b.readUInt16BE(p + 2)
+          const args = []
+          for (let j = 0; j < argc; j++) args.push(b.readUInt16BE(p + 4 + j * 2))
+          bootstrapMethods.push({ ref, args })
+          p += 4 + argc * 2
+        }
+      }
+      o += 6 + len
+    }
+  }
+  return { className, superName, interfaces, cp, codes, fields, bootstrapMethods }
+}
+
+// Linear instruction decode with operands resolved against the constant pool:
+// the shared substrate for the registration/props/state-definition scanners.
+// Each decoded row keeps only what the scanners consume.
+function decodeInstructions (code, cp) {
+  const out = []
+  walkBytecode(code, (op, pc) => {
+    const row = { op, pc }
+    switch (op) {
+      case 0x12: { // ldc
+        const c = cp[code[pc + 1]]
+        if (c) { if (c.tag === 8) row.str = cpUtf8(cp, c.strIndex); else if (c.tag === 3) row.int = c.int; else if (c.tag === 7) row.cls = cpUtf8(cp, c.nameIndex) }
+        break
+      }
+      case 0x13: { // ldc_w
+        const c = cp[code.readUInt16BE(pc + 1)]
+        if (c) { if (c.tag === 8) row.str = cpUtf8(cp, c.strIndex); else if (c.tag === 3) row.int = c.int; else if (c.tag === 7) row.cls = cpUtf8(cp, c.nameIndex) }
+        break
+      }
+      case 0x10: row.int = code.readInt8(pc + 1); break // bipush
+      case 0x11: row.int = code.readInt16BE(pc + 1); break // sipush
+      case 0x19: row.aload = code[pc + 1]; break // aload <n>
+      case 0x2a: case 0x2b: case 0x2c: case 0x2d: row.aload = op - 0x2a; break // aload_0..3
+      case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
+        row.int = op - 0x03; break // iconst_m1..iconst_5
+      case 0xb2: case 0xb3: case 0xb4: case 0xb5: // getstatic/putstatic/getfield/putfield
+      case 0xb6: case 0xb7: case 0xb8: case 0xb9: // invokevirtual/special/static/interface
+        row.ref = cpRef(cp, code.readUInt16BE(pc + 1)); break
+      case 0xbb: case 0xbd: case 0xc0: case 0xc1: // new / anewarray / checkcast / instanceof
+        row.cls = cpClassName(cp, code.readUInt16BE(pc + 1)); break
+      case 0xba: { // invokedynamic
+        const c = cp[code.readUInt16BE(pc + 1)]
+        if (c && c.bsmIndex !== undefined) { row.bsmIndex = c.bsmIndex; const nat = cp[c.natIndex]; if (nat) row.samName = cpUtf8(cp, nat.nameIndex) }
+        break
+      }
+      case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f:
+      case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: case 0xa5: case 0xa6:
+      case 0xa7: case 0xa8: case 0xc6: case 0xc7: // if*/goto/jsr/ifnull/ifnonnull
+        row.target = pc + code.readInt16BE(pc + 1); break
+      case 0xc8: case 0xc9: // goto_w / jsr_w
+        row.target = pc + code.readInt32BE(pc + 1); break
+    }
+    out.push(row)
+  })
+  return out
+}
+
+// Resolve an invokedynamic row's implementation method through the class's
+// BootstrapMethods table (LambdaMetafactory: args[1] is the impl handle).
+function resolveLambdaImpl (parsed, bsmIndex) {
+  const bsm = parsed.bootstrapMethods && parsed.bootstrapMethods[bsmIndex]
+  if (!bsm) return null
+  for (const argIdx of bsm.args) {
+    const c = parsed.cp[argIdx]
+    if (c && c.tag === 15) {
+      const ref = cpRef(parsed.cp, c.refIndex)
+      if (ref) return { ...ref, refKind: c.refKind }
+    }
+  }
+  return null
 }
 
 // JVM bytecode walk: fixed instruction lengths, with the four variable-length
@@ -171,6 +259,8 @@ module.exports = {
   zipEntryData,
   parseClassFile,
   walkBytecode,
+  decodeInstructions,
+  resolveLambdaImpl,
   JVM_OP_LEN,
   cpUtf8,
   cpClassName,

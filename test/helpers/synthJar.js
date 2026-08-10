@@ -71,6 +71,21 @@ class ConstantPool {
 
   fieldRef (o, n, d) { return this.ref(9, o, n, d) }
   methodRef (o, n, d) { return this.ref(10, o, n, d) }
+
+  methodHandle (refKind, owner, name, desc) {
+    const r = this.methodRef(owner, name, desc)
+    const out = Buffer.from([15, refKind, 0, 0])
+    out.writeUInt16BE(r, 2)
+    return this._add(`h:${refKind}:${owner}:${name}:${desc}`, out)
+  }
+
+  invokeDynamic (bsmIndex, name, desc) {
+    const nt = this.nat(name, desc)
+    const out = Buffer.from([18, 0, 0, 0, 0])
+    out.writeUInt16BE(bsmIndex, 1)
+    out.writeUInt16BE(nt, 3)
+    return this._add(`d:${bsmIndex}:${name}:${desc}`, out)
+  }
 }
 
 // --- bytecode assembler (only the ops the derivation reasons about) ---
@@ -98,17 +113,28 @@ class Asm {
   invokevirtual (o, n, d) { this.bytes.push(0xb6); this._u16(this.cp.methodRef(o, n, d)); return this }
   invokespecial (o, n, d) { this.bytes.push(0xb7); this._u16(this.cp.methodRef(o, n, d)); return this }
   invokestatic (o, n, d) { this.bytes.push(0xb8); this._u16(this.cp.methodRef(o, n, d)); return this }
+  invokedynamic (bsmIndex, name, desc) { this.bytes.push(0xba); this._u16(this.cp.invokeDynamic(bsmIndex, name, desc)); this.bytes.push(0, 0); return this }
+  areturn () { this.bytes.push(0xb0); return this }
+  goto_ (offset) { this.bytes.push(0xa7); this._u16(offset & 0xffff); return this }
   pop () { this.bytes.push(0x57); return this }
   ret () { this.bytes.push(0xb1); return this }
   code () { return Buffer.from(this.bytes) }
 }
 
-// Builds one .class file: { name, methods: [{name, desc, flags, code(asm)=>void}] }
+// Builds one .class file:
+//   { name, superName?, bootstrapMethods?: [{refKind, owner, name, desc}],
+//     methods: [{name, desc, flags, code(asm)=>void}] }
 function buildClass (spec) {
   const cp = new ConstantPool()
   const thisIdx = cp.cls(spec.name)
-  const superIdx = cp.cls('java/lang/Object')
+  const superIdx = cp.cls(spec.superName || 'java/lang/Object')
   const codeAttr = cp.utf8('Code')
+  // bootstrap methods must be interned before the pool is frozen; each entry
+  // becomes {ref: <handle>, args: [<same handle>]} — enough for
+  // resolveLambdaImpl, which scans args for the implementation MethodHandle.
+  const bsmHandles = (spec.bootstrapMethods || []).map((b) =>
+    cp.methodHandle(b.refKind != null ? b.refKind : 6, b.owner, b.name, b.desc))
+  const bsmAttrName = bsmHandles.length ? cp.utf8('BootstrapMethods') : null
 
   const methods = spec.methods.map((m) => {
     const asm = new Asm(cp)
@@ -152,8 +178,23 @@ function buildClass (spec) {
     const tail = Buffer.alloc(4) // exception_table_length=0, attributes_count=0
     parts.push(mh, ah, cb, m.body, tail)
   }
-  const classAttrs = Buffer.alloc(2)
-  parts.push(classAttrs)
+  if (bsmAttrName != null) {
+    const body = Buffer.alloc(2 + bsmHandles.length * 6)
+    body.writeUInt16BE(bsmHandles.length, 0)
+    bsmHandles.forEach((h, i) => {
+      body.writeUInt16BE(h, 2 + i * 6) // bootstrap_method_ref
+      body.writeUInt16BE(1, 4 + i * 6) // num args
+      body.writeUInt16BE(h, 6 + i * 6) // arg 0: the impl handle
+    })
+    const classAttrs = Buffer.alloc(8)
+    classAttrs.writeUInt16BE(1, 0)
+    classAttrs.writeUInt16BE(bsmAttrName, 2)
+    classAttrs.writeUInt32BE(body.length, 4)
+    parts.push(classAttrs, body)
+  } else {
+    const classAttrs = Buffer.alloc(2)
+    parts.push(classAttrs)
+  }
   return Buffer.concat(parts)
 }
 
