@@ -356,8 +356,398 @@ describe('blockShapeDerivation (Fabric/intermediary era)', function () {
   })
 })
 
+describe('blockShapeDerivation (invoked-ctor overload isolation)', function () {
+  // verifier MEDIUM-1: a nonsolid CONVENIENCE ctor must never poison a
+  // registration that invokes the plain Properties ctor — only the
+  // actually-invoked this()/super() chain contributes signals.
+  function trickJar (useConvenienceCtor) {
+    const owner = 'synth/reg/TrickBlocks'
+    const propsDesc = `L${PROPS};`
+    const trick = 'synth/blocks/TrickBlock'
+    const supplierCode = useConvenienceCtor
+      ? (a) => a
+          .new_(trick).dup()
+          .invokespecial(trick, '<init>', '()V')
+          .areturn()
+      : (a) => a
+          .new_(trick).dup()
+          .invokestatic(PROPS, 'm_284310_', `()${propsDesc}`)
+          .invokespecial(trick, '<init>', `(${propsDesc})V`)
+          .areturn()
+    const reg = buildClass({
+      name: owner,
+      bootstrapMethods: [{ refKind: 6, owner, name: 'lambda$static$0', desc: `()L${BLOCK};` }],
+      methods: [
+        {
+          name: '<clinit>',
+          desc: '()V',
+          flags: 0x0008,
+          code: (a) => a
+            .ldcStr('trickmod')
+            .invokestatic(DR, 'create', `(Ljava/lang/String;)L${DR};`)
+            .putstatic(owner, 'BLOCKS', `L${DR};`)
+            .getstatic(owner, 'BLOCKS', `L${DR};`)
+            .ldcStr('trick_block')
+            .invokedynamic(0, 'get', '()Ljava/util/function/Supplier;')
+            .invokevirtual(DR, 'register', `(Ljava/lang/String;Ljava/util/function/Supplier;)L${RO};`)
+            .pop().ret()
+        },
+        { name: 'lambda$static$0', desc: `()L${BLOCK};`, flags: 0x000a, code: supplierCode }
+      ]
+    })
+    const trickCls = buildClass({
+      name: trick,
+      superName: BLOCK,
+      methods: [
+        // convenience ctor: this(Properties.of().noCollission())
+        {
+          name: '<init>',
+          desc: '()V',
+          flags: 0x0001,
+          code: (a) => a
+            .aload(0)
+            .invokestatic(PROPS, 'm_284310_', `()L${PROPS};`)
+            .invokevirtual(PROPS, 'm_60910_', `()L${PROPS};`)
+            .invokespecial(trick, '<init>', `(L${PROPS};)V`)
+            .ret()
+        },
+        // plain ctor: super(props)
+        {
+          name: '<init>',
+          desc: `(L${PROPS};)V`,
+          flags: 0x0001,
+          code: (a) => a
+            .aload(0).aload(1)
+            .invokespecial(BLOCK, '<init>', `(L${PROPS};)V`)
+            .ret()
+        }
+      ]
+    })
+    return writeJar('trickmod.jar', buildJar([
+      { name: `${owner}.class`, data: reg },
+      { name: `${trick}.class`, data: trickCls }
+    ]))
+  }
+
+  it('plain-ctor registration is NOT poisoned by a sibling nonsolid ctor', function () {
+    const { blocks } = deriveBlockShapes([trickJar(false)])
+    const b = blocks.get('trickmod:trick_block')
+    assert.ok(b, 'registration found')
+    assert.strictEqual(b.shape, 'solid', 'of() through the PLAIN ctor => solid, never nonsolid')
+  })
+
+  it('convenience-ctor registration follows the this() delegation to nonsolid', function () {
+    const { blocks } = deriveBlockShapes([trickJar(true)])
+    const b = blocks.get('trickmod:trick_block')
+    assert.strictEqual(b.shape, 'nonsolid', 'noCollission inside the INVOKED ctor chain => nonsolid')
+  })
+})
+
+describe('blockShapeDerivation (Registrate framework)', function () {
+  const RG_ABS = 'com/tterrag/registrate/AbstractRegistrate'
+  const RG_BB = 'com/tterrag/registrate/builders/BlockBuilder'
+  const RG_ENTRY = 'com/tterrag/registrate/util/entry/BlockEntry'
+  const NNF = 'com/tterrag/registrate/util/nonnull/NonNullFunction'
+  const NNU = 'com/tterrag/registrate/util/nonnull/NonNullUnaryOperator'
+  const NNS = 'com/tterrag/registrate/util/nonnull/NonNullSupplier'
+  const MY_RG = 'rsynth/MyRegistrate'
+  const propsDesc = `L${PROPS};`
+
+  // REGISTRATE = new MyRegistrate("rsmod");
+  // FLOAT_WEED = REGISTRATE.block("float_weed", FloatWeedBlock::new)
+  //   .properties(p -> p.noCollission()).register();
+  // GILDED_SHRUB = REGISTRATE.block("gilded_shrub", ShrubBlock::new)
+  //   .initialProperties(() -> Blocks.TALL_GRASS)[.transform(op)].register();
+  function registrateJar (withTransform) {
+    const owner = 'rsynth/RegBlocks'
+    const myReg = buildClass({
+      name: MY_RG,
+      superName: RG_ABS,
+      methods: [
+        { name: '<init>', desc: '(Ljava/lang/String;)V', flags: 0x0001, code: (a) => a.ret() },
+        { name: 'block', desc: `(Ljava/lang/String;L${NNF};)L${RG_BB};`, flags: 0x0001, code: (a) => a.areturn() }
+      ]
+    })
+    const reg = buildClass({
+      name: owner,
+      bootstrapMethods: [
+        { refKind: 6, owner, name: 'lambda$static$0', desc: `(L${PROPS};)L${BLOCK};` }, // FloatWeedBlock factory
+        { refKind: 6, owner, name: 'lambda$static$1', desc: `(L${PROPS};)L${PROPS};` }, // properties op
+        { refKind: 6, owner, name: 'lambda$static$2', desc: `(L${PROPS};)L${BLOCK};` }, // ShrubBlock factory
+        { refKind: 6, owner, name: 'lambda$static$3', desc: `()L${BLOCK};` } // initialProperties supplier
+      ],
+      methods: [
+        {
+          name: '<clinit>',
+          desc: '()V',
+          flags: 0x0008,
+          code: (a) => {
+            a
+              .new_(MY_RG).dup()
+              .ldcStr('rsmod')
+              .invokespecial(MY_RG, '<init>', '(Ljava/lang/String;)V')
+              .putstatic(owner, 'REGISTRATE', `L${MY_RG};`)
+              // float_weed: nonsolid via builder properties op
+              .getstatic(owner, 'REGISTRATE', `L${MY_RG};`)
+              .ldcStr('float_weed')
+              .invokedynamic(0, 'apply', `()L${NNF};`)
+              .invokevirtual(MY_RG, 'block', `(Ljava/lang/String;L${NNF};)L${RG_BB};`)
+              .invokedynamic(1, 'apply', `()L${NNU};`)
+              .invokevirtual(RG_BB, 'properties', `(L${NNU};)L${RG_BB};`)
+              .invokevirtual(RG_BB, 'register', `()L${RG_ENTRY};`)
+              .putstatic(owner, 'FLOAT_WEED', `L${RG_ENTRY};`)
+              // gilded_shrub: initialProperties(copy of TALL_GRASS)
+              .getstatic(owner, 'REGISTRATE', `L${MY_RG};`)
+              .ldcStr('gilded_shrub')
+              .invokedynamic(2, 'apply', `()L${NNF};`)
+              .invokevirtual(MY_RG, 'block', `(Ljava/lang/String;L${NNF};)L${RG_BB};`)
+              .invokedynamic(3, 'get', `()L${NNS};`)
+              .invokevirtual(RG_BB, 'initialProperties', `(L${NNS};)L${RG_BB};`)
+            if (withTransform) {
+              a.invokedynamic(1, 'apply', `()L${NNU};`)
+                .invokevirtual(RG_BB, 'transform', `(L${NNU};)L${RG_BB};`)
+            }
+            a.invokevirtual(RG_BB, 'register', `()L${RG_ENTRY};`)
+              .putstatic(owner, 'GILDED_SHRUB', `L${RG_ENTRY};`)
+              .ret()
+          }
+        },
+        {
+          name: 'lambda$static$0',
+          desc: `(L${PROPS};)L${BLOCK};`,
+          flags: 0x000a,
+          code: (a) => a
+            .new_('rsynth/FloatWeedBlock').dup().aload(0)
+            .invokespecial('rsynth/FloatWeedBlock', '<init>', `(${propsDesc})V`)
+            .areturn()
+        },
+        {
+          name: 'lambda$static$1',
+          desc: `(L${PROPS};)L${PROPS};`,
+          flags: 0x000a,
+          code: (a) => a
+            .aload(0)
+            .invokevirtual(PROPS, 'm_60910_', `()${propsDesc}`)
+            .areturn()
+        },
+        {
+          name: 'lambda$static$2',
+          desc: `(L${PROPS};)L${BLOCK};`,
+          flags: 0x000a,
+          code: (a) => a
+            .new_('rsynth/ShrubBlock').dup().aload(0)
+            .invokespecial('rsynth/ShrubBlock', '<init>', `(${propsDesc})V`)
+            .areturn()
+        },
+        {
+          name: 'lambda$static$3',
+          desc: `()L${BLOCK};`,
+          flags: 0x000a,
+          code: (a) => a
+            .getstatic(BLOCKS, 'f_50359_', `L${BLOCK};`) // tall_grass (no collision)
+            .areturn()
+        }
+      ]
+    })
+    const weed = buildClass({
+      name: 'rsynth/FloatWeedBlock',
+      superName: FLOWER,
+      methods: [{ name: '<init>', desc: `(L${PROPS};)V`, flags: 0x0001, code: (a) => a.ret() }]
+    })
+    const shrub = buildClass({
+      name: 'rsynth/ShrubBlock',
+      superName: FLOWER,
+      methods: [{ name: '<init>', desc: `(L${PROPS};)V`, flags: 0x0001, code: (a) => a.ret() }]
+    })
+    return writeJar('rsynth.jar', buildJar([
+      { name: `${MY_RG}.class`, data: myReg },
+      { name: 'rsynth/RegBlocks.class', data: reg },
+      { name: 'rsynth/FloatWeedBlock.class', data: weed },
+      { name: 'rsynth/ShrubBlock.class', data: shrub }
+    ]))
+  }
+
+  it('derives builder-chain registrations (modid from the registrate creation)', function () {
+    const { blocks } = deriveBlockShapes([registrateJar(false)])
+    const weed = blocks.get('rsmod:float_weed')
+    assert.ok(weed, 'REGISTRATE.block("float_weed", ...) found')
+    assert.strictEqual(weed.shape, 'nonsolid', 'noCollission inside a .properties(...) op proves nonsolid')
+    assert.strictEqual(weed.stateCount, 1)
+    const shrub = blocks.get('rsmod:gilded_shrub')
+    assert.ok(shrub, 'initialProperties chain found')
+    assert.strictEqual(shrub.shape, 'nonsolid', 'initialProperties(() -> TALL_GRASS) proves nonsolid (no transform)')
+  })
+
+  it('an opaque .transform(...) kills base-copy nonsolid evidence (abstain)', function () {
+    const { blocks } = deriveBlockShapes([registrateJar(true)])
+    const shrub = blocks.get('rsmod:gilded_shrub')
+    assert.ok(shrub)
+    assert.strictEqual(shrub.shape, 'abstain',
+      'a transform can replace initialProperties wholesale - copy evidence must not survive it')
+    const weed = blocks.get('rsmod:float_weed')
+    assert.strictEqual(weed.shape, 'nonsolid', 'noCollission (irreversible in the Properties API) survives')
+  })
+})
+
+describe('blockShapeDerivation (const-namespace consumer-helper idiom)', function () {
+  const RL = 'net/minecraft/resources/ResourceLocation'
+  const propsDesc = `L${PROPS};`
+
+  it('derives registrations routed through a BiConsumer sink helper', function () {
+    const helperOwner = 'bsynth/reg/RegHelper'
+    const helper = buildClass({
+      name: helperOwner,
+      methods: [{
+        name: 'registerBlock',
+        desc: `(Ljava/util/function/BiConsumer;L${BLOCK};Ljava/lang/String;)V`,
+        flags: 0x0009,
+        code: (a) => a
+          .new_(RL).dup()
+          .ldcStr('bopmod')
+          .aload(2)
+          .invokespecial(RL, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V')
+          .aload(0)
+          .aload(1)
+          .invokestatic('bsynth/reg/Sink', 'accept', '(Ljava/lang/Object;Ljava/lang/Object;)V')
+          .ret()
+      }]
+    })
+    const caller = buildClass({
+      name: 'bsynth/reg/BopBlocks',
+      methods: [{
+        name: '<clinit>',
+        desc: '()V',
+        flags: 0x0008,
+        code: (a) => a
+          .getstatic('bsynth/reg/BopBlocks', 'SINK', 'Ljava/util/function/BiConsumer;')
+          .new_('bsynth/GlowBloomBlock').dup()
+          .invokestatic(PROPS, 'm_284310_', `()${propsDesc}`)
+          .invokevirtual(PROPS, 'm_60910_', `()${propsDesc}`)
+          .invokespecial('bsynth/GlowBloomBlock', '<init>', `(${propsDesc})V`)
+          .ldcStr('glow_bloom')
+          .invokestatic(helperOwner, 'registerBlock', `(Ljava/util/function/BiConsumer;L${BLOCK};Ljava/lang/String;)V`)
+          .getstatic('bsynth/reg/BopBlocks', 'SINK', 'Ljava/util/function/BiConsumer;')
+          .new_('bsynth/HardBloomBlock').dup()
+          .invokestatic(PROPS, 'm_284310_', `()${propsDesc}`)
+          .invokespecial('bsynth/HardBloomBlock', '<init>', `(${propsDesc})V`)
+          .ldcStr('hard_bloom')
+          .invokestatic(helperOwner, 'registerBlock', `(Ljava/util/function/BiConsumer;L${BLOCK};Ljava/lang/String;)V`)
+          .ret()
+      }]
+    })
+    const bloom = buildClass({
+      name: 'bsynth/GlowBloomBlock',
+      superName: FLOWER,
+      methods: [{ name: '<init>', desc: `(L${PROPS};)V`, flags: 0x0001, code: (a) => a.ret() }]
+    })
+    const hard = buildClass({
+      name: 'bsynth/HardBloomBlock',
+      superName: BLOCK,
+      methods: [{ name: '<init>', desc: `(L${PROPS};)V`, flags: 0x0001, code: (a) => a.ret() }]
+    })
+    const jar = writeJar('bsynth.jar', buildJar([
+      { name: `${helperOwner}.class`, data: helper },
+      { name: 'bsynth/reg/BopBlocks.class', data: caller },
+      { name: 'bsynth/GlowBloomBlock.class', data: bloom },
+      { name: 'bsynth/HardBloomBlock.class', data: hard }
+    ]))
+    const { blocks } = deriveBlockShapes([jar])
+    const glow = blocks.get('bopmod:glow_bloom')
+    assert.ok(glow, 'consumer-helper registration found (const namespace from the helper body)')
+    assert.strictEqual(glow.shape, 'nonsolid', 'noCollission in the call-site window proves nonsolid')
+    const hardB = blocks.get('bopmod:hard_bloom')
+    assert.ok(hardB, 'statement windows keep neighboring registrations separated')
+    assert.strictEqual(hardB.shape, 'solid', 'the noCollission of the PREVIOUS window must not leak')
+  })
+})
+
+describe('blockShapeDerivation (solved dynamic-body factors)', function () {
+  const MULTIFACE = 'net/minecraft/world/level/block/MultifaceBlock'
+  const BOOL_PROP = 'net/minecraft/world/level/block/state/properties/BooleanProperty'
+
+  it('counts a MultifaceBlock subclass via the equation-solved factor (64 x own props)', function () {
+    const owner = 'msynth/reg/MossBlocks'
+    const moss = 'msynth/CreepMossBlock'
+    const propsDesc = `L${PROPS};`
+    const reg = buildClass({
+      name: owner,
+      bootstrapMethods: [{ refKind: 6, owner, name: 'lambda$static$0', desc: `()L${BLOCK};` }],
+      methods: [
+        {
+          name: '<clinit>',
+          desc: '()V',
+          flags: 0x0008,
+          code: (a) => a
+            .ldcStr('mossmod')
+            .invokestatic(DR, 'create', `(Ljava/lang/String;)L${DR};`)
+            .putstatic(owner, 'BLOCKS', `L${DR};`)
+            .getstatic(owner, 'BLOCKS', `L${DR};`)
+            .ldcStr('creep_moss')
+            .invokedynamic(0, 'get', '()Ljava/util/function/Supplier;')
+            .invokevirtual(DR, 'register', `(Ljava/lang/String;Ljava/util/function/Supplier;)L${RO};`)
+            .pop().ret()
+        },
+        {
+          name: 'lambda$static$0',
+          desc: `()L${BLOCK};`,
+          flags: 0x000a,
+          code: (a) => a
+            .new_(moss).dup()
+            .invokestatic(PROPS, 'm_284310_', `()${propsDesc}`)
+            .invokespecial(moss, '<init>', `(${propsDesc})V`)
+            .areturn()
+        }
+      ]
+    })
+    const mossCls = buildClass({
+      name: moss,
+      superName: MULTIFACE,
+      methods: [
+        { name: '<init>', desc: `(L${PROPS};)V`, flags: 0x0001, code: (a) => a.ret() },
+        {
+          name: '<clinit>',
+          desc: '()V',
+          flags: 0x0008,
+          code: (a) => a
+            .ldcStr('waterlogged')
+            .invokestatic(BOOL_PROP, 'm_61465_', `(Ljava/lang/String;)L${BOOL_PROP};`)
+            .putstatic(moss, 'WATERLOGGED', `L${BOOL_PROP};`)
+            .ret()
+        },
+        {
+          // createBlockStateDefinition: super(builder); builder.add(WATERLOGGED)
+          name: 'm_7926_',
+          desc: `(L${BUILDER};)V`,
+          flags: 0x0004,
+          code: (a) => a
+            .aload(0).aload(1)
+            .invokespecial(MULTIFACE, 'm_7926_', `(L${BUILDER};)V`)
+            .aload(1)
+            .getstatic(moss, 'WATERLOGGED', `L${BOOL_PROP};`)
+            .invokevirtual(BUILDER, 'm_61104_', `([Lnet/minecraft/world/level/block/state/properties/Property;)L${BUILDER};`)
+            .pop().ret()
+        }
+      ]
+    })
+    const jar = writeJar('mossmod.jar', buildJar([
+      { name: `${owner}.class`, data: reg },
+      { name: `${moss}.class`, data: mossCls }
+    ]))
+    const { blocks } = deriveBlockShapes([jar])
+    const b = blocks.get('mossmod:creep_moss')
+    assert.ok(b)
+    assert.strictEqual(b.stateCount, 128,
+      'MultifaceBlock contributes the equation-solved factor 64; own WATERLOGGED doubles it')
+  })
+})
+
 describe('blockShapeDerivation (real jars, when present on this machine)', function () {
   const FD = '/Users/leoli/minepal-coop/modknowledge/jars/forge-1.20.1/FarmersDelight-1.20.1-1.3.2.jar'
+  const LANE_JARS = '/Users/leoli/minepal-coop/modded-block-shapes/registrate/jars'
+  const CREATE = `${LANE_JARS}/create-1.20.1-6.0.8.jar`
+  const BOP = `${LANE_JARS}/BiomesOPlenty-forge-1.20.1-19.0.0.96.jar`
+  const TB = `${LANE_JARS}/TerraBlender-forge-1.20.1-3.0.1.10.jar`
+
   it('Farmers Delight 1.20.1: 132 blocks, wild crops nonsolid, crates solid', function () {
     if (!fs.existsSync(FD)) return this.skip()
     const { blocks, stats } = deriveBlockShapes([FD])
@@ -369,5 +759,32 @@ describe('blockShapeDerivation (real jars, when present on this machine)', funct
     assert.strictEqual(blocks.get('farmersdelight:stove').shape, 'solid')
     assert.strictEqual(blocks.get('farmersdelight:rope').shape, 'abstain', 'getCollisionShape override guard')
     assert.strictEqual(blocks.get('farmersdelight:cabbages').stateCount, 8)
+  })
+
+  it('Create 1.20.1 (Registrate): 186 derived, all counted, rig-proven spots', function () {
+    if (!fs.existsSync(CREATE)) return this.skip()
+    const { blocks, stats } = deriveBlockShapes([CREATE])
+    // 186 of 643 total registry blocks: explicit chains derive; loop-generated
+    // families (dyed/palette variants) abstain per-block by design
+    assert.strictEqual(stats.registrations, 186)
+    assert.strictEqual(stats.counted, 186)
+    assert.strictEqual(blocks.get('create:shaft').shape, 'solid')
+    assert.strictEqual(blocks.get('create:shaft').stateCount, 6, 'axis(3) x waterlogged(2) - rig span-edge exact')
+    assert.strictEqual(blocks.get('create:fluid_pipe').stateCount, 128, '6 faces x waterlogged (interface-constant props)')
+    assert.strictEqual(blocks.get('create:fake_track').shape, 'nonsolid', 'the one nonsolid Create claim - rig-truthed')
+    assert.strictEqual(blocks.get('create:crushing_wheel_controller').shape, 'abstain', 'collision-override guard')
+  })
+
+  it('Biomes O Plenty 1.20.1 (+TerraBlender): 429/429 derived and counted', function () {
+    if (!fs.existsSync(BOP) || !fs.existsSync(TB)) return this.skip()
+    const { blocks, stats } = deriveBlockShapes([BOP, TB])
+    assert.strictEqual(stats.registrations, 429, 'BOP registers 429 blocks - full coverage via the consumer-helper idiom')
+    assert.strictEqual(stats.counted, 429, 'incl. the MultifaceBlock factor blocks')
+    assert.strictEqual(blocks.get('biomesoplenty:orange_cosmos').shape, 'nonsolid')
+    assert.strictEqual(blocks.get('biomesoplenty:rose').stateCount, 1)
+    assert.strictEqual(blocks.get('biomesoplenty:barnacles').stateCount, 128, 'MultifaceBlock factor 64 x waterlogged - rig span-edge exact')
+    assert.strictEqual(blocks.get('biomesoplenty:webbing').stateCount, 64, 'MultifaceBlock factor alone - rig span-edge exact')
+    assert.strictEqual(blocks.get('biomesoplenty:white_sandstone').shape, 'solid')
+    assert.strictEqual(blocks.get('biomesoplenty:blood').shape, 'abstain', 'fluid block - collision-override guard')
   })
 })

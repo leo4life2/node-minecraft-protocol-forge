@@ -308,21 +308,23 @@ function main () {
   // ---- 5. effective property set + count per vanilla block ----------------
   const effectiveProps = (cls) => {
     // walk down from cls: most-derived createBlockStateDefinition, following
-    // super calls upward. dynamic=true anywhere on the effective chain means
-    // the property set is not statically derivable -> honest abstention.
+    // super calls upward. A dynamic (loop/lambda-driven) body contributes an
+    // unknown FACTOR for its whole body (its partially-visible props are
+    // subsumed by the factor); factors are solved below against
+    // minecraft-data totals exactly like unknown property cardinalities.
     const out = []
-    let dynamic = false
+    const dynClasses = []
     let c = cls
     while (c && c !== 'java/lang/Object') {
       const contrib = classContrib[c]
       if (contrib) {
-        out.push(...contrib.props)
-        if (contrib.dynamic) dynamic = true
-        if (!contrib.callsSuper) return { props: out, dynamic }
+        if (contrib.dynamic) dynClasses.push(c)
+        else out.push(...contrib.props)
+        if (!contrib.callsSuper) return { props: out, dynClasses }
       }
       c = hierarchy[c] ?? null
     }
-    return { props: out, dynamic }
+    return { props: out, dynClasses }
   }
 
   // Inherited static fields may be referenced through the SUBCLASS as the
@@ -339,6 +341,7 @@ function main () {
     return pk
   }
 
+  const dynFactor = new Map() // dynamic-bodied class -> solved contribution factor
   const derivedCount = (cls) => {
     const eff = effectiveProps(cls)
     const props = eff.props.map(canonPropKey)
@@ -349,23 +352,33 @@ function main () {
       if (!pc || pc.card == null) unknowns.push(pk)
       else product *= pc.card
     }
-    return { product, unknowns, props, dynamic: eff.dynamic }
+    const dynUnknowns = []
+    for (const dc of eff.dynClasses) {
+      const f = dynFactor.get(dc)
+      if (f != null) product *= f
+      else dynUnknowns.push(dc)
+    }
+    return { product, unknowns, dynUnknowns, props }
   }
 
-  // solve unknown cardinalities against minecraft-data
+  // solve unknown cardinalities AND dynamic-body factors against
+  // minecraft-data. Factors are adopted only when EVERY single-unknown
+  // equation for the class agrees (a disagreement poisons the class: its
+  // body is instance-dependent, so chains through it must abstain).
   let progress = true
   const solved = new Map()
+  const factorPoisoned = new Set()
   while (progress) {
     progress = false
+    const factorCand = new Map() // cls -> Set of candidate factors
     for (const [name, cls] of nameToClass) {
       if (!cls) continue
       const md = mdByName.get(name)
       if (!md) continue
       const truth = md.maxStateId - md.minStateId + 1
-      const { product, unknowns, dynamic } = derivedCount(cls)
-      if (dynamic) continue // abstaining chains give no equations
+      const { product, unknowns, dynUnknowns } = derivedCount(cls)
       const un = [...new Set(unknowns.filter((u) => !solved.has(u)))]
-      if (un.length === 1 && unknowns.filter((u) => u === un[0]).length === 1) {
+      if (dynUnknowns.length === 0 && un.length === 1 && unknowns.filter((u) => u === un[0]).length === 1) {
         const v = truth / product
         if (Number.isInteger(v) && v >= 1) {
           solved.set(un[0], v)
@@ -374,8 +387,29 @@ function main () {
           propCard.set(un[0], pc)
           progress = true
         }
+      } else if (un.length === 0 && dynUnknowns.length === 1 && !factorPoisoned.has(dynUnknowns[0])) {
+        const v = truth / product
+        if (Number.isInteger(v) && v >= 1) {
+          if (!factorCand.has(dynUnknowns[0])) factorCand.set(dynUnknowns[0], new Set())
+          factorCand.get(dynUnknowns[0]).add(v)
+        } else {
+          factorPoisoned.add(dynUnknowns[0]) // non-integer: body not a clean factor
+        }
       }
     }
+    for (const [dc, vals] of factorCand) {
+      if (factorPoisoned.has(dc)) continue
+      if (vals.size === 1) { dynFactor.set(dc, [...vals][0]); progress = true } else {
+        factorPoisoned.add(dc) // instances disagree: instance-dependent body
+      }
+    }
+  }
+  if (dynFactor.size) {
+    console.log('solved dynamic-body factors:',
+      JSON.stringify([...dynFactor].map(([c, f]) => `${c.split('/').pop()}=${f}`)))
+  }
+  if (factorPoisoned.size) {
+    console.log('poisoned dynamic classes (abstain):', [...factorPoisoned].join(', '))
   }
 
   // ---- 6. SELF-TEST -------------------------------------------------------
@@ -391,8 +425,8 @@ function main () {
     if (!md) { failures.push({ name, reason: 'not in minecraft-data' }); continue }
     const truth = md.maxStateId - md.minStateId + 1
     if (!cls) { failures.push({ name, reason: 'no constructed class', truth }); continue }
-    const { product, unknowns, dynamic } = derivedCount(cls)
-    if (dynamic) { abstain++; abstainNames.push(name); continue }
+    const { product, unknowns, dynUnknowns } = derivedCount(cls)
+    if (dynUnknowns.length) { abstain++; abstainNames.push(name); continue }
     if (unknowns.length) { failures.push({ name, cls, reason: `unsolved ${unknowns.join(',')}`, truth }); continue }
     if (product !== truth) { failures.push({ name, cls, reason: `derived ${product} != md ${truth}` }); continue }
     ok++
@@ -491,11 +525,16 @@ function main () {
   // runtime table lookups are direct
   const classContribCanon = {}
   for (const [c, v] of Object.entries(classContrib)) {
-    classContribCanon[c] = {
-      callsSuper: v.callsSuper,
-      props: v.props.map(canonPropKey),
-      ...(v.dynamic ? { dynamic: true } : {}) // dynamic MUST survive: it is the abstain signal
-    }
+    const f = v.dynamic && !factorPoisoned.has(c) ? dynFactor.get(c) : null
+    classContribCanon[c] = f != null
+      // solved dynamic body: the factor subsumes the WHOLE body (incl. its
+      // partially-visible props), so props are dropped for this class
+      ? { callsSuper: v.callsSuper, props: [], contribFactor: f }
+      : {
+          callsSuper: v.callsSuper,
+          props: v.props.map(canonPropKey),
+          ...(v.dynamic ? { dynamic: true } : {}) // dynamic MUST survive: it is the abstain signal
+        }
   }
   const overridesCollision = []
   for (const cls of blockClasses) {
@@ -650,7 +689,12 @@ function translateTables (srg, classMojToObf, memberSrgToObf, tiny) {
         const io = cls(owner)
         const f = memberOrSelf(field)
         return io && f ? `${io}#${f}` : pk
-      })
+      }),
+      // abstain/factor semantics MUST survive translation: dropping `dynamic`
+      // here would make intermediary-era subclasses of loop-driven classes
+      // MISCOUNT (missing contribution) instead of abstaining
+      ...(v.dynamic ? { dynamic: true } : {}),
+      ...(v.contribFactor != null ? { contribFactor: v.contribFactor } : {})
     }
   }
   const propCard = {}

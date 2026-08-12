@@ -191,6 +191,40 @@ describe('PRIVACY LAW 1 - local-only (no network I/O)', function () {
     }
     assert.deepStrictEqual(calls, [], `no network primitive may be invoked, saw: ${calls.join(', ')}`)
   })
+
+  it('Registrate + consumer-helper derivations (real Create/BOP jars) run with network AND fs-writes armed', function () {
+    // the framework-linkage code paths (registrate builder chains, BiConsumer
+    // sink helpers, dynamic-body factor counting) must obey the same laws as
+    // the direct idioms - exercised on the real jars when present
+    const LANE = '/Users/leoli/minepal-coop/modded-block-shapes/registrate/jars'
+    const jars = [`${LANE}/create-1.20.1-6.0.8.jar`, `${LANE}/BiomesOPlenty-forge-1.20.1-19.0.0.96.jar`]
+    if (!jars.every((j) => fs.existsSync(j))) return this.skip()
+    const calls = []
+    const patched = []
+    const arm = (obj, name) => {
+      const orig = obj[name]
+      if (typeof orig !== 'function') return
+      obj[name] = function (...args) { calls.push(`${name}`); throw new Error(`blocked: ${name}`) }
+      patched.push(() => { obj[name] = orig })
+    }
+    arm(net, 'connect'); arm(net, 'createConnection'); arm(net.Socket.prototype, 'connect')
+    arm(tls, 'connect'); arm(http, 'request'); arm(http, 'get')
+    arm(https, 'request'); arm(https, 'get'); arm(dgram, 'createSocket')
+    const writeApis = ['writeFile', 'writeFileSync', 'appendFile', 'appendFileSync', 'createWriteStream', 'mkdir', 'mkdirSync', 'rename', 'renameSync', 'unlink', 'unlinkSync', 'rm', 'rmSync', 'copyFile', 'copyFileSync']
+    for (const name of writeApis) arm(fs, name)
+    const origFetch = global.fetch
+    global.fetch = (...a) => { calls.push('fetch'); throw new Error('blocked: fetch') }
+    try {
+      const { deriveBlockShapes } = require('../src/client/blockShapeDerivation')
+      const r = deriveBlockShapes(jars)
+      assert.ok(r.blocks.size >= 600, `both frameworks must derive under armed laws (got ${r.blocks.size})`)
+      assert.strictEqual(r.blocks.get('biomesoplenty:barnacles').stateCount, 128, 'factor counting works under armed laws')
+    } finally {
+      for (const undo of patched) undo()
+      global.fetch = origFetch
+    }
+    assert.deepStrictEqual(calls, [], `no network/write primitive may be invoked, saw: ${calls.join(', ')}`)
+  })
 })
 
 describe('PRIVACY LAW 2 - read-only, jars-only (parse, never execute)', function () {

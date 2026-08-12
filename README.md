@@ -100,10 +100,19 @@ registered block: the registry name, the block class's superclass chain, its
 property product. All vocabulary is mapping-level (generated from the real
 deobfuscated vanilla jar and published SRG/intermediary mappings by
 `tools/genBlockShapeTables.js` — nothing per-mod), and ambiguous or dynamic
-evidence always ABSTAINS to the conservative solid interpretation. Same
-privacy laws as above: local-only, read-only, never executes mod code, output
-goes only to the embedding client's perception layer. (Enforced by
-`test/privacyLaws.test.js`.)
+evidence always ABSTAINS to the conservative solid interpretation. Besides
+direct `DeferredRegister` / Fabric `Registry.register` idioms, the linkage
+follows two framework-level registration mechanisms (again by structure,
+never by mod identity): Registrate-style fluent builder chains
+(`.block(name, factory)…register()`, with `.properties`/`.initialProperties`
+evidence and opaque `.transform` abstention) and const-namespace
+consumer-helper sinks (a static helper building a `ResourceLocation` from a
+constant namespace plus a name parameter). Loop-driven vanilla state
+definitions are counted through per-class contribution factors the generator
+solves as equations against minecraft-data totals (self-test: every vanilla
+block exact). Same privacy laws as above: local-only, read-only, never
+executes mod code, output goes only to the embedding client's perception
+layer. (Enforced by `test/privacyLaws.test.js`.)
 
 ## Installation
 
