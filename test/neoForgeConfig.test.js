@@ -157,3 +157,38 @@ describe('derivation ground truth (rig corpus, env-gated)', function () {
     }
   })
 })
+
+// GROUND TRUTH (fixture-gated): the HELPER registration shape (HF-NEOFORGE
+// lane). AE2 19.2.17 registers every channel through private static helpers
+// (InitNetwork.clientbound(registrar, TYPE, CODEC) -> registrar.playToClient)
+// and builds each TYPE through a static factory on an interface
+// (CustomAppEngPayload.createType(String) -> new Type(AppEng.makeId(name))),
+// including ONE empty-string path (GuiDataSyncPacket = createType("") -> id
+// "ae2:"). Before the helper/TYPE-factory dispatch + the cpUtf8 empty-string
+// fix, this pack derived ZERO ae2 channels with zero abstains and the live
+// 21.1.248 server kicked "Incompatible client! Please use NeoForge 21.1.248".
+// Expected values decompiled (CFR) from the rig's exact jars.
+describe('derivation ground truth (AE2 helper shape, fixture-gated)', function () {
+  const fs = require('fs')
+  const path = require('path')
+  const root = process.env.MODKNOW_AE2_FIXTURE || '/Users/leoli/minepal-coop/modknowledge/jars/neoforge-21.1.248-ae2'
+  const enabled = fs.existsSync(path.join(root, 'mods'))
+  ;(enabled ? it : it.skip)('derives all 34 ae2 channels through static helpers, TYPE factories, and the empty-path id', function () {
+    this.timeout(30000)
+    const jars = fs.readdirSync(path.join(root, 'mods')).filter((f) => f.endsWith('.jar')).map((f) => path.join(root, 'mods', f))
+    const loaderJar = path.join(root, 'libraries/net/neoforged/neoforge/21.1.248/neoforge-21.1.248-universal.jar')
+    if (fs.existsSync(loaderJar)) jars.push(loaderJar)
+    const { components, diagnostics } = deriveNeoForgeComponents(jars)
+    assert.strictEqual(diagnostics.abstains.length, 0, `no abstains expected, got: ${diagnostics.abstains.join(' | ')}`)
+    const ae2 = components.play.filter((c) => c.id.startsWith('ae2:'))
+    assert.strictEqual(ae2.length, 34)
+    const flows = ae2.reduce((m, c) => { const k = c.flow ?? 'bidirectional'; m[k] = (m[k] || 0) + 1; return m }, {})
+    assert.deepStrictEqual(flows, { clientbound: 17, serverbound: 16, bidirectional: 1 })
+    assert.ok(ae2.every((c) => c.version === 'ae2' && c.optional === false))
+    const empty = ae2.find((c) => c.id === 'ae2:')
+    assert.ok(empty, 'empty-path channel "ae2:" (GuiDataSyncPacket createType("")) must be derived')
+    assert.strictEqual(empty.flow, 'clientbound')
+    const gm = components.play.find((c) => c.id === 'guideme:open_guide')
+    assert.deepStrictEqual({ version: gm.version, flow: gm.flow, optional: gm.optional }, { version: '1.0', flow: 'clientbound', optional: false })
+  })
+})

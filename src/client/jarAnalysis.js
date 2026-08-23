@@ -236,7 +236,11 @@ function walkBytecode (code, visit) {
 }
 
 // - constant-pool convenience shared by the scanners -
-function cpUtf8 (cp, i) { return (cp[i] && cp[i].str) || null }
+// NOTE: the EMPTY string is a legitimate constant — AE2 19.2.17 registers a
+// payload whose ResourceLocation path is "" (createType("") -> id "ae2:").
+// The old `(cp[i] && cp[i].str) || null` collapsed it to null and silently
+// lost the registration (HF-NEOFORGE lane).
+function cpUtf8 (cp, i) { return cp[i] && typeof cp[i].str === 'string' ? cp[i].str : null }
 function cpClassName (cp, i) { return (cp[i] && cp[i].tag === 7 ? cpUtf8(cp, cp[i].nameIndex) : null) }
 // Field/Method/InterfaceMethod ref -> {owner, name, desc}
 function cpRef (cp, i) {

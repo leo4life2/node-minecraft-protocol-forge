@@ -24,6 +24,18 @@
 //              method's own bytecode names which PayloadRegistrar method each
 //              branch of the boolean maps to; virtual dispatch is resolved
 //              against every subclass present in the scanned jars.
+//   HELPER     the registrar is passed as an ARGUMENT into a helper method
+//              whose body performs the real PayloadRegistrar call (AE2
+//              19.2.17 InitNetwork: clientbound(registrar, TYPE, CODEC) ->
+//              registrar.playToClient(TYPE, CODEC, handler); HF-NEOFORGE
+//              lane: this shape was silently invisible — 34 required ae2:*
+//              play channels derived as ZERO with zero abstains, so the
+//              config-phase negotiation failed "Incompatible client!").
+//              Each call site dispatches INTO the callee with the caller's
+//              abstract argument values as locals, so the registrar state
+//              and the per-call payload TYPE flow through; bounded by a
+//              re-entrancy cycle guard + a global frame budget that
+//              abstains loudly instead of spinning.
 //   ENUM-REGISTRY  an enum whose constants each build a Type from
 //              name().toLowerCase(ROOT) + a namespace helper and carry the
 //              payload class; a static method constructs a registry object
@@ -369,6 +381,11 @@ function simulate (index, classInfo, method, state, opts = {}) {
         if (!returnsVoid(desc)) push(UNKNOWN)
         break
       }
+      case 0xb0: { // areturn: hand the returned abstract value to the caller
+        const v = stack.pop()
+        if (v && opts.onReturn) opts.onReturn(v)
+        break
+      }
       case 0xc0: break // checkcast: value unchanged
       default: break
     }
@@ -457,6 +474,28 @@ function handleInvoke (index, classInfo, state, opts, call) {
     return
   }
 
+  // HELPER shape: the registrar itself rides as an argument into a helper
+  // method whose body performs the real registration (AE2's InitNetwork).
+  // Simulate the callee with this call's abstract arguments as its locals —
+  // once per CALL SITE, because each call carries a different payload TYPE.
+  if (argVals.some((a) => a && a.k === 'registrar')) {
+    dispatchRegistrarHelper(index, ref, call.kind, recv, argVals, state, opts)
+    if (!retVoid) push(UNKNOWN)
+    return
+  }
+
+  // TYPE-factory helper: a method that RETURNS a CustomPacketPayload$Type —
+  // simulate its body with this call's arguments and adopt the returned
+  // abstract value (AE2's CustomAppEngPayload.createType(String) ->
+  // new Type(AppEng.makeId(name))). Same bounds as the registrar-helper
+  // dispatch; an unresolvable body pushes UNKNOWN and the registration
+  // abstains loudly downstream.
+  if (ref.desc.endsWith(`)L${PAYLOAD_TYPE_CLASS};`)) {
+    const returned = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts)
+    push(returned ?? UNKNOWN)
+    return
+  }
+
   // namespace helper: static (String) -> ResourceLocation
   if (call.kind === 'static' && ref.desc === `(Ljava/lang/String;)L${RESLOC_TYPE};`) {
     if (ref.owner === RESLOC_TYPE && (ref.name === 'parse' || ref.name === 'tryParse')) {
@@ -481,6 +520,93 @@ function handleInvoke (index, classInfo, state, opts, call) {
   }
 
   if (!retVoid) push(UNKNOWN)
+}
+
+// HELPER shape dispatch: simulate the called method with the caller's
+// abstract argument values as locals so a registrar passed BY ARGUMENT keeps
+// flowing (static helpers seed locals from the args directly; instance
+// helpers seed slot 0 with the receiver). Bounds: a per-path re-entrancy
+// guard kills recursive helper cycles, a global frame budget turns
+// pathological fan-out into a loud abstain (never a wedge), and unresolvable
+// instance declarations fall back to the same scanned-subclass search (and
+// the same >12-override abstain) the wrapper dispatch uses.
+const HELPER_FRAME_BUDGET = 20000
+
+function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) {
+  state.helperStack = state.helperStack || new Set()
+  state.helperFrames = state.helperFrames || 0
+  const key = `${ref.owner}.${ref.name}${ref.desc}`
+  if (state.helperStack.has(key)) return // recursive helper: cycle guard
+  if (++state.helperFrames > HELPER_FRAME_BUDGET) {
+    if (!state.helperBudgetBlown) {
+      state.helperBudgetBlown = true
+      state.diagnostics.abstains.push(`registrar-helper dispatch budget exhausted at ${key} — remaining helper registrations abstained`)
+    }
+    return
+  }
+  const targets = []
+  const ownerInfo = index.get(ref.owner)
+  const hasOwn = ownerInfo && ownerInfo.codes.some((c) => c.method === ref.name && c.desc === ref.desc)
+  if (hasOwn) {
+    targets.push(ref.owner)
+  } else if (kind === 'instance') {
+    for (const name of state.allClassNames) {
+      if (name === ref.owner) continue
+      if (isSubclassOf(index, name, ref.owner)) {
+        const info = index.get(name)
+        if (info && info.codes.some((c) => c.method === ref.name && c.desc === ref.desc)) targets.push(name)
+      }
+    }
+    if (targets.length > 12) {
+      state.diagnostics.abstains.push(`${key}: ${targets.length} overrides carrying a registrar — too many, abstaining`)
+      return
+    }
+  }
+  if (targets.length === 0) return
+  state.helperStack.add(key)
+  try {
+    for (const target of targets) {
+      const info = index.get(target)
+      const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
+      const locals = kind === 'static' ? argVals.slice() : [recv ?? UNKNOWN, ...argVals]
+      // onReturn stripped: a nested registration helper's return value must
+      // never leak into an enclosing TYPE-factory resolution.
+      simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
+    }
+  } finally {
+    state.helperStack.delete(key)
+  }
+}
+
+// Simulate a method body to learn its RETURN value (TYPE-factory helpers).
+// Shares the registrar-helper bounds (cycle guard + frame budget); returns
+// the last type-shaped value the body returned, else the last returned value.
+function simulateForReturn (index, ref, kind, recv, argVals, state, opts) {
+  state.helperStack = state.helperStack || new Set()
+  state.helperFrames = state.helperFrames || 0
+  const key = `${ref.owner}.${ref.name}${ref.desc}`
+  if (state.helperStack.has(key)) return null
+  if (++state.helperFrames > HELPER_FRAME_BUDGET) return null
+  const info = index.get(ref.owner)
+  const m = info && info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
+  if (!m) return null
+  let best = null
+  let last = null
+  state.helperStack.add(key)
+  try {
+    const locals = kind === 'static' ? argVals.slice() : [recv ?? UNKNOWN, ...argVals]
+    simulate(index, info, m, state, {
+      ...opts,
+      locals,
+      onReturn: (v) => {
+        last = v
+        if (v && v.k === 'type') best = v
+      }
+    })
+  } finally {
+    state.helperStack.delete(key)
+  }
+  return best ?? last
 }
 
 // virtual call carrying a registrar-wrapper: simulate the declared method on
