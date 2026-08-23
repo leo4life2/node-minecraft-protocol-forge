@@ -158,6 +158,153 @@ describe('derivation ground truth (rig corpus, env-gated)', function () {
   })
 })
 
+// CTOR-BODY shape (HF-R2, deterministic synthetic jars): a mod that receives
+// the registrar as a CONSTRUCTOR argument and registers its channels directly
+// inside the <init> body (new Networking(event.registrar("3")) with
+// registrar.playToClient(...) in the ctor). Same silent-miss family as the
+// landed HELPER shape: before the ctor-body dispatch, handleInvoke returned
+// at <init> before the helper dispatch, so this shape derived ZERO channels
+// with ZERO abstains — invisible to the honesty layer. Also pins that the
+// cycle guard terminates a self-recursive ctor and still lands its
+// registration.
+describe('derivation CTOR-BODY shape (synthetic jars, deterministic)', function () {
+  const fs = require('fs')
+  const os = require('os')
+  const path = require('path')
+  const { buildClass, buildJar } = require('./helpers/synthJar')
+
+  const EVENT = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
+  const REG = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
+  const TYPE = 'net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type'
+  const RL = 'net/minecraft/resources/ResourceLocation'
+
+  function payloadClass (name, ns, pathStr) {
+    // <clinit>: TYPE = new Type(ResourceLocation.fromNamespaceAndPath(ns, path))
+    return buildClass({
+      name,
+      methods: [{
+        name: '<clinit>',
+        desc: '()V',
+        flags: 0x0008,
+        code: (a) => a
+          .new_(TYPE).dup()
+          .ldcStr(ns).ldcStr(pathStr)
+          .invokestatic(RL, 'fromNamespaceAndPath', `(Ljava/lang/String;Ljava/lang/String;)L${RL};`)
+          .invokespecial(TYPE, '<init>', `(L${RL};)V`)
+          .putstatic(name, 'TYPE', `L${TYPE};`)
+          .ret()
+      }]
+    })
+  }
+
+  function register (a, regMethod, payloadOwner) {
+    // registrar on stack top expected as local 1: aload(1) done by caller
+    return a
+      .getstatic(payloadOwner, 'TYPE', `L${TYPE};`)
+      .iconst(0).iconst(0) // codec + handler placeholders
+      .invokevirtual(REG, regMethod, `(L${TYPE};Ljava/lang/Object;Ljava/lang/Object;)L${REG};`)
+      .pop()
+  }
+
+  function synthCtorMod () {
+    const entry = 'synth/ctor/ModInit'
+    const net = 'synth/ctor/Networking'
+    const rec = 'synth/ctor/RecNet'
+    const ping = 'synth/ctor/PingPacket'
+    const state = 'synth/ctor/StatePacket'
+    const recp = 'synth/ctor/RecPacket'
+    const entryCls = buildClass({
+      name: entry,
+      methods: [{
+        name: 'onRegister',
+        desc: `(L${EVENT};)V`,
+        flags: 0x0009,
+        code: (a) => a
+          // new Networking(event.registrar("3"))
+          .new_(net).dup()
+          .aload(0).ldcStr('3')
+          .invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`)
+          .invokespecial(net, '<init>', `(L${REG};)V`)
+          .pop()
+          // new RecNet(event.registrar("7")) — self-recursive ctor
+          .new_(rec).dup()
+          .aload(0).ldcStr('7')
+          .invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`)
+          .invokespecial(rec, '<init>', `(L${REG};)V`)
+          .pop()
+          .ret()
+      }]
+    })
+    const netCls = buildClass({
+      name: net,
+      methods: [{
+        name: '<init>',
+        desc: `(L${REG};)V`,
+        flags: 0x0001,
+        code: (a) => {
+          a.aload(1)
+          register(a, 'playToClient', ping)
+          a.aload(1)
+          register(a, 'configurationToClient', state)
+          return a.ret()
+        }
+      }]
+    })
+    const recCls = buildClass({
+      name: rec,
+      methods: [{
+        name: '<init>',
+        desc: `(L${REG};)V`,
+        flags: 0x0001,
+        code: (a) => {
+          // pathological self-recursion: new RecNet(registrar) inside own ctor
+          a.new_(rec).dup().aload(1)
+            .invokespecial(rec, '<init>', `(L${REG};)V`)
+            .pop()
+          a.aload(1)
+          register(a, 'playToServer', recp)
+          return a.ret()
+        }
+      }]
+    })
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'synthjar-ctorbody-'))
+    const jar = path.join(dir, 'ctorbody.jar')
+    fs.writeFileSync(jar, buildJar([
+      { name: `${entry}.class`, data: entryCls },
+      { name: `${net}.class`, data: netCls },
+      { name: `${rec}.class`, data: recCls },
+      { name: `${ping}.class`, data: payloadClass(ping, 'synthctor', 'ping') },
+      { name: `${state}.class`, data: payloadClass(state, 'synthctor', 'state') },
+      { name: `${recp}.class`, data: payloadClass(recp, 'synthctor', 'rec') }
+    ]))
+    return jar
+  }
+
+  it('derives channels registered inside a constructor body that received the registrar', () => {
+    const jar = synthCtorMod()
+    const { components, diagnostics } = deriveNeoForgeComponents([jar])
+    assert.strictEqual(diagnostics.abstains.length, 0, `no abstains expected, got: ${diagnostics.abstains.join(' | ')}`)
+    const play = new Map(components.play.map((c) => [c.id, c]))
+    const cfg = new Map(components.configuration.map((c) => [c.id, c]))
+    const ping = play.get('synthctor:ping')
+    assert.ok(ping, 'ctor-body playToClient registration must be derived')
+    assert.deepStrictEqual(
+      { version: ping.version, flow: ping.flow, optional: ping.optional, versionSource: ping.versionSource },
+      { version: '3', flow: 'clientbound', optional: false, versionSource: 'constant' })
+    const state = cfg.get('synthctor:state')
+    assert.ok(state, 'ctor-body configurationToClient registration must be derived')
+    assert.deepStrictEqual({ version: state.version, flow: state.flow }, { version: '3', flow: 'clientbound' })
+  })
+
+  it('cycle guard terminates a self-recursive ctor and still lands its registration', () => {
+    const jar = synthCtorMod()
+    const { components } = deriveNeoForgeComponents([jar])
+    const rec = components.play.find((c) => c.id === 'synthctor:rec')
+    assert.ok(rec, 'self-recursive ctor registration must still be derived (guard skips only the re-entry)')
+    assert.deepStrictEqual({ version: rec.version, flow: rec.flow }, { version: '7', flow: 'serverbound' })
+  })
+})
+
 // GROUND TRUTH (fixture-gated): the HELPER registration shape (HF-NEOFORGE
 // lane). AE2 19.2.17 registers every channel through private static helpers
 // (InitNetwork.clientbound(registrar, TYPE, CODEC) -> registrar.playToClient)

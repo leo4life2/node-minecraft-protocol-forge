@@ -406,6 +406,21 @@ function handleInvoke (index, classInfo, state, opts, call) {
         recv.v = argVals[0].v
       }
     }
+    // CTOR-BODY shape (HF-R2, same silent-miss family as the HELPER shape):
+    // a registrar passed INTO a constructor whose body performs the real
+    // registrations (new Networking(registrar) with registrar.playToClient
+    // in the <init> body). This branch used to return BEFORE the helper
+    // dispatch below, so such registrations derived NOTHING with zero
+    // abstains — invisible to the honesty layer. Dispatch into the <init>
+    // body with the ctor args as locals (slot 0 = the object under
+    // construction), under the same re-entrancy cycle guard + global frame
+    // budget as the registrar-helper dispatch. The WRAPPER shape is
+    // unaffected: wrapper ctors only store fields (putfield is a no-op to
+    // the interpreter) and their registrations still resolve through the
+    // wrapper-method analysis on later calls.
+    if (argVals.some((a) => a && a.k === 'registrar')) {
+      dispatchCtorBody(index, ref, recv, argVals, state, opts)
+    }
     return
   }
 
@@ -573,6 +588,40 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
       // never leak into an enclosing TYPE-factory resolution.
       simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
     }
+  } finally {
+    state.helperStack.delete(key)
+  }
+}
+
+// CTOR-BODY shape dispatch: simulate a constructor body that received a
+// registrar as an argument (new Networking(registrar) registering channels
+// directly in <init>). Exactly-known target — invokespecial <init> binds to
+// ref.owner's own constructor, never a subclass override — so no scanned-
+// subclass search: if the owner class (or its exact <init> descriptor) is
+// not in the scanned jars there is nothing to simulate. Shares the
+// registrar-helper cycle guard (self-recursive ctors terminate) and the
+// global frame budget (pathological fan-out abstains loudly).
+function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
+  state.helperStack = state.helperStack || new Set()
+  state.helperFrames = state.helperFrames || 0
+  const key = `${ref.owner}.${ref.name}${ref.desc}`
+  if (state.helperStack.has(key)) return // self-recursive ctor: cycle guard
+  if (++state.helperFrames > HELPER_FRAME_BUDGET) {
+    if (!state.helperBudgetBlown) {
+      state.helperBudgetBlown = true
+      state.diagnostics.abstains.push(`registrar-helper dispatch budget exhausted at ${key} — remaining helper registrations abstained`)
+    }
+    return
+  }
+  const info = index.get(ref.owner)
+  const m = info && info.codes.find((c) => c.method === '<init>' && c.desc === ref.desc)
+  if (!m) return
+  state.helperStack.add(key)
+  try {
+    const locals = [recv ?? UNKNOWN, ...argVals]
+    // onReturn stripped for the same reason as the helper dispatch: a ctor
+    // body's stray areturn must never leak into a TYPE-factory resolution.
+    simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
   } finally {
     state.helperStack.delete(key)
   }
