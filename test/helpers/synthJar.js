@@ -135,10 +135,12 @@ class Asm {
   }
 
   lconst (v) { this.bytes.push(0x09 + v); return this } // lconst_0/1
+  fconst (v) { this.bytes.push(0x0b + v); return this } // fconst_0/1/2
   dconst (v) { this.bytes.push(0x0e + v); return this } // dconst_0/1
   ldc2Long (v) { this.bytes.push(0x14); this._u16(this.cp.long(v)); return this }
   ldc2Double (v) { this.bytes.push(0x14); this._u16(this.cp.double(v)); return this }
   lload (n) { this.bytes.push(0x1e + n); return this } // lload_n
+  fload (n) { this.bytes.push(0x22 + n); return this } // fload_n
   dload (n) { this.bytes.push(0x26 + n); return this } // dload_n
   new_ (name) { this.bytes.push(0xbb); this._u16(this.cp.cls(name)); return this }
   dup () { this.bytes.push(0x59); return this }

@@ -575,6 +575,103 @@ describe('derivation category-2 (long/double) argument modeling (HF-R3, syntheti
     assert.deepStrictEqual(ids, ['synthcat2:dnet', 'synthcat2:lnet', 'synthcat2:ping', 'synthcat2:pong', 'synthcat2:wided', 'synthcat2:widej'])
     assert.strictEqual(diagnostics.abstains.length, 0)
   })
+
+  // Category-1 FLOAT short forms (fconst_0/1/2, fload_n) are the same
+  // missing-push family: a float is ONE slot so LOCALS seeding was never
+  // wrong, but an unmodeled fconst/fload inside or feeding a registration
+  // body ate the value beneath it and the registration silently missed
+  // (HF-R3 verify MEDIUM-1, probes VR1/VR2 — RED pre-settlement with the
+  // exact P8 signature: derived=false, zero abstains).
+  function synthFloatMod () {
+    const entry = 'synth/flt/ModInit'
+    const helpers = 'synth/flt/Helpers'
+    const pFC = 'synth/flt/FloatCPacket' // fconst inline codec arg
+    const pFA = 'synth/flt/FloatAPacket' // float call-site arg + fload in body
+    const EAT = 'synth/flt/Eat' // absent from the jar: opaque codec factory
+
+    const entryCls = buildClass({
+      name: entry,
+      methods: [{
+        name: 'onRegister',
+        desc: `(L${EVENT};)V`,
+        flags: 0x0009,
+        code: (a) => a
+          .aload(0).ldcStr('21')
+          .invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`)
+          .astore(1)
+          // registrar at slot 0 of wideF-analog: fconst_1 inline codec arg
+          .aload(1)
+          .getstatic(pFC, 'TYPE', `L${TYPE};`)
+          .invokestatic(helpers, 'floatC', `(L${REG};L${TYPE};)V`)
+          // float CALL-SITE arg: fconst_0 pushes the F, registrar follows it
+          .fconst(0)
+          .aload(1)
+          .getstatic(pFA, 'TYPE', `L${TYPE};`)
+          .invokestatic(helpers, 'floatA', `(FL${REG};L${TYPE};)V`)
+          .ret()
+      }]
+    })
+
+    const helpersCls = buildClass({
+      name: helpers,
+      methods: [{
+        // fconst_1 as inline codec-factory argument — same shape as wideJ
+        // with a float literal: pre-settlement the missing push made codecF
+        // eat TYPE and the registration vanish with zero abstains
+        name: 'floatC',
+        desc: `(L${REG};L${TYPE};)V`,
+        flags: 0x0009,
+        code: (a) => a
+          .aload(0)
+          .aload(1)
+          .fconst(1)
+          .invokestatic(EAT, 'codecF', '(F)Ljava/lang/Object;')
+          .iconst(0)
+          .invokevirtual(REG, 'configurationToClient', `(L${TYPE};Ljava/lang/Object;Ljava/lang/Object;)L${REG};`)
+          .pop()
+          .ret()
+      },
+      {
+        // float ARG (slot 0, ONE slot — registrar at slot 1 needs no filler)
+        // reloaded via fload_0 as the codec argument inside the body
+        name: 'floatA',
+        desc: `(FL${REG};L${TYPE};)V`,
+        flags: 0x0009,
+        code: (a) => a
+          .aload(1)
+          .aload(2)
+          .fload(0)
+          .invokestatic(EAT, 'codecF', '(F)Ljava/lang/Object;')
+          .iconst(0)
+          .invokevirtual(REG, 'playToServer', `(L${TYPE};Ljava/lang/Object;Ljava/lang/Object;)L${REG};`)
+          .pop()
+          .ret()
+      }]
+    })
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'synthjar-flt-'))
+    const jar = path.join(dir, 'flt.jar')
+    fs.writeFileSync(jar, buildJar([
+      { name: `${entry}.class`, data: entryCls },
+      { name: `${helpers}.class`, data: helpersCls },
+      { name: `${pFC}.class`, data: payloadClass(pFC, 'synthflt', 'floatc') },
+      { name: `${pFA}.class`, data: payloadClass(pFA, 'synthflt', 'floata') }
+    ]))
+    return jar
+  }
+
+  it('keeps the abstract stack coherent through fconst/fload_n (category-1 float short forms)', () => {
+    const { components, diagnostics } = deriveNeoForgeComponents([synthFloatMod()])
+    assert.strictEqual(diagnostics.abstains.length, 0, `no abstains expected, got: ${diagnostics.abstains.join(' | ')}`)
+    const cfg = new Map(components.configuration.map((c) => [c.id, c]))
+    const play = new Map(components.play.map((c) => [c.id, c]))
+    const fc = cfg.get('synthflt:floatc')
+    assert.ok(fc, 'registration after an inline fconst_1 codec argument must be derived')
+    assert.deepStrictEqual({ version: fc.version, flow: fc.flow }, { version: '21', flow: 'clientbound' })
+    const fa = play.get('synthflt:floata')
+    assert.ok(fa, 'registration with a float call-site arg + fload_0 codec argument must be derived')
+    assert.deepStrictEqual({ version: fa.version, flow: fa.flow }, { version: '21', flow: 'serverbound' })
+  })
 })
 
 // GROUND TRUTH (fixture-gated): the HELPER registration shape (HF-NEOFORGE

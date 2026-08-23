@@ -319,6 +319,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
       // any values beneath them were eaten by later pops and registrations
       // downstream silently missed.
       case 0x09: case 0x0a: push(UNKNOWN); break // lconst_0/1
+      case 0x0b: case 0x0c: case 0x0d: push(UNKNOWN); break // fconst_0/1/2
       case 0x0e: case 0x0f: push(UNKNOWN); break // dconst_0/1
       case 0x10: push(vInt(code.readInt8(pc + 1))); break
       case 0x11: push(vInt(code.readInt16BE(pc + 1))); break
@@ -336,6 +337,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
         push(locals[code[pc + 1]] ?? UNKNOWN); break
       case 0x1a: case 0x1b: case 0x1c: case 0x1d: push(locals[op - 0x1a] ?? UNKNOWN); break // iload_n
       case 0x1e: case 0x1f: case 0x20: case 0x21: push(locals[op - 0x1e] ?? UNKNOWN); break // lload_n (one abstract push)
+      case 0x22: case 0x23: case 0x24: case 0x25: push(locals[op - 0x22] ?? UNKNOWN); break // fload_n
       case 0x26: case 0x27: case 0x28: case 0x29: push(locals[op - 0x26] ?? UNKNOWN); break // dload_n (one abstract push)
       case 0x2a: case 0x2b: case 0x2c: case 0x2d: push(locals[op - 0x2a] ?? UNKNOWN); break // aload_n
       case 0x36: case 0x37: case 0x38: case 0x39: case 0x3a:
