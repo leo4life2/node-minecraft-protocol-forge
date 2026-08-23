@@ -186,6 +186,23 @@ function argSlots (desc) {
 
 function returnsVoid (desc) { return desc.endsWith(')V') }
 
+// Seed a callee's locals from a call's abstract argument values, laying them
+// out at REAL JVM slot numbers: a category-2 argument (J/D) occupies TWO
+// local slots, so a filler slot follows each long/double (HF-R3, verifier
+// probe P8 — without the filler, every argument AFTER a J/D in the
+// descriptor sits one slot low and a registrar there silently misses its
+// registrations with zero abstains). The value itself is modeled as ONE
+// abstract stack entry (matching ldc2_w), so only LOCALS carry the filler.
+function seedArgLocals (desc, argVals, recvVal) {
+  const locals = recvVal === undefined ? [] : [recvVal]
+  const types = argSlots(desc)
+  for (let i = 0; i < types.length; i++) {
+    locals.push(argVals[i] ?? UNKNOWN)
+    if (types[i] === 'J' || types[i] === 'D') locals.push(UNKNOWN) // second slot of the category-2 value
+  }
+  return locals
+}
+
 // ---------- abstract values ----------
 
 const UNKNOWN = null
@@ -295,6 +312,14 @@ function simulate (index, classInfo, method, state, opts = {}) {
       case 0x01: push(UNKNOWN); break // aconst_null
       case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
         push(vInt(op - 0x03)); break
+      // Category-2 constants/loads model as ONE abstract push (matching the
+      // ldc2_w handling below): a long/double is a single value on this
+      // abstract stack — only the LOCALS layout carries its second slot
+      // (see seedArgLocals). Before HF-R3 these opcodes pushed NOTHING, so
+      // any values beneath them were eaten by later pops and registrations
+      // downstream silently missed.
+      case 0x09: case 0x0a: push(UNKNOWN); break // lconst_0/1
+      case 0x0e: case 0x0f: push(UNKNOWN); break // dconst_0/1
       case 0x10: push(vInt(code.readInt8(pc + 1))); break
       case 0x11: push(vInt(code.readInt16BE(pc + 1))); break
       case 0x12: case 0x13: {
@@ -310,6 +335,8 @@ function simulate (index, classInfo, method, state, opts = {}) {
       case 0x15: case 0x16: case 0x17: case 0x18: case 0x19:
         push(locals[code[pc + 1]] ?? UNKNOWN); break
       case 0x1a: case 0x1b: case 0x1c: case 0x1d: push(locals[op - 0x1a] ?? UNKNOWN); break // iload_n
+      case 0x1e: case 0x1f: case 0x20: case 0x21: push(locals[op - 0x1e] ?? UNKNOWN); break // lload_n (one abstract push)
+      case 0x26: case 0x27: case 0x28: case 0x29: push(locals[op - 0x26] ?? UNKNOWN); break // dload_n (one abstract push)
       case 0x2a: case 0x2b: case 0x2c: case 0x2d: push(locals[op - 0x2a] ?? UNKNOWN); break // aload_n
       case 0x36: case 0x37: case 0x38: case 0x39: case 0x3a:
         locals[code[pc + 1]] = stack.pop(); break
@@ -555,7 +582,7 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
   if (++state.helperFrames > HELPER_FRAME_BUDGET) {
     if (!state.helperBudgetBlown) {
       state.helperBudgetBlown = true
-      state.diagnostics.abstains.push(`registrar-helper dispatch budget exhausted at ${key} — remaining helper registrations abstained`)
+      state.diagnostics.abstains.push(`registration dispatch budget exhausted at ${key} — remaining registrations abstained`)
     }
     return
   }
@@ -583,7 +610,7 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
     for (const target of targets) {
       const info = index.get(target)
       const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
-      const locals = kind === 'static' ? argVals.slice() : [recv ?? UNKNOWN, ...argVals]
+      const locals = kind === 'static' ? seedArgLocals(ref.desc, argVals) : seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
       // onReturn stripped: a nested registration helper's return value must
       // never leak into an enclosing TYPE-factory resolution.
       simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
@@ -609,7 +636,7 @@ function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
   if (++state.helperFrames > HELPER_FRAME_BUDGET) {
     if (!state.helperBudgetBlown) {
       state.helperBudgetBlown = true
-      state.diagnostics.abstains.push(`registrar-helper dispatch budget exhausted at ${key} — remaining helper registrations abstained`)
+      state.diagnostics.abstains.push(`registration dispatch budget exhausted at ${key} — remaining registrations abstained`)
     }
     return
   }
@@ -618,7 +645,7 @@ function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
   if (!m) return
   state.helperStack.add(key)
   try {
-    const locals = [recv ?? UNKNOWN, ...argVals]
+    const locals = seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
     // onReturn stripped for the same reason as the helper dispatch: a ctor
     // body's stray areturn must never leak into a TYPE-factory resolution.
     simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
@@ -643,7 +670,7 @@ function simulateForReturn (index, ref, kind, recv, argVals, state, opts) {
   let last = null
   state.helperStack.add(key)
   try {
-    const locals = kind === 'static' ? argVals.slice() : [recv ?? UNKNOWN, ...argVals]
+    const locals = kind === 'static' ? seedArgLocals(ref.desc, argVals) : seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
     simulate(index, info, m, state, {
       ...opts,
       locals,
@@ -681,7 +708,7 @@ function dispatchVirtual (index, ref, argVals, state, opts) {
   for (const target of targets) {
     const info = index.get(target)
     const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
-    const locals = [UNKNOWN, ...argVals]
+    const locals = seedArgLocals(ref.desc, argVals, UNKNOWN)
     simulate(index, info, m, state, { ...opts, locals })
   }
 }

@@ -51,6 +51,35 @@ class ConstantPool {
     return this._add(`i:${v}`, out)
   }
 
+  // Category-2 constants (tag 5/6) occupy TWO constant-pool slots; a phantom
+  // zero-length entry keeps this builder's index accounting aligned with the
+  // JVM's (parseClassFile skips the second slot the same way).
+  long (v) {
+    const key = `j:${v}`
+    if (this.map.has(key)) return this.map.get(key)
+    const out = Buffer.alloc(9)
+    out[0] = 5
+    out.writeBigInt64BE(BigInt(v), 1)
+    this.entries.push(out)
+    const idx = this.entries.length
+    this.map.set(key, idx)
+    this.entries.push(Buffer.alloc(0)) // phantom second slot
+    return idx
+  }
+
+  double (v) {
+    const key = `d:${v}`
+    if (this.map.has(key)) return this.map.get(key)
+    const out = Buffer.alloc(9)
+    out[0] = 6
+    out.writeDoubleBE(v, 1)
+    this.entries.push(out)
+    const idx = this.entries.length
+    this.map.set(key, idx)
+    this.entries.push(Buffer.alloc(0)) // phantom second slot
+    return idx
+  }
+
   nat (name, desc) {
     const n = this.utf8(name)
     const d = this.utf8(desc)
@@ -105,9 +134,16 @@ class Asm {
     return this
   }
 
+  lconst (v) { this.bytes.push(0x09 + v); return this } // lconst_0/1
+  dconst (v) { this.bytes.push(0x0e + v); return this } // dconst_0/1
+  ldc2Long (v) { this.bytes.push(0x14); this._u16(this.cp.long(v)); return this }
+  ldc2Double (v) { this.bytes.push(0x14); this._u16(this.cp.double(v)); return this }
+  lload (n) { this.bytes.push(0x1e + n); return this } // lload_n
+  dload (n) { this.bytes.push(0x26 + n); return this } // dload_n
   new_ (name) { this.bytes.push(0xbb); this._u16(this.cp.cls(name)); return this }
   dup () { this.bytes.push(0x59); return this }
   aload (n) { this.bytes.push(0x2a + n); return this }
+  astore (n) { this.bytes.push(0x4b + n); return this } // astore_n
   getstatic (o, n, d) { this.bytes.push(0xb2); this._u16(this.cp.fieldRef(o, n, d)); return this }
   putstatic (o, n, d) { this.bytes.push(0xb3); this._u16(this.cp.fieldRef(o, n, d)); return this }
   invokevirtual (o, n, d) { this.bytes.push(0xb6); this._u16(this.cp.methodRef(o, n, d)); return this }
