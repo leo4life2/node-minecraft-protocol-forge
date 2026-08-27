@@ -1,0 +1,97 @@
+// NeoForge universal-jar locator — the ONE selector of the local loader jar
+// the component derivation claims built-in channels from.
+//
+// The neoforge universal jar carries NetworkInitialization (the built-in
+// channel registrations that opt into registry sync + data-map negotiation).
+// Launchers keep it in a `libraries` tree near the instance: vanilla launcher
+// .minecraft/libraries, CurseForge minecraft/Install/libraries, servers
+// ./libraries. A machine often carries SEVERAL builds side by side (shared
+// libraries trees, multiple instances), and the server's config-phase kick
+// names the exact build it runs ("NeoForge 21.1.216" — NetworkRegistry,
+// wire truth). Selection law:
+//   1. when the caller knows the server's announced build
+//      (preferredVersion) and that exact build exists locally, use it —
+//      wire truth we can honor;
+//   2. otherwise the numerically newest local build (segment-wise numeric
+//      compare — lexicographic sort ranks 21.1.9 above 21.1.100 and is
+//      wrong for real NeoForge build numbers).
+// Nothing here fabricates anything: no local jar, no built-in claims.
+//
+// PRIVACY: local filesystem reads only, bounded walk (5 levels up from each
+// mods folder), never touches the network.
+'use strict'
+
+const fs = require('fs')
+const path = require('path')
+
+/** Segment-wise numeric-aware version compare (non-numeric segments compare as strings). */
+function compareNeoForgeVersions (a, b) {
+  const as = String(a).split(/[.-]/)
+  const bs = String(b).split(/[.-]/)
+  const len = Math.max(as.length, bs.length)
+  for (let i = 0; i < len; i++) {
+    const av = as[i]
+    const bv = bs[i]
+    if (av === undefined) return -1
+    if (bv === undefined) return 1
+    const an = /^\d+$/.test(av) ? Number(av) : NaN
+    const bn = /^\d+$/.test(bv) ? Number(bv) : NaN
+    if (!Number.isNaN(an) && !Number.isNaN(bn)) {
+      if (an !== bn) return an - bn
+    } else if (av !== bv) {
+      return av < bv ? -1 : 1
+    }
+  }
+  return 0
+}
+
+/**
+ * Every neoforge universal jar reachable from the mods folder(s):
+ * Map<version, jarPath>. First hit wins per version (nearest tree).
+ */
+function collectNeoForgeUniversalJars (modsPaths) {
+  const found = new Map()
+  for (const modsDir of modsPaths || []) {
+    let dir = path.resolve(modsDir)
+    for (let depth = 0; depth < 5; depth++) {
+      dir = path.dirname(dir)
+      for (const libRoot of [path.join(dir, 'libraries'), path.join(dir, 'Install', 'libraries')]) {
+        const neoRoot = path.join(libRoot, 'net', 'neoforged', 'neoforge')
+        let versions = []
+        try { versions = fs.readdirSync(neoRoot) } catch { continue }
+        for (const v of versions) {
+          if (found.has(v)) continue
+          const jar = path.join(neoRoot, v, `neoforge-${v}-universal.jar`)
+          if (fs.existsSync(jar)) found.set(v, jar)
+        }
+      }
+    }
+  }
+  return found
+}
+
+/**
+ * The loader jar(s) the derivation should read (0 or 1 entries).
+ *
+ * @param {string[]} modsPaths resolved local mods folder(s)
+ * @param {{preferredVersion?: string|null}} options preferredVersion = the
+ *   build the SERVER announced (kick/hint wire truth); honored only when
+ *   that exact build exists locally — never invented.
+ * @returns {{jars: string[], version: string|null, matchedPreferred: boolean}}
+ */
+function pickNeoForgeLoaderJars (modsPaths, options = {}) {
+  const preferred = options.preferredVersion || null
+  const found = collectNeoForgeUniversalJars(modsPaths)
+  if (found.size === 0) return { jars: [], version: null, matchedPreferred: false }
+  if (preferred && found.has(preferred)) {
+    return { jars: [found.get(preferred)], version: preferred, matchedPreferred: true }
+  }
+  const newest = [...found.keys()].sort(compareNeoForgeVersions).pop()
+  return { jars: [found.get(newest)], version: newest, matchedPreferred: false }
+}
+
+module.exports = {
+  collectNeoForgeUniversalJars,
+  pickNeoForgeLoaderJars,
+  compareNeoForgeVersions
+}

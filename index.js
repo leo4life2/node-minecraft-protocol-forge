@@ -29,6 +29,7 @@ module.exports = {
   decodeOptimized: require('./src/client/decodeOptimized'),
   installTolerantPlayParser: require('./src/client/tolerantPlayParser'),
   neoForgeConfig: require('./src/client/neoForgeConfig'),
+  neoForgeLoaderLocator: require('./src/client/neoForgeLoaderLocator'),
   deriveNeoForgeComponents: require('./src/client/neoForgePayloadDerivation').deriveNeoForgeComponents,
   resolveForgeRegistryName,
   resolveForgeItemName,

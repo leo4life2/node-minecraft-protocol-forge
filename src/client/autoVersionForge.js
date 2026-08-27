@@ -25,33 +25,20 @@ function listModJars (modsPaths) {
 
 // The neoforge universal jar carries NetworkInitialization (the built-in
 // channel registrations that opt into registry sync + data-map negotiation).
-// Launchers keep it in a `libraries` tree near the instance: vanilla
-// launcher .minecraft/libraries, CurseForge minecraft/Install/libraries,
-// servers ./libraries. Walk a few levels up from the mods folder and take
-// the newest universal jar found. Missing is tolerated (mod channels alone
-// still negotiate; registry sync is then skipped by the server).
-function findNeoForgeLoaderJars (modsPaths) {
-  for (const modsDir of modsPaths || []) {
-    let dir = path.resolve(modsDir)
-    for (let depth = 0; depth < 5; depth++) {
-      dir = path.dirname(dir)
-      for (const libRoot of [path.join(dir, 'libraries'), path.join(dir, 'Install', 'libraries')]) {
-        const neoRoot = path.join(libRoot, 'net', 'neoforged', 'neoforge')
-        try {
-          const versions = fs.readdirSync(neoRoot).sort().reverse()
-          for (const v of versions) {
-            const jar = path.join(neoRoot, v, `neoforge-${v}-universal.jar`)
-            if (fs.existsSync(jar)) {
-              debug(`neoforge universal jar located: ${jar}`)
-              return [jar]
-            }
-          }
-        } catch { /* no libraries tree here */ }
-      }
-    }
+// Selection semantics live in neoForgeLoaderLocator (one selector: exact
+// server-announced build first, else numerically newest local build).
+// Missing is tolerated (mod channels alone still negotiate; registry sync is
+// then skipped by the server).
+const { pickNeoForgeLoaderJars } = require('./neoForgeLoaderLocator')
+
+function findNeoForgeLoaderJars (modsPaths, preferredVersion) {
+  const picked = pickNeoForgeLoaderJars(modsPaths, { preferredVersion })
+  if (picked.jars.length > 0) {
+    debug(`neoforge universal jar located: ${picked.jars[0]}${picked.matchedPreferred ? ' (matches the server-announced build)' : ''}`)
+  } else {
+    debug('no neoforge universal jar found near the mods folder(s) — built-in channels unclaimed')
   }
-  debug('no neoforge universal jar found near the mods folder(s) — built-in channels unclaimed')
-  return []
+  return picked.jars
 }
 
 // 1.20.2 moved the Forge handshake from the login state into the vanilla
@@ -179,7 +166,7 @@ module.exports = function (client, options) {
     }
     const modsPaths = options.modsPaths || options.owoModsPaths || []
     const jarPaths = listModJars(modsPaths)
-    const loaderJars = options.neoForgeLoaderJars || findNeoForgeLoaderJars(modsPaths)
+    const loaderJars = options.neoForgeLoaderJars || findNeoForgeLoaderJars(modsPaths, options.neoForgePreferredVersion)
     if (jarPaths.length === 0) {
       debug('NeoForge 1.20.5+ server detected but no local mod jars resolved — attempting vanilla join')
       return
