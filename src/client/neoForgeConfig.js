@@ -39,6 +39,56 @@
 // optional serverbound registrations, no claim needed — NetworkRegistry
 // .hasAdhocChannel).
 //
+// HF6 — the loader contract rides TWO lawful wires (read verbatim from the
+// neoforged/NeoForge 1.21.1 branch sources):
+//
+//   1. CLAIMS (versioned tuples in the `neoforge:register` answer) stay
+//      JAR-DERIVED ONLY. Versions are negotiation inputs (String.equals) and
+//      only the local universal jar gives version truth; nothing is ever
+//      fabricated. Claims are additionally INTERSECTED with this responder's
+//      handler contract (below): a clientbound configuration built-in we
+//      cannot answer is never claimed, because several configuration tasks
+//      block on a client reply and a claimed-but-ignored payload wedges the
+//      phase (the no-blind-accept law).
+//
+//   2. LISTENING DECLARATION (new): a real NeoForge client also declares the
+//      channels it listens on via the vanilla `minecraft:register` payload
+//      (Dinnerbone protocol, NUL-separated ids, NO versions —
+//      DinnerboneProtocolUtils.CHANNELS_CODEC; NetworkRegistry
+//      .initializeNeoForgeConnection client-side). The server handles that
+//      payload UNCONDITIONALLY, before any negotiation state exists
+//      (ServerCommonPacketListenerImpl patch: "Neo: Unconditionally handle
+//      register/unregister payloads" -> NetworkRegistry.onMinecraftRegister
+//      -> the connection's AD-HOC channel set), and the send-path guard
+//      consults exactly that set as its last tier (NetworkRegistry
+//      .hasChannel: negotiated setup -> common channels -> ad-hoc).
+//
+// WHY the declaration is load-bearing (the HF6 receipt): NetworkRegistry
+// .checkPacket throws UnsupportedOperationException("Payload %s may not be
+// sent to the client!") for any clientbound custom payload outside the
+// negotiation carriers (BUILTIN_PAYLOADS), the minecraft namespace, and
+// hasChannel — killing the connection with vanilla's "Internal Exception"
+// disconnect. `neoforge:extensible_enum_data` is NOT a carrier: it is a
+// normal optional("1") configurationToClient registration
+// (NetworkInitialization, since 21.0.127-beta / PR #1305 — every 21.1.x
+// build has it), and CheckExtensibleEnums.start() sends it UNCONDITIONALLY
+// to every non-memory NEOFORGE-type connection with no hasChannel gate
+// (unlike its siblings: RegistryDataMapNegotiation and CheckFeatureFlags
+// both gate, SyncRegistries/SyncConfig gate at registration). So a client
+// that answered the query (NEOFORGE type) without claiming that channel —
+// exactly what happens when no local universal jar can be found and the
+// built-ins go unclaimed — makes the SERVER crash its own send. Declaring
+// the handler contract over `minecraft:register` at query time (before our
+// component answer, so the ad-hoc set is populated before any task runs)
+// makes that send lawful with nothing invented: the declaration carries no
+// versions, and every declared channel is one this stack truly implements
+// (the configuration handler contract) or lawfully tolerates (the reply-free
+// clientbound PLAY built-ins — see TOLERATED_CLIENTBOUND_PLAY_CHANNELS: play
+// sends share the same crash class, e.g. IEntityExtension.sendPairingData
+// ships neoforge:advanced_add_entity ungated for IEntityWithComplexSpawn
+// entities, and the ad-hoc set is connection-scoped so one declaration
+// covers both phases).
+//
 // Everything here is bytes-on-the-wire per the decompiled STREAM_CODECs; no
 // guessing. FriendlyByteBuf primitives: varint, utf8 string (varint length),
 // ResourceLocation (string), Optional (bool prefix), map (varint count of
@@ -62,6 +112,56 @@ const SNAPSHOT_REGISTRIES = {
   'minecraft:item': 'item',
   'minecraft:block': 'block',
   'minecraft:entity_type': 'entity_type'
+}
+
+// HF6 — the responder's HANDLER CONTRACT: every clientbound (or
+// bidirectional) configuration-phase channel the switch below truly
+// implements. This is a fact about THIS FILE, not a guess about any server:
+// it is what we declare over `minecraft:register` (listening declaration)
+// and the ceiling for clientbound neoforge:* configuration CLAIMS (the
+// intersection law). A channel outside this list is neither declared nor
+// claimed — a payload whose semantics we cannot honor is refused at the
+// boundary, never silently mishandled (`neoforge:split` falls out of claims
+// here by the same law: this transport cannot reassemble split payloads).
+const HANDLED_CLIENTBOUND_CONFIG_CHANNELS = Object.freeze([
+  'neoforge:frozen_registry_sync_start',
+  'neoforge:frozen_registry',
+  'neoforge:frozen_registry_sync_completed',
+  'neoforge:known_registry_data_maps',
+  'neoforge:extensible_enum_data',
+  'neoforge:feature_flags',
+  'neoforge:config_file'
+])
+
+// HF6 — the TOLERATED play-phase contract: NeoForge's clientbound PLAY
+// built-ins, every one a pure informational toClient stream with NO reply
+// semantics (NetworkInitialization, 1.21.1 branch: all playToClient, no
+// serverbound counterpart registered; corroborated by the 21.1.248 universal
+// jar derivation — the play neoforge:* set carries no serverbound flow).
+// The play phase has no blocking tasks, so ignoring these is protocol-sound;
+// it is also exactly what happens today when they ride the negotiated setup
+// from a jar-derived claim (the play parser tolerates unknown custom
+// payloads). They must be DECLARED because play sends share the receipt's
+// crash class: e.g. IEntityExtension.sendPairingData ships
+// `neoforge:advanced_add_entity` for every IEntityWithComplexSpawn entity
+// with no hasChannel gate — a NEOFORGE-type connection that neither claimed
+// nor declared it dies on the server's own send the moment such an entity
+// spawns in view.
+const TOLERATED_CLIENTBOUND_PLAY_CHANNELS = Object.freeze([
+  'neoforge:advanced_add_entity',
+  'neoforge:advanced_open_screen',
+  'neoforge:auxiliary_light_data',
+  'neoforge:registry_data_map_sync',
+  'neoforge:advanced_container_set_data',
+  'neoforge:custom_time_packet',
+  'neoforge:sync_attachments'
+])
+
+// Vanilla `minecraft:register` payload body: NUL-separated channel ids, no
+// versions (DinnerboneProtocolUtils.CHANNELS_CODEC, 1.21.1 branch — the
+// reader splits on '\0' and parses the trailing segment too).
+function encodeDinnerboneChannels (channels) {
+  return Buffer.from(channels.join('\u0000'), 'utf8')
 }
 
 // --- FriendlyByteBuf primitives ---
@@ -299,16 +399,45 @@ function encodeKnownDataMapsReply (maps) {
  *   claimBuiltins: boolean | undefined, // default true: claim the optional
  *     // neoforge built-in channels that opt into registry sync + data-map
  *     // negotiation (the ones this responder can actually answer)
+ *   declareListening: boolean | undefined, // default true: declare the
+ *     // handler contract over `minecraft:register` at query time (HF6 —
+ *     // populates the server's ad-hoc channel set so its send-path guard
+ *     // accepts the configuration built-ins its tasks send unconditionally)
  * }} options
  */
 function installNeoForgeConfigNegotiation (client, options = {}) {
-  const components = options.components || { configuration: [], play: [] }
+  const rawComponents = options.components || { configuration: [], play: [] }
+  const declareListening = options.declareListening !== false
+  // HF6 intersection law (header §1): a clientbound/bidirectional neoforge:*
+  // built-in outside the phase's contract must never be claimed — a
+  // configuration task may block on a reply we cannot give, and an unknown
+  // play built-in has semantics we cannot vouch for. Mod channels and
+  // serverbound built-ins (our own acks/replies) pass through untouched.
+  // (`neoforge:split` falls out of both contracts by the same law.)
+  const unclaimedBuiltins = []
+  const builtinFilter = (contract) => (c) => {
+    if (typeof c.id !== 'string' || !c.id.startsWith('neoforge:')) return true
+    if (c.flow === 'serverbound') return true
+    if (contract.includes(c.id)) return true
+    unclaimedBuiltins.push(c.id)
+    return false
+  }
+  const components = {
+    configuration: (rawComponents.configuration || []).filter(builtinFilter(HANDLED_CLIENTBOUND_CONFIG_CHANNELS)),
+    play: (rawComponents.play || []).filter(builtinFilter(TOLERATED_CLIENTBOUND_PLAY_CHANNELS))
+  }
+  if (unclaimedBuiltins.length > 0) {
+    debug(`neoforge config: refusing to claim ${unclaimedBuiltins.length} configuration built-in(s) this responder cannot answer: ${unclaimedBuiltins.join(', ')}`)
+  }
   const state = {
     negotiated: false,
     setup: null,
     registries: {},
     frozenRegistryCount: 0,
     dataMapsAnswered: false,
+    declaredListening: null,
+    unclaimedBuiltins,
+    unhandled: [],
     log: []
   }
   client.neoForgeConfig = state
@@ -329,6 +458,21 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           // component sets BEFORE the vanilla pong can classify us as a
           // vanilla client (the query always precedes ping(0), so a
           // synchronous reply is ordered ahead of nmp's pong).
+          //
+          // HF6 — LISTENING DECLARATION first (header §2): the server
+          // handles `minecraft:register` unconditionally into the
+          // connection's ad-hoc channel set, and processes our packets in
+          // order, so declaring BEFORE the component answer guarantees the
+          // ad-hoc set is populated before negotiation completes and any
+          // configuration task (CheckExtensibleEnums sends with no
+          // hasChannel gate) can crash its own send. Nothing is invented:
+          // the declaration is version-free and names only channels this
+          // responder implements.
+          if (declareListening) {
+            state.declaredListening = [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS]
+            debug(`neoforge config: declaring ${state.declaredListening.length} listening channels over minecraft:register`)
+            send('minecraft:register', encodeDinnerboneChannels(state.declaredListening))
+          }
           const reply = encodeNetworkQuery(components)
           debug(`neoforge config: query received, claiming ${components.configuration.length} configuration + ${components.play.length} play components`)
           send('neoforge:register', reply)
@@ -402,6 +546,18 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           break
         }
         default:
+          // HF6 boundary honesty: a neoforge:* configuration payload outside
+          // the handler contract is SURFACED, never silently swallowed and
+          // never answered with an invented reply. (Post-intersection we
+          // never claim such a channel, and post-declaration we never
+          // declare it, so a lawful server will not send one — this firing
+          // means a server-side unconditional send of a payload newer than
+          // this responder, the same class as the HF6 receipt.)
+          if (typeof channel === 'string' && channel.startsWith('neoforge:')) {
+            state.unhandled.push(channel)
+            debug(`neoforge config: UNHANDLED neoforge payload ${channel} (${data.length} bytes) — surfacing, not answering`)
+            client.emit('neoForgeUnhandledPayload', { channel, bytes: data.length })
+          }
           break
       }
     } catch (err) {
@@ -413,6 +569,9 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
 
 module.exports = {
   installNeoForgeConfigNegotiation,
+  HANDLED_CLIENTBOUND_CONFIG_CHANNELS,
+  TOLERATED_CLIENTBOUND_PLAY_CHANNELS,
+  encodeDinnerboneChannels,
   encodeNetworkQuery,
   decodeNetworkSetup,
   decodeSetupFailed,
