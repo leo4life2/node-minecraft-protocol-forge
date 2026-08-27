@@ -92,7 +92,14 @@ function methodEvents (parsed, m) {
   const { cp } = parsed
   const ev = []
   const code = m.code
-  walkBytecode(code, (op, pc) => {
+  // Every event carries `insn`: its ordinal in the FULL instruction walk,
+  // modeled or not. Adjacency checks (resolveLocalIndex) use it to prove
+  // that NO unmodeled instruction (imul/iadd/ineg/...) sits between a value
+  // push and its consumer — unmodeled arithmetic is invisible to the event
+  // stream, so without this a computed store would present a WRONG value
+  // as proven.
+  let insn = 0
+  const handle = (op, pc) => {
     if (op === 0x12 || op === 0x13) { // ldc / ldc_w
       const c = cp[op === 0x12 ? code[pc + 1] : code.readUInt16BE(pc + 1)]
       if (!c) return
@@ -143,6 +150,12 @@ function methodEvents (parsed, m) {
       // poisons LOCAL int-counter simulation (values may be branch-dependent)
       ev.push({ k: 'br' })
     }
+  }
+  walkBytecode(code, (op, pc) => {
+    const before = ev.length
+    handle(op, pc)
+    for (let i = before; i < ev.length; i++) ev[i].insn = insn
+    insn++
   })
   return ev
 }
@@ -393,10 +406,20 @@ function resolveLocalIndex (ev, slot, useEvIdx) {
   for (let i = 0; i < useEvIdx; i++) {
     const e = ev[i]
     if (e.k === 'istore' && e.slot === slot) {
-      // only a store of an immediately-preceding pushed constant is provable;
-      // storing a computed value poisons the local
+      // Only a store of a DIRECTLY-ADJACENT pushed constant is provable —
+      // adjacency by instruction ordinal, not event order: any instruction
+      // between the push and the store (unmodeled arithmetic like imul is
+      // invisible to the event stream) means the stored value is computed,
+      // which poisons the local. Wrong answers are worse than no answer.
       const prev = ev[i - 1]
-      value = prev && prev.k === 'int' ? prev.v : null
+      const adjacent = prev && prev.insn === e.insn - 1
+      if (adjacent && prev.k === 'int') {
+        value = prev.v
+      } else if (adjacent && prev.k === 'iload' && prev.slot === slot) {
+        // self-store: value unchanged
+      } else {
+        value = null
+      }
     } else if (e.k === 'iinc' && e.slot === slot) {
       if (value != null) value += e.delta
     }

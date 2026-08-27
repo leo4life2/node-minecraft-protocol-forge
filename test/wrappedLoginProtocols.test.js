@@ -84,3 +84,35 @@ describe('WRAPPED_LOGIN_PROTOCOLS', function () {
     )
   })
 })
+
+// FML2 responder (forgeHandshake2) — the same default case, guarded shapes.
+describe('FML2 responder default case', function () {
+  const forgeHandshake2 = require('../src/client/forgeHandshake2')
+
+  // FML2 install removes nmp's own onLoginPluginRequest listener and calls
+  // client.registerChannel, so the stub needs both present.
+  function makeFml2Client () {
+    const client = makeClient()
+    client.registerChannel = () => {}
+    client.on('login_plugin_request', function onLoginPluginRequest () {})
+    return client
+  }
+
+  it('empty wrapped payload: length-guarded FML convention ack, never a readVarInt throw (L2 pin)', () => {
+    // An empty inner payload has no discriminator to read. The guard must
+    // answer it as its own honest shape (convention ack on the originating
+    // channel) instead of reaching readVarInt and replying from a catch.
+    const client = makeFml2Client()
+    forgeHandshake2(client, {})
+    client.emit('login_plugin_request', {
+      messageId: 7,
+      channel: 'fml:loginwrapper',
+      data: wrap('somemod:channel', Buffer.alloc(0))
+    })
+    assert.strictEqual(client.written.length, 1, 'exactly one reply')
+    const { name, params } = client.written[0]
+    assert.strictEqual(name, 'login_plugin_response')
+    assert.strictEqual(params.messageId, 7)
+    assert.deepStrictEqual(params.data, wrap('somemod:channel', writeVarInt(99)))
+  })
+})

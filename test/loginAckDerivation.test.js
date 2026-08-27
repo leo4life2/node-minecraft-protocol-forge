@@ -318,7 +318,7 @@ describe('loginAckDerivation - real shipped jars (ground truth)', function () {
 // C2SAcknowledgePacket — index byte 0 + empty body (IndexedMessageCodec
 // writeByte / readUnsignedByte; login index never on the wire).
 
-function synthLocalCounterMod ({ ns, seed = 0, ackFirst = true, branch = false, packages }) {
+function synthLocalCounterMod ({ ns, seed = 0, ackFirst = true, branch = false, computed = false, packages }) {
   const scPkg = packages === 'fml2' ? 'net/minecraftforge/fml/network' : 'net/minecraftforge/network'
   const sc = `${scPkg}/simple/SimpleChannel`
   const mb = `${scPkg}/simple/SimpleChannel$MessageBuilder`
@@ -370,6 +370,10 @@ function synthLocalCounterMod ({ ns, seed = 0, ackFirst = true, branch = false, 
         desc: '()V',
         code: (a) => {
           a.iconst(seed).istore(0)
+          // `index = index * 2;` — iload_0 iconst_2 imul istore_0: the imul
+          // is invisible to the event stream, so the istore must NOT be
+          // proven by the (non-adjacent) iconst_2 event before it
+          if (computed) a.iload(0).iconst(2).imul().istore(0)
           if (branch) a.iconst(0).ifeq(4) // any branch poisons the simulation
           if (ackFirst) { site(a, ack, 'LOGIN_TO_SERVER'); site(a, login, 'LOGIN_TO_CLIENT') } else { site(a, login, 'LOGIN_TO_CLIENT'); site(a, ack, 'LOGIN_TO_SERVER') }
           return a.ret()
@@ -409,6 +413,18 @@ describe('loginAckDerivation - local-int-counter shape (calio class)', function 
     const r = deriveLoginAck('lseed:channel', [dir])
     assert.ok(r)
     assert.strictEqual(r.index, 3)
+  })
+
+  it('abstains on a computed store: unmodeled arithmetic between push and istore (M1 pin)', () => {
+    // `int index = 0; index = index * 2;` — before the adjacency poison the
+    // event stream saw iconst_2 immediately before the istore and derived
+    // index 2 (truth: 0), presenting a WRONG value as proven. The store
+    // resolution must abstain whenever ANY instruction sits between the
+    // value push and the store.
+    const dir = synthLocalCounterMod({ ns: 'limul', computed: true })
+    assert.strictEqual(deriveLoginAck('limul:channel', [dir]), null)
+    // the channel IS known locally -> honest underivable, never the 99 guess
+    assert.strictEqual(assessLoginChannel('limul:channel', [dir]).verdict, 'underivable')
   })
 
   it('abstains when the registration method branches (simulation no longer provable)', () => {

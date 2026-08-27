@@ -227,6 +227,15 @@ module.exports = function (client, options) {
           // mod channel — the old fml:handshake-wrapped acknowledge was
           // delivered to the FML handshake handler while the waiting mod
           // channel never saw an answer.
+          if (loginwrapper.data.length === 0) {
+            // An EMPTY wrapped payload carries no discriminator — it is its
+            // own honest shape (nothing to read, nothing to derive), not a
+            // readVarInt failure to catch and fall through from. Answer with
+            // the FML convention acknowledge on the originating channel.
+            debug(`empty ${loginwrapper.channel} login payload - FML convention ack`)
+            client.write('login_plugin_response', { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, encodeAcknowledgement()) })
+            break
+          }
           try {
             const disc = readVarInt(loginwrapper.data, 0)
             const resolved = resolveWrappedModLogin(client, loginwrapper.channel, disc.value, loginwrapper.data.slice(disc.size), options)
