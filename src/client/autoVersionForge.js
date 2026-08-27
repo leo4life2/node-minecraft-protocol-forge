@@ -97,7 +97,9 @@ module.exports = function (client, options) {
       return
     }
 
-    forgeHandshake2(client, { forgeMods })
+    // modsPaths: same source as FML3 — jar-derived wrapped-channel login
+    // replies (and honest failures) also apply to the FML2 login phase
+    forgeHandshake2(client, { forgeMods, modsPaths: options.modsPaths || options.owoModsPaths })
   })
 
   // FML3 (1.18 - 1.20.1): fmlNetworkVersion 3; mods and channels are packed

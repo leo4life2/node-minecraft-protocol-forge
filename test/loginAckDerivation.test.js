@@ -17,7 +17,7 @@ const os = require('os')
 const path = require('path')
 const { EventEmitter } = require('events')
 
-const { deriveLoginAck } = require('../src/client/loginAckDerivation')
+const { deriveLoginAck, assessLoginChannel } = require('../src/client/loginAckDerivation')
 const forgeHandshake3 = require('../src/client/forgeHandshake3')
 const { writeVarInt, writeString } = forgeHandshake3
 const { buildClass, buildJar } = require('./helpers/synthJar')
@@ -305,5 +305,202 @@ describe('loginAckDerivation - real shipped jars (ground truth)', function () {
   it('zeta: abstains (echo protocol, not an empty ack - the table must keep owning it)', function () {
     if (!fs.existsSync(ZOMBIE_MODS)) return this.skip()
     assert.strictEqual(deriveLoginAck('zeta:main', [ZOMBIE_MODS]), null)
+  })
+})
+
+// --- local-int-counter registrations (HF2 lane: the calio class) ------------
+//
+// Ground truth: calio-forge-1.20.1-1.11.0.5.jar, CalioNetwork#register —
+// javac's straight-line `int index = 0; CHANNEL.messageBuilder(cls, index++,
+// DIR)` idiom (iconst_0/istore_0 ... iload_0/iinc 0,1), the channel RL built
+// through a helper (CalioAPI.resource) that lives OUTSIDE the hot class set.
+// The Forge 1.20.1 receipt: the client's reply must be the mod's own
+// C2SAcknowledgePacket — index byte 0 + empty body (IndexedMessageCodec
+// writeByte / readUnsignedByte; login index never on the wire).
+
+function synthLocalCounterMod ({ ns, seed = 0, ackFirst = true, branch = false, packages }) {
+  const scPkg = packages === 'fml2' ? 'net/minecraftforge/fml/network' : 'net/minecraftforge/network'
+  const sc = `${scPkg}/simple/SimpleChannel`
+  const mb = `${scPkg}/simple/SimpleChannel$MessageBuilder`
+  const nd = `${scPkg}/NetworkDirection`
+  const nr = `${scPkg}/NetworkRegistry`
+  const owner = `synth/${ns}/Net`
+  const api = `synth/${ns}/API`
+  const ack = `synth/${ns}/Ack`
+  const login = `synth/${ns}/LoginSync`
+
+  const site = (a, cls, direction) => a
+    .getstatic(owner, 'CHANNEL', `L${sc};`)
+    .ldcCls(cls)
+    .iload(0)
+    .iinc(0, 1)
+    .getstatic(nd, direction, `L${nd};`)
+    .invokevirtual(sc, 'messageBuilder', `(Ljava/lang/Class;IL${nd};)L${mb};`)
+    .invokevirtual(mb, 'loginIndex', `(Ljava/util/function/Function;Ljava/util/function/BiConsumer;)L${mb};`)
+    .invokevirtual(mb, 'add', '()V')
+
+  const apiClass = buildClass({
+    name: api,
+    methods: [{
+      name: 'resource',
+      desc: `(Ljava/lang/String;)L${RL};`,
+      code: (a) => a
+        .new_(RL).dup().ldcStr(ns).aload(0)
+        .invokespecial(RL, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V')
+        .areturn()
+    }]
+  })
+
+  const net = buildClass({
+    name: owner,
+    methods: [
+      {
+        name: '<clinit>',
+        desc: '()V',
+        flags: 0x0008,
+        code: (a) => a
+          .ldcStr('channel')
+          .invokestatic(api, 'resource', `(Ljava/lang/String;)L${RL};`)
+          .invokestatic(nr, 'newSimpleChannel', `(L${RL};)L${sc};`)
+          .putstatic(owner, 'CHANNEL', `L${sc};`)
+          .ret()
+      },
+      {
+        name: 'register',
+        desc: '()V',
+        code: (a) => {
+          a.iconst(seed).istore(0)
+          if (branch) a.iconst(0).ifeq(4) // any branch poisons the simulation
+          if (ackFirst) { site(a, ack, 'LOGIN_TO_SERVER'); site(a, login, 'LOGIN_TO_CLIENT') } else { site(a, login, 'LOGIN_TO_CLIENT'); site(a, ack, 'LOGIN_TO_SERVER') }
+          return a.ret()
+        }
+      }
+    ]
+  })
+
+  return writeJarDir(ns, [
+    { name: `${api}.class`, data: apiClass },
+    { name: `${owner}.class`, data: net },
+    { name: `${ack}.class`, data: emptyEncoderClass(ack) },
+    { name: `${login}.class`, data: busyEncoderClass(login) }
+  ])
+}
+
+describe('loginAckDerivation - local-int-counter shape (calio class)', function () {
+  it('calio-exact shape: helper-built RL + local counter, ack first -> index 0, single 0x00 byte', () => {
+    const dir = synthLocalCounterMod({ ns: 'lcalio' })
+    const r = deriveLoginAck('lcalio:channel', [dir])
+    assert.ok(r, 'derivation must succeed')
+    assert.strictEqual(r.index, 0)
+    assert.deepStrictEqual(r.reply, Buffer.from([0x00]))
+    assert.strictEqual(r.msgClass, 'synth/lcalio/Ack')
+  })
+
+  it('counts the local counter: ack registered second -> index 1', () => {
+    const dir = synthLocalCounterMod({ ns: 'lsecond', ackFirst: false })
+    const r = deriveLoginAck('lsecond:channel', [dir])
+    assert.ok(r)
+    assert.strictEqual(r.index, 1)
+    assert.deepStrictEqual(r.reply, Buffer.from([0x01]))
+  })
+
+  it('honors a nonzero local seed', () => {
+    const dir = synthLocalCounterMod({ ns: 'lseed', seed: 3 })
+    const r = deriveLoginAck('lseed:channel', [dir])
+    assert.ok(r)
+    assert.strictEqual(r.index, 3)
+  })
+
+  it('abstains when the registration method branches (simulation no longer provable)', () => {
+    const dir = synthLocalCounterMod({ ns: 'lbranch', branch: true })
+    assert.strictEqual(deriveLoginAck('lbranch:channel', [dir]), null)
+    // ...but the channel IS known locally, so the verdict is an honest
+    // underivable, never the FML-99 guess
+    assert.strictEqual(assessLoginChannel('lbranch:channel', [dir]).verdict, 'underivable')
+  })
+
+  it('derives the FML2-era package (net/minecraftforge/fml/network/simple) identically', () => {
+    const dir = synthLocalCounterMod({ ns: 'loldpkg', packages: 'fml2' })
+    const r = deriveLoginAck('loldpkg:channel', [dir])
+    assert.ok(r, 'old-package derivation must succeed')
+    assert.strictEqual(r.index, 0)
+    assert.deepStrictEqual(r.reply, Buffer.from([0x00]))
+  })
+})
+
+describe('assessLoginChannel verdicts', function () {
+  it("'unknown' when no local jar creates the channel", () => {
+    const dir = synthLocalCounterMod({ ns: 'lver' })
+    assert.deepStrictEqual(assessLoginChannel('absent:channel', [dir]), { verdict: 'unknown' })
+    assert.deepStrictEqual(assessLoginChannel('absent:channel', []), { verdict: 'unknown' })
+  })
+
+  it("'ack' carries the exact reply bytes", () => {
+    const dir = synthLocalCounterMod({ ns: 'lack' })
+    const a = assessLoginChannel('lack:channel', [dir])
+    assert.strictEqual(a.verdict, 'ack')
+    assert.deepStrictEqual(a.reply, Buffer.from([0x00]))
+  })
+
+  it("'unknown' when the RL exists locally but only as a NON-channel creation (registry key)", () => {
+    // origins:origins in the real family pack: the id names a DYNAMIC
+    // REGISTRY, not a network channel. Non-channel RL consumers must not
+    // count as channel knowledge, or the honest-failure path would stop
+    // joins the FML-99 convention may still carry.
+    const owner = 'synth/lreg/Registries'
+    const cls = buildClass({
+      name: owner,
+      methods: [{
+        name: '<clinit>',
+        desc: '()V',
+        flags: 0x0008,
+        code: (a) => a
+          .new_(RL).dup().ldcStr('lreg').ldcStr('lreg')
+          .invokespecial(RL, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V')
+          .invokestatic('net/minecraft/resources/ResourceKey', 'createRegistryKey', `(L${RL};)Lnet/minecraft/resources/ResourceKey;`)
+          .putstatic(owner, 'KEY', 'Lnet/minecraft/resources/ResourceKey;')
+          .ret()
+      }]
+    })
+    const dir = writeJarDir('lreg', [{ name: `${owner}.class`, data: cls }])
+    assert.deepStrictEqual(assessLoginChannel('lreg:lreg', [dir]), { verdict: 'unknown' })
+  })
+
+  it("'underivable' with reason substantive-reply when the only login C2S provably writes data", () => {
+    // reuse the eps shape from above: busy encoder, login-marked
+    const owner = 'synth/lsub/Net'
+    const busy = 'synth/lsub/Busy'
+    const net = buildClass({
+      name: owner,
+      methods: [
+        { name: '<clinit>', desc: '()V', flags: 0x0008, code: clinitFor(owner, 'lsub', 'handshake', 1) },
+        { name: 'init', desc: '()V', code: (a) => registerCounter(a, owner, busy).ret() }
+      ]
+    })
+    const dir = writeJarDir('lsub', [
+      { name: `${owner}.class`, data: net },
+      { name: `${busy}.class`, data: busyEncoderClass(busy) }
+    ])
+    const a = assessLoginChannel('lsub:handshake', [dir])
+    assert.strictEqual(a.verdict, 'underivable')
+    assert.strictEqual(a.reason, 'substantive-reply')
+    assert.strictEqual(a.msgClass, busy)
+  })
+})
+
+// --- ground truth: the real shipped calio jar (env-gated) -------------------
+
+const CALIO_MODS = process.env.MODS_SCAN_CALIO_MODS || '/private/tmp/mods-scan-rigs/calio/mods'
+
+describe('loginAckDerivation - real calio jar (HF2 receipt ground truth)', function () {
+  this.timeout(30000)
+
+  it('calio-forge 1.20.1-1.11.0.5: derives C2SAcknowledgePacket at index 0 (reply 0x00)', function () {
+    if (!fs.existsSync(path.join(CALIO_MODS, 'calio-forge-1.20.1-1.11.0.5.jar'))) return this.skip()
+    const r = deriveLoginAck('calio:channel', [CALIO_MODS])
+    assert.ok(r, 'must derive (the incumbent abstained here — the receipt failure)')
+    assert.strictEqual(r.index, 0)
+    assert.deepStrictEqual(r.reply, Buffer.from([0x00]))
+    assert.strictEqual(r.msgClass, 'io/github/edwinmindcraft/calio/common/network/packet/C2SAcknowledgePacket')
   })
 })

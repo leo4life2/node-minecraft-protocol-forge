@@ -1,5 +1,9 @@
 const ProtoDef = require('protodef').ProtoDef
 const debug = require('debug')('minecraft-protocol-forge')
+// Shared wrapped mod-channel login machinery (one rule for the class of
+// login-wrapped mod channels across the FML2 and FML3 eras): table override
+// -> jar-derived verdict -> honest failure / FML-99 convention.
+const { resolveWrappedModLogin, wrapLoginPayload, encodeAcknowledgement, readVarInt } = require('./forgeHandshake3')
 
 // Channels
 const FML_CHANNELS = {
@@ -216,17 +220,31 @@ module.exports = function (client, options) {
           break
         }
 
-        default:
+        default: {
+          // A mod's own login message riding the loginwrapper. The server's
+          // LoginWrapper routes our reply to whichever inner channel the
+          // response NAMES, so the reply must be wrapped on the ORIGINATING
+          // mod channel — the old fml:handshake-wrapped acknowledge was
+          // delivered to the FML handshake handler while the waiting mod
+          // channel never saw an answer.
           try {
-            console.log('other loginwrapperchannel', loginwrapper.channel, 'received, sending acknowledgement packet')
-            const AcknowledgementPacket = proto.createPacketBuffer(PROTODEF_TYPES.HANDSHAKE, { discriminator: 'Acknowledgement' })
-            const loginWrapperPacket = proto.createPacketBuffer(PROTODEF_TYPES.LOGINWRAPPER, { channel: FML_CHANNELS.HANDSHAKE, data: AcknowledgementPacket })
-            client.write('login_plugin_response', { messageId: data.messageId, data: loginWrapperPacket })
-            break
+            const disc = readVarInt(loginwrapper.data, 0)
+            const resolved = resolveWrappedModLogin(client, loginwrapper.channel, disc.value, loginwrapper.data.slice(disc.size), options)
+            if (resolved && resolved.failed) break // honest join stop — no guessed bytes
+            if (resolved && resolved.reply) {
+              debug(`answering ${loginwrapper.channel} login message disc=${disc.value} via ${resolved.via} (${resolved.reply.length} bytes)`)
+              client.write('login_plugin_response', { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, resolved.reply) })
+              break
+            }
           } catch (error) {
-            console.error(error)
+            debug(`failed to resolve wrapped channel ${loginwrapper.channel} (${error.message}), falling back to the FML convention ack`)
           }
+          // no local knowledge: FML convention acknowledge (99), on the
+          // originating channel
+          console.log('other loginwrapperchannel', loginwrapper.channel, 'received, sending acknowledgement packet')
+          client.write('login_plugin_response', { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, encodeAcknowledgement()) })
           break
+        }
       }
     } else {
       console.log('other channel', data.channel, 'received')

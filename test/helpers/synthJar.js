@@ -154,6 +154,10 @@ class Asm {
   invokedynamic (bsmIndex, name, desc) { this.bytes.push(0xba); this._u16(this.cp.invokeDynamic(bsmIndex, name, desc)); this.bytes.push(0, 0); return this }
   areturn () { this.bytes.push(0xb0); return this }
   goto_ (offset) { this.bytes.push(0xa7); this._u16(offset & 0xffff); return this }
+  iload (n) { if (n <= 3) this.bytes.push(0x1a + n); else this.bytes.push(0x15, n); return this }
+  istore (n) { if (n <= 3) this.bytes.push(0x3b + n); else this.bytes.push(0x36, n); return this }
+  iinc (n, d) { this.bytes.push(0x84, n, d & 0xff); return this }
+  ifeq (offset) { this.bytes.push(0x99); this._u16(offset & 0xffff); return this }
   pop () { this.bytes.push(0x57); return this }
   ret () { this.bytes.push(0xb1); return this }
   code () { return Buffer.from(this.bytes) }

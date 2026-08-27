@@ -2,7 +2,7 @@ const fs = require('fs')
 const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, javaStringHash } = require('./jarAnalysis')
-const { deriveLoginAck } = require('./loginAckDerivation')
+const { assessLoginChannel } = require('./loginAckDerivation')
 
 // FML3 login handshake (Forge for Minecraft 1.18 - 1.20.1, fmlNetworkVersion 3).
 //
@@ -168,9 +168,13 @@ function encodeAcknowledgement () {
 
 // Wrapped (fml:loginwrapper) mod login messages: builder(disc, body) returns
 // the reply payload for the SAME inner channel, or null to fall through to
-// the FML acknowledge. Unknown wrapped channels keep getting the FML ack 99:
-// mods that copy FML's HandshakeMessages convention register their
-// acknowledge at login index 99, so it stays the least-bad default.
+// the FML acknowledge. Channels with NO local knowledge (not in this table,
+// not created by any local jar) keep getting the FML ack 99: mods that copy
+// FML's HandshakeMessages convention register their acknowledge at login
+// index 99, so it stays the least-bad default. Channels a local jar DOES
+// create resolve through assessLoginChannel instead — derived ack, or an
+// honest join stop when no correct reply is provable (see
+// resolveWrappedModLogin below).
 const WRAPPED_LOGIN_PROTOCOLS = {
   // TACZ (tacz:handshake): NetworkHandler seeds HANDSHAKE_ID_COUNT at 1, so
   // its Acknowledge login message is index 1 with an empty body. The server
@@ -679,6 +683,79 @@ function parseServerRegistry (client, buffer, offset) {
   debug(`parsed ${name.value} registry snapshot: ${ids.value.size} ids`)
 }
 
+// --- wrapped mod-channel login resolution (shared by FML2 and FML3) ---------
+//
+// One rule for the whole CLASS of login-wrapped mod channels (receipt case:
+// Calio's calio:channel on Forge 1.20.1):
+//   1. hand-verified table override (WRAPPED_LOGIN_PROTOCOLS — includes
+//      non-ack shapes like zeta's echo),
+//   2. jar-DERIVED verdict (loginAckDerivation.assessLoginChannel over the
+//      local mods folder):
+//        'ack'         -> the mod's own acknowledge, exact wire bytes
+//                         (IndexedMessageCodec: one index byte + empty body),
+//        'underivable' -> HONEST JOIN STOP. The channel is proven to live in
+//                         the local jars but no correct reply exists/derives;
+//                         answering anything else is a fake ack the server
+//                         rejects as "unexpected query response" (Forge
+//                         1.20.1 ServerLoginPacketListenerImpl patch), and
+//                         FML defines no accepted "not understood" reply for
+//                         wrapped channels. So the join fails HERE, naming
+//                         the channel, instead of dying with the server's
+//                         generic kick.
+//        'unknown'     -> null: caller falls back to the FML convention
+//                         acknowledge byte 99 on the ORIGINATING channel
+//                         (mods that copy FML's HandshakeMessages register
+//                         their acknowledge at index 99 — the least-bad
+//                         default when the local jars carry no knowledge).
+//
+// Returns { reply, via } (inner payload for the SAME channel), { failed:
+// true } (join already stopped honestly), or null (use the 99 convention).
+function resolveWrappedModLogin (client, channel, disc, body, options) {
+  if (WRAPPED_LOGIN_PROTOCOLS[channel]) {
+    try {
+      const reply = WRAPPED_LOGIN_PROTOCOLS[channel](disc, body)
+      if (reply) return { reply, via: 'table' }
+    } catch (err) {
+      debug(`table reply for ${channel} failed (${err.message})`)
+    }
+    return null // table channel declining this message: FML 99 convention
+  }
+  let assessed = null
+  try {
+    assessed = assessLoginChannel(channel, modsPathsFor(options))
+  } catch (err) {
+    debug(`assessment for ${channel} failed (${err.message})`)
+    return null
+  }
+  if (assessed.verdict === 'ack') return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}` }
+  if (assessed.verdict === 'underivable') {
+    failWrappedLoginHonestly(client, channel, assessed)
+    return { failed: true }
+  }
+  return null
+}
+
+// The honest failure: no guessed bytes are ever sent for a channel we KNOW
+// we cannot answer. The copy names the channel; ending the connection rides
+// the existing surfacing rails (the app's join watchdog turns a pre-login
+// 'end' into a typed error carrying this reason, and join-diagnostics
+// records it as the disconnect reason).
+function failWrappedLoginHonestly (client, channel, assessed) {
+  const detail = assessed.reason === 'substantive-reply'
+    ? `its login reply (${assessed.msgClass}) must carry data this client cannot reconstruct`
+    : 'no provable acknowledgement reply exists in the local mod jars'
+  const message = `Cannot answer the modded login check on channel "${channel}": ${detail}. ` +
+    'Join stopped honestly instead of sending a wrong acknowledgement (the server would kick it as an unexpected query response).'
+  console.error(`[forge] ${message}`)
+  client.forgeUnanswerableLoginChannel = { channel, verdict: assessed.verdict, reason: assessed.reason, msgClass: assessed.msgClass, evidence: assessed.evidence }
+  client.emit('forgeLoginUnanswerable', client.forgeUnanswerableLoginChannel)
+  try {
+    if (typeof client.end === 'function') client.end(message)
+  } catch (err) {
+    debug(`ending the connection failed (${err.message}) — the socket may already be down`)
+  }
+}
+
 /**
  * Installs the FML3 handshake responder on a connecting client, so a modless
  * protocol client can log into a Forge 1.18-1.20.1 server by mirroring the
@@ -740,26 +817,20 @@ module.exports = function (client, options) {
       // A mod's own login message riding the loginwrapper: it gates the join
       // exactly like fml:handshake does, but decodes replies in ITS index
       // space, so answer in the channel's own sub-protocol when we speak it.
-      // Resolution order: table override first (hand-verified protocols,
-      // incl. non-ack shapes like zeta's echo), jar-DERIVED SimpleChannel
-      // login ack second (loginAckDerivation.js over the local mods folder),
-      // FML acknowledge 99 last.
+      // Resolution ladder (resolveWrappedModLogin): table override first,
+      // jar-DERIVED verdict second (ack / honest join stop for provably
+      // unanswerable channels), FML acknowledge 99 last — only for channels
+      // the local jars know nothing about.
       if (wrapper.channel !== 'fml:handshake') {
-        if (WRAPPED_LOGIN_PROTOCOLS[wrapper.channel]) {
-          const reply = WRAPPED_LOGIN_PROTOCOLS[wrapper.channel](disc.value, wrapper.data.slice(disc.size))
-          if (reply) {
-            debug(`answering ${wrapper.channel} login message disc=${disc.value} in its own index space (${reply.length} bytes)`)
-            respond(packet.messageId, wrapLoginPayload(wrapper.channel, reply))
-            return
-          }
-        } else {
-          const derived = deriveLoginAck(wrapper.channel, modsPathsFor(options))
-          if (derived) {
-            debug(`answering ${wrapper.channel} login message disc=${disc.value} with jar-derived ack index ${derived.index} (${derived.reply.length} bytes)`)
-            respond(packet.messageId, wrapLoginPayload(wrapper.channel, derived.reply))
-            return
-          }
+        const resolved = resolveWrappedModLogin(client, wrapper.channel, disc.value, wrapper.data.slice(disc.size), options)
+        if (resolved && resolved.failed) return // honest join stop — no reply was (or could be) written
+        if (resolved && resolved.reply) {
+          debug(`answering ${wrapper.channel} login message disc=${disc.value} in its own index space via ${resolved.via} (${resolved.reply.length} bytes)`)
+          respond(packet.messageId, wrapLoginPayload(wrapper.channel, resolved.reply))
+          return
         }
+        // null: no local knowledge of this channel — fall through to the FML
+        // convention acknowledge (99) below, wrapped on the ORIGINATING channel
       }
 
       if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.MOD_LIST) {
@@ -847,3 +918,11 @@ module.exports.SNAPSHOT_REGISTRIES = SNAPSHOT_REGISTRIES
 // The hand-verified override table, exported so tests (and E2E rigs proving
 // the derivation path) can inspect or disable individual entries.
 module.exports.WRAPPED_LOGIN_PROTOCOLS = WRAPPED_LOGIN_PROTOCOLS
+// Shared wrapped-channel machinery, used by the FML2 (1.13-1.17) sibling
+// responder and by tests: one rule for the class of login-wrapped mod
+// channels across both login-phase FML eras.
+module.exports.resolveWrappedModLogin = resolveWrappedModLogin
+module.exports.failWrappedLoginHonestly = failWrappedLoginHonestly
+module.exports.wrapLoginPayload = wrapLoginPayload
+module.exports.encodeAcknowledgement = encodeAcknowledgement
+module.exports.modsPathsFor = modsPathsFor

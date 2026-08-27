@@ -54,25 +54,34 @@ const RL_CLASSES = new Set([
   'net/minecraft/class_2960', // intermediary (shipped Fabric jars)
   'net/minecraft/util/Identifier' // yarn (dev jars)
 ])
-const SIMPLE_CHANNEL = 'net/minecraftforge/network/simple/SimpleChannel'
-const MESSAGE_BUILDER = 'net/minecraftforge/network/simple/SimpleChannel$MessageBuilder'
+// SimpleChannel/MessageBuilder/NetworkDirection across the FML eras: Forge
+// 1.17+ (FML3-era mods) uses net/minecraftforge/network/..., Forge 1.13-1.16
+// (FML2-era mods) shipped the same API under net/minecraftforge/fml/network/.
+// Both eras run the identical login sub-protocol over fml:loginwrapper, so
+// one derivation covers both — membership sets, not a single name.
+const SIMPLE_CHANNELS = new Set([
+  'net/minecraftforge/network/simple/SimpleChannel',
+  'net/minecraftforge/fml/network/simple/SimpleChannel'
+])
+const MESSAGE_BUILDERS = new Set([
+  'net/minecraftforge/network/simple/SimpleChannel$MessageBuilder',
+  'net/minecraftforge/fml/network/simple/SimpleChannel$MessageBuilder'
+])
+const NETWORK_DIRECTIONS = new Set([
+  'net/minecraftforge/network/NetworkDirection',
+  'net/minecraftforge/fml/network/NetworkDirection'
+])
 const ATOMIC_INT = 'java/util/concurrent/atomic/AtomicInteger'
-const NETWORK_DIRECTION = 'net/minecraftforge/network/NetworkDirection'
+const isSimpleChannelDesc = (desc) => typeof desc === 'string' && desc[0] === 'L' && desc.endsWith(';') && SIMPLE_CHANNELS.has(desc.slice(1, -1))
+const returnsSimpleChannel = (desc) => {
+  if (typeof desc !== 'string') return false
+  const ret = desc.slice(desc.lastIndexOf(')') + 1)
+  return isSimpleChannelDesc(ret)
+}
 // FriendlyByteBuf across mapping sets (mojmap, intermediary, legacy mcp)
 const BYTEBUF_TYPES = ['net/minecraft/network/FriendlyByteBuf', 'net/minecraft/class_2540', 'net/minecraft/network/PacketBuffer']
 
 const ACC_BRIDGE = 0x0040
-
-function writeVarInt (value) {
-  const bytes = []
-  do {
-    let b = value & 0x7F
-    value >>>= 7
-    if (value !== 0) b |= 0x80
-    bytes.push(b)
-  } while (value !== 0)
-  return Buffer.from(bytes)
-}
 
 // --- per-method ordered event stream ---------------------------------------
 // Linearizes one method's bytecode into the events the derivation reasons
@@ -113,6 +122,26 @@ function methodEvents (parsed, m) {
     } else if (op === 0xb6 || op === 0xb7 || op === 0xb8 || op === 0xb9) { // invoke*
       const r = cpRef(cp, code.readUInt16BE(pc + 1))
       if (r) ev.push({ k: 'call', r })
+    } else if (op === 0x15) { // iload <n>
+      ev.push({ k: 'iload', slot: code[pc + 1] })
+    } else if (op >= 0x1a && op <= 0x1d) { // iload_0..3
+      ev.push({ k: 'iload', slot: op - 0x1a })
+    } else if (op === 0x36) { // istore <n>
+      ev.push({ k: 'istore', slot: code[pc + 1] })
+    } else if (op >= 0x3b && op <= 0x3e) { // istore_0..3
+      ev.push({ k: 'istore', slot: op - 0x3b })
+    } else if (op === 0x84) { // iinc
+      ev.push({ k: 'iinc', slot: code[pc + 1], delta: code.readInt8(pc + 2) })
+    } else if (op === 0xc4) { // wide iload/istore/iinc
+      const wop = code[pc + 1]
+      if (wop === 0x15) ev.push({ k: 'iload', slot: code.readUInt16BE(pc + 2) })
+      else if (wop === 0x36) ev.push({ k: 'istore', slot: code.readUInt16BE(pc + 2) })
+      else if (wop === 0x84) ev.push({ k: 'iinc', slot: code.readUInt16BE(pc + 2), delta: code.readInt16BE(pc + 4) })
+    } else if ((op >= 0x99 && op <= 0xa8) || op === 0xaa || op === 0xab ||
+               op === 0xc6 || op === 0xc7 || op === 0xc8 || op === 0xc9 || op === 0xbf) {
+      // any jump/switch/throw: the method is no longer straight-line, which
+      // poisons LOCAL int-counter simulation (values may be branch-dependent)
+      ev.push({ k: 'br' })
     }
   })
   return ev
@@ -236,7 +265,7 @@ function rlValueBefore (ev, i, facts) {
     if (e.k === 'call') {
       const helper = e.r.desc && e.r.desc.match(/^\(Ljava\/lang\/String;\)L([^;]+);$/)
       if (helper && RL_CLASSES.has(helper[1])) {
-        const ns = facts.helperNs.get(`${e.r.owner}.${e.r.name}`)
+        const ns = helperNsOf(facts, e.r.owner, e.r.name)
         const prev = ev.slice(Math.max(0, j - 3), j).reverse().find((x) => x.k === 'str')
         if (ns && prev) return { ns, path: prev.v }
         return null
@@ -244,6 +273,31 @@ function rlValueBefore (ev, i, facts) {
     }
   }
   return null
+}
+
+// Namespace of a (String)->ResourceLocation id helper (MyMod.resource("x")).
+// Harvested eagerly from HOT classes, but helpers routinely live in classes
+// OUTSIDE the hot set (CalioAPI.resource carries "calio" and never mentions
+// "channel"), so unknown helpers are resolved lazily from the full class
+// index: parse the owner, find the single-ldc-string helper body, cache
+// hits AND misses.
+function helperNsOf (facts, owner, name) {
+  const key = `${owner}.${name}`
+  if (facts.helperNs.has(key)) return facts.helperNs.get(key)
+  let ns = null
+  const parsed = lazyClass(facts, owner)
+  if (parsed) {
+    for (const m of parsed.codes) {
+      if (m.method !== name) continue
+      const match = m.desc.match(/^\(Ljava\/lang\/String;\)L([^;]+);$/)
+      if (!match || !RL_CLASSES.has(match[1])) continue
+      const strs = eventsFor(facts, parsed, m).filter((e) => e.k === 'str')
+      if (strs.length === 1) ns = strs[0].v
+      break
+    }
+  }
+  facts.helperNs.set(key, ns)
+  return ns
 }
 
 // --- registration-site model ------------------------------------------------
@@ -256,7 +310,7 @@ function extractRegSites (ev, className, method) {
   const sites = []
   for (let i = 0; i < ev.length; i++) {
     const e = ev[i]
-    if (e.k !== 'call' || e.r.owner !== SIMPLE_CHANNEL) continue
+    if (e.k !== 'call' || !SIMPLE_CHANNELS.has(e.r.owner)) continue
     if (e.r.name !== 'messageBuilder' && e.r.name !== 'registerMessage') continue
 
     // backwards scan bounded by the previous SimpleChannel call
@@ -266,11 +320,16 @@ function extractRegSites (ev, className, method) {
     let direction = null
     for (let j = i - 1; j >= 0; j--) {
       const p = ev[j]
-      if (p.k === 'call' && p.r.owner === SIMPLE_CHANNEL) break
+      if (p.k === 'call' && SIMPLE_CHANNELS.has(p.r.owner)) break
       if (p.k === 'cls' && !msgClass) msgClass = p.v
       if (!index) {
         if (p.k === 'int') index = { const: p.v }
-        else if (p.k === 'call' && p.r.owner === ATOMIC_INT && p.r.name === 'getAndIncrement') {
+        else if (p.k === 'iload') {
+          // local int variable as the index argument — the calio-class
+          // `int index = 0; CHANNEL.messageBuilder(cls, index++, DIR)` idiom.
+          // Resolved later by straight-line simulation of the local's value.
+          index = { local: p.slot, useEvIdx: j }
+        } else if (p.k === 'call' && p.r.owner === ATOMIC_INT && p.r.name === 'getAndIncrement') {
           const fieldGet = ev.slice(Math.max(0, j - 4), j).reverse()
             .find((x) => x.k === 'get' && x.r.desc === `L${ATOMIC_INT};`)
           // useIdx: this site's OWN counter use - callers counting "prior
@@ -278,23 +337,23 @@ function extractRegSites (ev, className, method) {
           index = { counter: fieldGet ? `${fieldGet.r.owner}.${fieldGet.r.name}` : null, useIdx: j }
         }
       }
-      if (p.k === 'get' && p.r.desc === `L${SIMPLE_CHANNEL};` && !channelField) {
+      if (p.k === 'get' && isSimpleChannelDesc(p.r.desc) && !channelField) {
         channelField = `${p.r.owner}.${p.r.name}`
       }
-      if (p.k === 'get' && p.r.owner === NETWORK_DIRECTION && !direction) direction = p.r.name
+      if (p.k === 'get' && NETWORK_DIRECTIONS.has(p.r.owner) && !direction) direction = p.r.name
     }
     // forwards scan for builder-chain login markers, bounded by the next
     // SimpleChannel call / field store (statement end)
     let loginMarked = false
     for (let j = i + 1; j < ev.length; j++) {
       const n = ev[j]
-      if (n.k === 'call' && n.r.owner === MESSAGE_BUILDER &&
+      if (n.k === 'call' && MESSAGE_BUILDERS.has(n.r.owner) &&
           (n.r.name === 'loginIndex' || n.r.name === 'markAsLoginPacket')) loginMarked = true
-      if (n.k === 'call' && n.r.owner === SIMPLE_CHANNEL) break
+      if (n.k === 'call' && SIMPLE_CHANNELS.has(n.r.owner)) break
       if (n.k === 'put') break
-      if (n.k === 'get' && n.r.owner === NETWORK_DIRECTION && !direction) direction = n.r.name
+      if (n.k === 'get' && NETWORK_DIRECTIONS.has(n.r.owner) && !direction) direction = n.r.name
     }
-    sites.push({ className, method, evIdx: i, msgClass, index, channelField, direction, loginMarked })
+    sites.push({ className, method, evIdx: i, msgClass, index, channelField, direction, loginMarked, ev })
   }
   return sites
 }
@@ -318,6 +377,31 @@ function hasEmptyEncoder (facts, className) {
     else return false // a real encoder writes bytes -> not an empty ack
   }
   return found
+}
+
+// --- LOCAL int-counter reasoning -------------------------------------------
+// The most common 1.18-1.20.1 registration idiom (Calio, Apoli, and the wide
+// `int index = 0; CHANNEL.messageBuilder(X, index++, DIR)` family) passes a
+// METHOD-LOCAL counter as the index. javac compiles it to straight-line
+// `iconst_k; istore_N; ... iload_N; iinc N,1; ...`, so the value at any use
+// is exactly computable by walking the method once — PROVIDED the method has
+// no branches (any jump/switch/throw poisons the simulation and we abstain;
+// wrong answers are worse than no answer).
+function resolveLocalIndex (ev, slot, useEvIdx) {
+  if (ev.some((e) => e.k === 'br')) return null // not straight-line: abstain
+  let value = null
+  for (let i = 0; i < useEvIdx; i++) {
+    const e = ev[i]
+    if (e.k === 'istore' && e.slot === slot) {
+      // only a store of an immediately-preceding pushed constant is provable;
+      // storing a computed value poisons the local
+      const prev = ev[i - 1]
+      value = prev && prev.k === 'int' ? prev.v : null
+    } else if (e.k === 'iinc' && e.slot === slot) {
+      if (value != null) value += e.delta
+    }
+  }
+  return value
 }
 
 // --- counter reasoning ------------------------------------------------------
@@ -344,7 +428,7 @@ function counterSeed (facts, counterField) {
           }
           return null
         }
-        if (p.k === 'put' || (p.k === 'call' && p.r.owner === SIMPLE_CHANNEL)) break
+        if (p.k === 'put' || (p.k === 'call' && SIMPLE_CHANNELS.has(p.r.owner))) break
       }
     }
   }
@@ -403,6 +487,14 @@ function deriveDirect (facts, channelField, hotClasses, channelId) {
 
   if (ack.index && ack.index.const != null) {
     return { index: ack.index.const, msgClass: ack.msgClass, evidence: `explicit constant at ${ack.className}#${ack.method}` }
+  }
+  if (ack.index && ack.index.local != null) {
+    const v = resolveLocalIndex(ack.ev, ack.index.local, ack.index.useEvIdx)
+    if (v == null) {
+      debug(`login-ack ${channelId}: local counter slot ${ack.index.local} not provably straight-line - abstaining`)
+      return null
+    }
+    return { index: v, msgClass: ack.msgClass, evidence: `local int counter slot ${ack.index.local} = ${v} (straight-line simulation) at ${ack.className}#${ack.method}` }
   }
   if (!ack.index || !ack.index.counter) {
     debug(`login-ack ${channelId}: ack index source unresolved - abstaining`)
@@ -493,7 +585,7 @@ function deriveWrapper (facts, creation, hotClasses, channelId) {
     const names = new Set(parsed.codes.map((m) => m.method))
     if (!registerNames.some((n) => names.has(n))) continue
     const touchesBuilder = parsed.codes.some((m) =>
-      eventsFor(facts, parsed, m).some((e) => e.k === 'call' && e.r.owner === SIMPLE_CHANNEL && e.r.name === 'messageBuilder'))
+      eventsFor(facts, parsed, m).some((e) => e.k === 'call' && SIMPLE_CHANNELS.has(e.r.owner) && e.r.name === 'messageBuilder'))
     if (touchesBuilder) impls.push(parsed)
   }
 
@@ -595,7 +687,7 @@ function deriveFromImpl (facts, impl, chain, channelId) {
           }
           continue
         }
-        if (e.k === 'call' && e.r.owner === SIMPLE_CHANNEL && (e.r.name === 'messageBuilder' || e.r.name === 'registerMessage')) {
+        if (e.k === 'call' && SIMPLE_CHANNELS.has(e.r.owner) && (e.r.name === 'messageBuilder' || e.r.name === 'registerMessage')) {
           const sites = extractRegSites(evList, cls, '?')
           const site = sites.find((s) => s.evIdx === i)
           if (!site) continue
@@ -651,11 +743,11 @@ function findCreations (facts, hotClasses, ns, pathPart) {
           if (n.k === 'put') break
         }
         const returned = e.r.desc.slice(e.r.desc.lastIndexOf(')') + 2, -1)
-        const isDirectChannel = returned === SIMPLE_CHANNEL || chain.some((c) => c.owner && c.desc && c.desc.endsWith(`)L${SIMPLE_CHANNEL};`))
+        const isDirectChannel = SIMPLE_CHANNELS.has(returned) || chain.some((c) => c.owner && c.desc && returnsSimpleChannel(c.desc))
         // the channel field the terminal value is stored into (if any)
         let channelField = null
         for (let j = i + 1; j < ev.length; j++) {
-          if (ev[j].k === 'put' && ev[j].r.desc === `L${SIMPLE_CHANNEL};`) { channelField = `${ev[j].r.owner}.${ev[j].r.name}`; break }
+          if (ev[j].k === 'put' && isSimpleChannelDesc(ev[j].r.desc)) { channelField = `${ev[j].r.owner}.${ev[j].r.name}`; break }
           if (ev[j].k === 'put') break
         }
         creations.push({ className: parsed.className, method: m.method, direct: isDirectChannel, channelField, chain })
@@ -667,42 +759,75 @@ function findCreations (facts, hotClasses, ns, pathPart) {
 
 // --- public API -------------------------------------------------------------
 
-const deriveCache = new Map()
+const assessCache = new Map()
 
 /**
- * Statically derives the login-ack reply payload for `channelId` from the
- * mod jars in `modsPaths`. Returns { reply: Buffer, index, msgClass,
- * evidence } or null when nothing can be PROVEN (wrong answers are worse
- * than no answer - the caller falls back to its table/default ack).
+ * Statically ASSESSES a mod's wrapped login channel against the local mod
+ * jars. This is the verdict ladder the login-phase responders act on:
  *
- * @param {string} channelId e.g. 'framework:handshake'
+ *   { verdict: 'ack', index, reply, msgClass, evidence }
+ *       The channel's login reply is PROVABLY the mod's own empty-body
+ *       acknowledge message; `reply` is the exact inner payload — a single
+ *       index byte, because Forge's IndexedMessageCodec frames every
+ *       SimpleChannel message as writeByte(index & 0xff) + body (1.20.1
+ *       IndexedMessageCodec#build / #consume: readUnsignedByte), and the
+ *       login index is context-side only, never on the wire.
+ *   { verdict: 'underivable', reason, msgClass?, evidence }
+ *       The channel IS created by a local jar, but no correct reply can be
+ *       constructed: reason 'substantive-reply' when a login-marked C2S
+ *       message provably writes data we cannot reconstruct, else
+ *       'no-derivable-ack'. Callers must fail the join honestly — the FML
+ *       convention byte (99) is then a KNOWN-wrong guess, and Forge's login
+ *       protocol defines no accepted "not understood" answer for wrapped
+ *       channels (any undispatched response kicks with
+ *       multiplayer.disconnect.unexpected_query_response — 1.20.1
+ *       ServerLoginPacketListenerImpl patch + NetworkHooks.onCustomPayload).
+ *   { verdict: 'unknown' }
+ *       No local jar creates this channel (or no jars are configured); the
+ *       caller keeps its least-bad convention default.
+ *
+ * @param {string} channelId e.g. 'calio:channel'
  * @param {Array.<string>} modsPaths jar files and/or directories of jars
  */
-function deriveLoginAck (channelId, modsPaths) {
+function assessLoginChannel (channelId, modsPaths) {
   const paths = (modsPaths || []).filter(Boolean)
-  if (paths.length === 0) return null
+  if (paths.length === 0) return { verdict: 'unknown' }
   const cacheKey = `${paths.join('|')}::${channelId}`
-  if (deriveCache.has(cacheKey)) return deriveCache.get(cacheKey)
+  if (assessCache.has(cacheKey)) return assessCache.get(cacheKey)
 
-  let result = null
+  let result = { verdict: 'unknown' }
   const started = Date.now()
   try {
-    result = deriveUncached(channelId, paths)
+    result = assessUncached(channelId, paths)
   } catch (err) {
-    debug(`login-ack derivation for ${channelId} failed (${err.message})`)
+    debug(`login-ack assessment for ${channelId} failed (${err.message})`)
   }
-  if (result) {
+  if (result.verdict === 'ack') {
     console.log(`[forge] derived ${channelId} login ack: index ${result.index} (${result.msgClass}; ${result.evidence}; ${Date.now() - started}ms)`)
+  } else if (result.verdict === 'underivable') {
+    console.log(`[forge] ${channelId} login channel found in local jars but no correct reply is derivable (${result.reason}; ${result.evidence}; ${Date.now() - started}ms)`)
   } else {
-    debug(`login-ack derivation for ${channelId}: no provable answer (${Date.now() - started}ms)`)
+    debug(`login-ack derivation for ${channelId}: no local knowledge (${Date.now() - started}ms)`)
   }
-  deriveCache.set(cacheKey, result)
+  assessCache.set(cacheKey, result)
   return result
 }
 
-function deriveUncached (channelId, paths) {
+/**
+ * Back-compat surface: the provable ack reply for `channelId`, or null.
+ * Returns { reply: Buffer, index, msgClass, evidence } exactly as before;
+ * the richer verdict lives in assessLoginChannel.
+ */
+function deriveLoginAck (channelId, modsPaths) {
+  const a = assessLoginChannel(channelId, modsPaths)
+  if (a.verdict !== 'ack') return null
+  const { verdict, ...rest } = a
+  return rest
+}
+
+function assessUncached (channelId, paths) {
   const colon = channelId.indexOf(':')
-  if (colon <= 0) return null
+  if (colon <= 0) return { verdict: 'unknown' }
   const ns = channelId.slice(0, colon)
   const pathPart = channelId.slice(colon + 1)
 
@@ -728,21 +853,57 @@ function deriveUncached (channelId, paths) {
       }
     }
   }
-  if (hot.length === 0) return null
+  if (hot.length === 0) return { verdict: 'unknown' }
 
   const creations = findCreations(facts, hot, ns, pathPart)
-  for (const creation of creations) {
+  // Only CHANNEL-class creations count as local knowledge: a direct
+  // SimpleChannel stored in a field, or a wrapper-builder chain that
+  // registers messages. The same ResourceLocation routinely names other
+  // things (dynamic registries, capabilities — origins:origins is a registry
+  // key in the same family pack), and treating those as channel knowledge
+  // would honest-fail joins the 99 convention may still carry.
+  const channelCreations = creations.filter((c) =>
+    (c.direct && c.channelField) ||
+    (!c.direct && c.chain.some((link) => /^register/i.test(link.name))))
+  if (channelCreations.length === 0) return { verdict: 'unknown' }
+
+  for (const creation of channelCreations) {
     let r = null
     if (creation.direct && creation.channelField) {
       r = deriveDirect(facts, creation.channelField, hot, channelId)
     } else if (!creation.direct) {
       r = deriveWrapper(facts, creation, hot, channelId)
     }
-    if (r && r.index != null && r.index >= 0) {
-      return { ...r, reply: writeVarInt(r.index) }
+    // reply framing per Forge IndexedMessageCodec: writeByte(index & 0xff).
+    // An index above 255 cannot be represented distinctly on the wire (Forge
+    // itself truncates), so it is unprovable — abstain into 'underivable'.
+    if (r && r.index != null && r.index >= 0 && r.index <= 255) {
+      return { verdict: 'ack', ...r, reply: Buffer.from([r.index]) }
     }
   }
-  return null
+
+  // The channel exists in the local jars but no ack reply was proven:
+  // classify WHY, so the caller can surface an honest, channel-naming
+  // failure instead of guessing.
+  const fields = new Set(channelCreations.filter((c) => c.direct && c.channelField).map((c) => c.channelField))
+  let substantive = null
+  for (const parsed of hot) {
+    for (const m of parsed.codes) {
+      for (const site of extractRegSites(eventsFor(facts, parsed, m), parsed.className, m.method)) {
+        if (!site.channelField || !fields.has(site.channelField)) continue
+        if (site.loginMarked && site.msgClass && (!site.direction || site.direction === 'LOGIN_TO_SERVER') &&
+            !hasEmptyEncoder(facts, site.msgClass)) {
+          substantive = site.msgClass
+        }
+      }
+    }
+  }
+  return {
+    verdict: 'underivable',
+    reason: substantive ? 'substantive-reply' : 'no-derivable-ack',
+    msgClass: substantive || undefined,
+    evidence: `channel is created by a local jar (${channelCreations[0].className}) but no provable login-ack reply exists`
+  }
 }
 
-module.exports = { deriveLoginAck, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, findCreations, newFacts, indexJar, eventsFor } }
+module.exports = { deriveLoginAck, assessLoginChannel, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
