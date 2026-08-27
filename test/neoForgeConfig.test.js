@@ -708,3 +708,33 @@ describe('derivation ground truth (AE2 helper shape, fixture-gated)', function (
     assert.deepStrictEqual({ version: gm.version, flow: gm.flow, optional: gm.optional }, { version: '1.0', flow: 'clientbound', optional: false })
   })
 })
+
+describe('HF6 M1 — list==switch mechanical pin (declared contract vs handler cases)', function () {
+  it('HANDLED_CLIENTBOUND_CONFIG_CHANNELS exactly equals the channel switch\'s handled case set', () => {
+    const fs = require('fs')
+    const { HANDLED_CLIENTBOUND_CONFIG_CHANNELS } = require('../src/client/neoForgeConfig')
+    const src = fs.readFileSync(require.resolve('../src/client/neoForgeConfig'), 'utf8')
+    const at = src.indexOf('switch (channel)')
+    assert.ok(at !== -1, 'neoForgeConfig.js must contain the configuration channel switch')
+    const cases = [...src.slice(at).matchAll(/case '([^']+)':/g)].map((m) => m[1])
+    assert.strictEqual(new Set(cases).size, cases.length, 'duplicate case labels in the channel switch')
+    // The negotiation wire itself (query / answer / failure) is the machinery
+    // that CREATES the contract, not part of it: the switch handles these
+    // three, but they are neither declared over minecraft:register nor
+    // claimable components.
+    const NEGOTIATION_WIRE = ['neoforge:register', 'neoforge:network', 'neoforge:modded_network_setup_failed']
+    for (const ch of NEGOTIATION_WIRE) {
+      assert.ok(cases.includes(ch), `negotiation wire channel ${ch} lost its handler case`)
+      assert.ok(!HANDLED_CLIENTBOUND_CONFIG_CHANNELS.includes(ch), `${ch} is negotiation machinery — it must not ride the declared list`)
+    }
+    // EXACT set equality, both directions:
+    // - a list entry WITHOUT a handler case is the declared-but-wedging
+    //   direction: we invite a payload we then cannot answer, and a blocking
+    //   configuration task would wedge the phase — FAIL.
+    // - a handler case MISSING from the list is undeclared-but-handled: the
+    //   server's send-path guard kills its own send before our handler ever
+    //   runs (the HF6 receipt class) — FAIL.
+    const handledBySwitch = cases.filter((c) => !NEGOTIATION_WIRE.includes(c)).sort()
+    assert.deepStrictEqual([...HANDLED_CLIENTBOUND_CONFIG_CHANNELS].sort(), handledBySwitch)
+  })
+})
