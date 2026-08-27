@@ -32,8 +32,11 @@ function compareNeoForgeVersions (a, b) {
   for (let i = 0; i < len; i++) {
     const av = as[i]
     const bv = bs[i]
-    if (av === undefined) return -1
-    if (bv === undefined) return 1
+    // HF4 L1: when one side runs out of segments, a MISSING segment beats a
+    // non-numeric (pre-release) segment — '21.1.0' outranks '21.1.0-beta' —
+    // while a numeric-longer build still wins ('21.1.0.1' > '21.1.0').
+    if (av === undefined) return /^\d+$/.test(String(bv)) ? -1 : 1
+    if (bv === undefined) return /^\d+$/.test(String(av)) ? 1 : -1
     const an = /^\d+$/.test(av) ? Number(av) : NaN
     const bn = /^\d+$/.test(bv) ? Number(bv) : NaN
     if (!Number.isNaN(an) && !Number.isNaN(bn)) {
