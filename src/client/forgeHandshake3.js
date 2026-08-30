@@ -693,15 +693,31 @@ function parseServerRegistry (client, buffer, offset) {
 //      local mods folder):
 //        'ack'         -> the mod's own acknowledge, exact wire bytes
 //                         (IndexedMessageCodec: one index byte + empty body),
-//        'underivable' -> HONEST JOIN STOP. The channel is proven to live in
-//                         the local jars but no correct reply exists/derives;
-//                         answering anything else is a fake ack the server
-//                         rejects as "unexpected query response" (Forge
-//                         1.20.1 ServerLoginPacketListenerImpl patch), and
-//                         FML defines no accepted "not understood" reply for
-//                         wrapped channels. So the join fails HERE, naming
-//                         the channel, instead of dying with the server's
-//                         generic kick.
+//        'underivable' -> split by WHAT the jars prove (HF8):
+//          reason 'substantive-reply' -> HONEST JOIN STOP. The jars PROVE
+//                         the channel's login reply must carry data this
+//                         client cannot reconstruct — the protocol demands
+//                         an answer no decline can satisfy, so the join
+//                         fails HERE, naming the channel, instead of dying
+//                         with the server's generic kick.
+//          reason 'no-derivable-ack' -> PROTOCOL-CORRECT DECLINE (HF8, the
+//                         tacztweaks:handshake receipt). The reference
+//                         client's own behavior for a login query it cannot
+//                         dispatch is the vanilla "not understood" response
+//                         (Forge 1.20.1 ClientHandshakePacketListenerImpl
+//                         patch: `new ServerboundCustomQueryPacket(id,
+//                         (FriendlyByteBuf)null)`), and the SERVER models
+//                         it (IndexedMessageCodec.consume: a null/empty
+//                         payload is accepted — setPacketHandled(true) —
+//                         whenever HandshakeHandler.packetNeedsResponse is
+//                         false, and otherwise yields the server's own
+//                         unexpected_query_response kick). A decline is not
+//                         a claim: no guessed bytes ride the wire, mods
+//                         that tolerate a vanilla-shaped answer let the
+//                         join proceed, and mods that demand the reply kick
+//                         with THEIR named copy (surfaced, with our decline
+//                         receipt attached). Aborting here — the pre-HF8
+//                         behavior — forfeited every tolerant server.
 //        'unknown'     -> null: caller falls back to the FML convention
 //                         acknowledge byte 99 on the ORIGINATING channel
 //                         (mods that copy FML's HandshakeMessages register
@@ -729,8 +745,18 @@ function resolveWrappedModLogin (client, channel, disc, body, options) {
   }
   if (assessed.verdict === 'ack') return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}` }
   if (assessed.verdict === 'underivable') {
-    failWrappedLoginHonestly(client, channel, assessed)
-    return { failed: true }
+    if (assessed.reason === 'substantive-reply') {
+      // Jar-proven mandatory-and-unanswerable: the reply must carry data we
+      // cannot reconstruct — no decline can satisfy it. Honest stop.
+      failWrappedLoginHonestly(client, channel, assessed)
+      return { failed: true }
+    }
+    // 'no-derivable-ack': the requirement itself is unproven — send the
+    // protocol's own "not understood" decline and let the server decide
+    // (HF8; primary sources in the header above). The caller writes the
+    // empty login_plugin_response; this records the receipt.
+    declineWrappedLoginHonestly(client, channel, assessed)
+    return { declined: true, assessed }
   }
   return null
 }
@@ -754,6 +780,24 @@ function failWrappedLoginHonestly (client, channel, assessed) {
   } catch (err) {
     debug(`ending the connection failed (${err.message}) — the socket may already be down`)
   }
+}
+
+// The protocol-correct decline (HF8): the login check stays UNANSWERED in
+// the mod's own index space — we send the vanilla "not understood"
+// login_plugin_response (successful=false, no payload), exactly what the
+// reference Forge client sends for a query it cannot dispatch. No claim is
+// made; the server's IndexedMessageCodec accepts the decline for messages
+// registered without needsResponse and kicks with its own named copy for
+// the rest — either way the outcome is the SERVER's decision, recorded here
+// so a following kick is classified with this channel attached.
+function declineWrappedLoginHonestly (client, channel, assessed) {
+  const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline: ` +
+    'no provable acknowledgement reply exists in the local mod jars, and a decline (unlike a guessed acknowledgement) is not a claim. ' +
+    'The server now decides — mods that tolerate a vanilla-shaped answer continue the login; mods that require the reply will kick with their own message.'
+  console.warn(`[forge] ${message}`)
+  if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
+  client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence })
+  client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence })
 }
 
 /**
@@ -824,6 +868,13 @@ module.exports = function (client, options) {
       if (wrapper.channel !== 'fml:handshake') {
         const resolved = resolveWrappedModLogin(client, wrapper.channel, disc.value, wrapper.data.slice(disc.size), options)
         if (resolved && resolved.failed) return // honest join stop — no reply was (or could be) written
+        if (resolved && resolved.declined) {
+          // HF8: vanilla "not understood" — messageId with NO data encodes
+          // successful=false (byte-identical to the reference client's
+          // decline, ClientHandshakePacketListenerImpl patch).
+          client.write('login_plugin_response', { messageId: packet.messageId })
+          return
+        }
         if (resolved && resolved.reply) {
           debug(`answering ${wrapper.channel} login message disc=${disc.value} in its own index space via ${resolved.via} (${resolved.reply.length} bytes)`)
           respond(packet.messageId, wrapLoginPayload(wrapper.channel, resolved.reply))

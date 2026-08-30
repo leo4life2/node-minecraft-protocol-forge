@@ -164,6 +164,67 @@ function encodeDinnerboneChannels (channels) {
   return Buffer.from(channels.join('\u0000'), 'utf8')
 }
 
+// HF8 — THE DECLARATION SIZE LAW. The real protocol constant, read from the
+// 1.21.1 sources (vanilla lines preserved verbatim in NeoForge's
+// ServerboundCustomPayloadPacket.java.patch): any serverbound custom payload
+// WITHOUT a registered codec decodes as `DiscardedPayload.codec(id, 32767)`
+// — for BOTH the configuration and play protocols — and an oversize frame is
+// a decode exception that kills the connection. NeoForge exempts exactly its
+// BUILTIN_PAYLOADS (NetworkRegistry.getCodec consults BUILTIN_PAYLOADS
+// first; `neoforge:register`, `minecraft:register` et al. decode by their
+// own codecs, uncapped), but the vanilla-lineage cap is the ONLY bound a
+// declaration can rely on across every stack that may parse the frame
+// (vanilla, Paper, proxies) — so every declaration payload we emit is bound
+// to it.
+//
+// HOW an oversize declaration stays truthful (the HF8 adjudication order —
+// drop nothing that can lawfully ride another frame):
+//   - `minecraft:register` is ADDITIVE by primary source (NetworkRegistry
+//     .onMinecraftRegister: `getOrCreateAdHocChannels(connection)
+//     .addAll(...)` — a Set union per frame), so a large declaration SPLITS
+//     into multiple well-formed register payloads, each a complete
+//     NUL-separated list under the cap. Nothing is dropped; order is
+//     preserved (callers put race-sensitive channels first).
+//   - the `neoforge:register` component ANSWER is one atomic
+//     ModdedNetworkQueryPayload with a builtin (uncapped) codec on every
+//     NeoForge endpoint — it is never split and never trimmed: trimming
+//     claims we lawfully hold would forfeit negotiable channels for no
+//     protocol reason. Its size is RECEIPTED (state.queryAnswer) so a
+//     post-answer failure names the real bytes — the sub-shape-A receipt's
+//     "42,171-byte payload" was a JSON-length artifact of the diagnostics
+//     tap over a ~13KB wire frame, under every real limit.
+const MAX_SERVERBOUND_CUSTOM_PAYLOAD_BYTES = 32767
+
+// Splits a channel list into Dinnerbone register frames, each encoding to at
+// most MAX_SERVERBOUND_CUSTOM_PAYLOAD_BYTES. Returns an array of Buffers
+// (>= 1; an empty channel list yields one empty frame). A single id that
+// alone exceeds the cap cannot ride any lawful frame (real
+// ResourceLocations are orders of magnitude shorter) — it is dropped
+// LOUDLY, never sent malformed.
+function splitDinnerboneFrames (channels, warn = (m) => console.warn(m)) {
+  const frames = []
+  let current = []
+  let currentBytes = 0
+  for (const ch of channels || []) {
+    const chBytes = Buffer.byteLength(String(ch), 'utf8')
+    if (chBytes > MAX_SERVERBOUND_CUSTOM_PAYLOAD_BYTES) {
+      warn(`[neoforge] declaration channel id exceeds the serverbound custom-payload law (${chBytes} > ${MAX_SERVERBOUND_CUSTOM_PAYLOAD_BYTES} bytes) and cannot ride any lawful frame — dropped: ${String(ch).slice(0, 80)}...`)
+      continue
+    }
+    const sep = current.length > 0 ? 1 : 0
+    if (currentBytes + sep + chBytes > MAX_SERVERBOUND_CUSTOM_PAYLOAD_BYTES) {
+      frames.push(encodeDinnerboneChannels(current))
+      current = [ch]
+      currentBytes = chBytes
+    } else {
+      current.push(ch)
+      currentBytes += sep + chBytes
+    }
+  }
+  frames.push(encodeDinnerboneChannels(current))
+  return frames
+}
+
 // --- FriendlyByteBuf primitives ---
 
 function readVarInt (buf, offset) {
@@ -436,6 +497,8 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     frozenRegistryCount: 0,
     dataMapsAnswered: false,
     declaredListening: null,
+    queryAnswer: null, // HF8: {configuration, play, bytes} once answered
+    setupFailed: null, // HF8: the server's per-channel failure reasons
     unclaimedBuiltins,
     unhandled: [],
     log: []
@@ -471,10 +534,25 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           if (declareListening) {
             state.declaredListening = [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS]
             debug(`neoforge config: declaring ${state.declaredListening.length} listening channels over minecraft:register`)
-            send('minecraft:register', encodeDinnerboneChannels(state.declaredListening))
+            // HF8 size law: register frames are additive server-side
+            // (onMinecraftRegister addAll), so an oversize declaration rides
+            // multiple lawful frames instead of one over-cap frame.
+            for (const frame of splitDinnerboneFrames(state.declaredListening)) {
+              send('minecraft:register', frame)
+            }
           }
           const reply = encodeNetworkQuery(components)
           debug(`neoforge config: query received, claiming ${components.configuration.length} configuration + ${components.play.length} play components`)
+          // HF8 receipt: the answer's true wire size + claim counts, so a
+          // silent post-answer close is classifiable (sub-shape A: the
+          // server closed without EITHER neoforge:network or
+          // modded_network_setup_failed — the claim's fate must be namable
+          // from our side with real numbers, not tap estimates).
+          state.queryAnswer = {
+            configuration: components.configuration.length,
+            play: components.play.length,
+            bytes: reply.length
+          }
           send('neoforge:register', reply)
           break
         }
@@ -491,6 +569,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           let reasons = null
           try { reasons = decodeSetupFailed(data) } catch (err) { reasons = { parse_error: err.message } }
           debug(`neoforge config: negotiation FAILED: ${JSON.stringify(reasons)}`)
+          state.setupFailed = reasons // HF8 receipt: the answer got a verdict
           client.emit('neoForgeNegotiationFailed', reasons)
           break
         }
@@ -572,6 +651,8 @@ module.exports = {
   HANDLED_CLIENTBOUND_CONFIG_CHANNELS,
   TOLERATED_CLIENTBOUND_PLAY_CHANNELS,
   encodeDinnerboneChannels,
+  MAX_SERVERBOUND_CUSTOM_PAYLOAD_BYTES,
+  splitDinnerboneFrames,
   encodeNetworkQuery,
   decodeNetworkSetup,
   decodeSetupFailed,

@@ -240,6 +240,12 @@ module.exports = function (client, options) {
             const disc = readVarInt(loginwrapper.data, 0)
             const resolved = resolveWrappedModLogin(client, loginwrapper.channel, disc.value, loginwrapper.data.slice(disc.size), options)
             if (resolved && resolved.failed) break // honest join stop — no guessed bytes
+            if (resolved && resolved.declined) {
+              // HF8: protocol-correct not-understood decline — messageId
+              // with NO data (successful=false), same law as FML3.
+              client.write('login_plugin_response', { messageId: data.messageId })
+              break
+            }
             if (resolved && resolved.reply) {
               debug(`answering ${loginwrapper.channel} login message disc=${disc.value} via ${resolved.via} (${resolved.reply.length} bytes)`)
               client.write('login_plugin_response', { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, resolved.reply) })
