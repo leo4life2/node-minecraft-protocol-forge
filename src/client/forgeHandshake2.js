@@ -4,6 +4,11 @@ const debug = require('debug')('minecraft-protocol-forge')
 // login-wrapped mod channels across the FML2 and FML3 eras): table override
 // -> jar-derived verdict -> honest failure / FML-99 convention.
 const { resolveWrappedModLogin, wrapLoginPayload, encodeAcknowledgement, readVarInt } = require('./forgeHandshake3')
+// HF12 boundary law — see loginReplyBoundary.js: awaited fml:handshake
+// lockstep replies write synchronously through the guard; wrapped-mod-channel
+// replies (the fire-and-forget-capable class) defer one event-loop turn and
+// are dropped with a receipt when the negotiation is observably over.
+const { writeLoginReplyNow, writeLoginReplyDeferred } = require('./loginReplyBoundary')
 
 // Channels
 const FML_CHANNELS = {
@@ -213,10 +218,10 @@ module.exports = function (client, options) {
               throw Error('received clientbound-only Acknowledgement from server')
           }
 
-          client.write('login_plugin_response', {
+          writeLoginReplyNow(client, {
             messageId: data.messageId,
             data: loginwrapperpacket
-          })
+          }, { channel: FML_CHANNELS.HANDSHAKE, kind: 'lockstep reply', awaited: true })
           break
         }
 
@@ -233,7 +238,7 @@ module.exports = function (client, options) {
             // readVarInt failure to catch and fall through from. Answer with
             // the FML convention acknowledge on the originating channel.
             debug(`empty ${loginwrapper.channel} login payload - FML convention ack`)
-            client.write('login_plugin_response', { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, encodeAcknowledgement()) })
+            writeLoginReplyDeferred(client, { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, encodeAcknowledgement()) }, { channel: loginwrapper.channel, kind: 'convention ack' })
             break
           }
           try {
@@ -243,12 +248,12 @@ module.exports = function (client, options) {
             if (resolved && resolved.declined) {
               // HF8: protocol-correct not-understood decline — messageId
               // with NO data (successful=false), same law as FML3.
-              client.write('login_plugin_response', { messageId: data.messageId })
+              writeLoginReplyDeferred(client, { messageId: data.messageId }, { channel: loginwrapper.channel, kind: 'wrapped decline' })
               break
             }
             if (resolved && resolved.reply) {
               debug(`answering ${loginwrapper.channel} login message disc=${disc.value} via ${resolved.via} (${resolved.reply.length} bytes)`)
-              client.write('login_plugin_response', { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, resolved.reply) })
+              writeLoginReplyDeferred(client, { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, resolved.reply) }, { channel: loginwrapper.channel, kind: 'wrapped reply' })
               break
             }
           } catch (error) {
@@ -257,7 +262,7 @@ module.exports = function (client, options) {
           // no local knowledge: FML convention acknowledge (99), on the
           // originating channel
           console.log('other loginwrapperchannel', loginwrapper.channel, 'received, sending acknowledgement packet')
-          client.write('login_plugin_response', { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, encodeAcknowledgement()) })
+          writeLoginReplyDeferred(client, { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, encodeAcknowledgement()) }, { channel: loginwrapper.channel, kind: 'convention ack' })
           break
         }
       }

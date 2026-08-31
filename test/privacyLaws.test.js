@@ -26,7 +26,8 @@ const dgram = require('dgram')
 const { buildClass, buildJar } = require('./helpers/synthJar')
 
 const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js',
-  'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js']
+  'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js',
+  'loginReplyBoundary.js']
 const SRC = path.join(__dirname, '..', 'src', 'client')
 
 // build a synthetic mod that DOES derive, so the network-spy test exercises
@@ -298,8 +299,10 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
     it(`${mod} imports only local parsing deps`, () => {
       const src = fs.readFileSync(path.join(SRC, mod), 'utf8')
       const requires = [...src.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1])
+      // HF12: loginReplyBoundary is a pure local write-boundary mechanism
+      // (no requires at all) — same purpose-limited class as the parsers
       const allowed = new Set(['fs', 'path', 'zlib', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation',
-        './data/blockShapeTables.json'])
+        './loginReplyBoundary', './data/blockShapeTables.json'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }
