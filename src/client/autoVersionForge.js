@@ -192,7 +192,7 @@ module.exports = function (client, options) {
       return
     }
     try {
-      const { components, diagnostics } = deriveNeoForgeComponents([...jarPaths, ...loaderJars])
+      const { components, diagnostics, syncContracts } = deriveNeoForgeComponents([...jarPaths, ...loaderJars])
       // channels the transport does not implement must not be claimed:
       // neoforge:split would invite split payloads this responder cannot
       // reassemble yet.
@@ -200,8 +200,8 @@ module.exports = function (client, options) {
         components[proto] = components[proto].filter((c) => c.id !== 'neoforge:split')
       }
       debug(`NeoForge 1.20.5+ server detected — claiming ${components.configuration.length} configuration + ${components.play.length} play jar-derived components (${jarPaths.length} mod jars, ${loaderJars.length} loader jars, ${diagnostics.abstains.length} abstains)`)
-      installNeoForgeConfigNegotiation(client, { components })
-      client.emit('neoForgeDerivation', { components, diagnostics })
+      installNeoForgeConfigNegotiation(client, { components, syncContracts })
+      client.emit('neoForgeDerivation', { components, diagnostics, syncContracts })
     } catch (err) {
       debug(`NeoForge component derivation failed (${err.message}) — attempting vanilla join`)
     }

@@ -490,6 +490,33 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   if (unclaimedBuiltins.length > 0) {
     debug(`neoforge config: refusing to claim ${unclaimedBuiltins.length} configuration built-in(s) this responder cannot answer: ${unclaimedBuiltins.join(', ')}`)
   }
+  // HF9 — content-mod config-phase SYNC CONTRACTS (annotation-registry
+  // derivation, jar-proven): each contract names a configuration-to-client
+  // mod channel whose payload the mod's OWN client answers with a fixed
+  // task-finish ack (`new FinishAck(Task.TYPE.id())` -> serverbound reply
+  // whose wire bytes are utf8-string sequences per the registry's codec).
+  // The server's vanilla task queue advances ONLY on finishCurrentTask
+  // (ServerConfigurationPacketListenerImpl: a mismatched finish is an
+  // IllegalStateException kick), so the responder acks EXACTLY ONCE per
+  // task id per configuration session:
+  //   - multi-part sync payloads (jar truth: SyncSpecies/SyncMoves/
+  //     SyncPokeBalls carry a `last` boolean and the reference client acks
+  //     on the last part) are acked on the FIRST part instead — all parts
+  //     were already flushed by the task's own start(), finishCurrentTask
+  //     matches the still-current task, and the remaining parts are
+  //     consumed. Parsing each mod's per-class field layout for the `last`
+  //     flag would add per-mod codec knowledge for zero server-visible
+  //     difference; the once-per-task law is the mechanism.
+  //   - the acked set resets on every configuration re-entry (the server
+  //     builds a fresh task queue per reconfiguration).
+  const syncContracts = options.syncContracts || null
+  const contractByChannel = new Map()
+  for (const c of (syncContracts && syncContracts.contracts) || []) {
+    if (c && typeof c.channel === 'string' && c.reply && Array.isArray(c.reply.strings)) {
+      contractByChannel.set(c.channel, c)
+    }
+  }
+  const consumeOnlyChannels = new Set((syncContracts && syncContracts.consumeOnly) || [])
   const state = {
     negotiated: false,
     setup: null,
@@ -501,13 +528,31 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     setupFailed: null, // HF8: the server's per-channel failure reasons
     unclaimedBuiltins,
     unhandled: [],
-    log: []
+    log: [],
+    // HF9 receipts: which mod sync tasks were acked, what was consumed —
+    // the join classifier reads these when a modded config still stalls.
+    modSync: contractByChannel.size > 0 || consumeOnlyChannels.size > 0
+      ? { contracts: contractByChannel.size, ackedTasks: [], consumed: {}, unfinishableTasks: (syncContracts && syncContracts.unfinishableTasks) || [] }
+      : null
   }
   client.neoForgeConfig = state
+  if (state.modSync && state.modSync.unfinishableTasks.length > 0) {
+    // Requirement-5 honesty: the jars prove the mod registers configuration
+    // tasks this client cannot finish — the join may wedge on them, and the
+    // receipt names them BEFORE it does.
+    console.warn(`[neoforge] content-mod sync: ${state.modSync.unfinishableTasks.length} registered configuration task(s) have no derivable finish ack (${state.modSync.unfinishableTasks.slice(0, 5).join(', ')}) — if the join stalls in configuration, this is why`)
+  }
 
   const send = (channel, data) => {
     debug(`neoforge config: sending ${channel} (${data.length} bytes)`)
     client.write('custom_payload', { channel, data })
+  }
+
+  // HF9: fresh task queue per configuration entry -> fresh ack ledger.
+  if (state.modSync) {
+    client.on('state', (newState) => {
+      if (newState === 'configuration') state.modSync.ackedTasks = []
+    })
   }
 
   client.on('packet', (packet, meta) => {
@@ -625,6 +670,31 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           break
         }
         default:
+          // HF9 — content-mod sync-task payloads (jar-proven contracts): the
+          // mod's configuration task sent this and blocks the phase until
+          // the mod's own finish ack arrives. Ack once per task id (see the
+          // once-per-task law above); every subsequent part of the same task
+          // is consumed with a receipt. A consume-only channel (jar truth:
+          // its reference handler sends nothing) is consumed with a receipt
+          // and never answered.
+          if (state.modSync && contractByChannel.has(channel)) {
+            const contract = contractByChannel.get(channel)
+            state.modSync.consumed[channel] = (state.modSync.consumed[channel] || 0) + 1
+            if (!state.modSync.ackedTasks.includes(contract.taskId)) {
+              state.modSync.ackedTasks.push(contract.taskId)
+              const wire = Buffer.concat(contract.reply.strings.map((s) => writeString(String(s))))
+              debug(`neoforge config: content-mod sync ${channel} (${data.length} bytes) -> finish ack for ${contract.taskId} on ${contract.reply.channel} (${wire.length} bytes)`)
+              send(contract.reply.channel, wire)
+            } else {
+              debug(`neoforge config: content-mod sync ${channel} — task ${contract.taskId} already acked, consuming part`)
+            }
+            break
+          }
+          if (state.modSync && consumeOnlyChannels.has(channel)) {
+            state.modSync.consumed[channel] = (state.modSync.consumed[channel] || 0) + 1
+            debug(`neoforge config: content-mod payload ${channel} (${data.length} bytes) — consume-only per jar contract`)
+            break
+          }
           // HF6 boundary honesty: a neoforge:* configuration payload outside
           // the handler contract is SURFACED, never silently swallowed and
           // never answered with an invented reply. (Post-intersection we
