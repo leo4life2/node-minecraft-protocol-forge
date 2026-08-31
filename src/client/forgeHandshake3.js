@@ -3,6 +3,7 @@ const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, javaStringHash } = require('./jarAnalysis')
 const { assessLoginChannel } = require('./loginAckDerivation')
+const { writeLoginReplyNow, writeLoginReplyDeferred } = require('./loginReplyBoundary')
 
 // FML3 login handshake (Forge for Minecraft 1.18 - 1.20.1, fmlNetworkVersion 3).
 //
@@ -40,6 +41,7 @@ const DISCRIMINATOR = {
   MOD_LIST_REPLY: 2,
   SERVER_REGISTRY: 3,
   CHANNEL_MISMATCH: 6,
+  MOD_DATA: 5,
   ACKNOWLEDGEMENT: 99
 }
 
@@ -826,8 +828,22 @@ module.exports = function (client, options) {
   const nmpListener = client.listeners('login_plugin_request').find((fn) => fn.name === 'onLoginPluginRequest')
   if (nmpListener) client.removeListener('login_plugin_request', nmpListener)
 
-  function respond (messageId, data) {
-    client.write('login_plugin_response', { messageId, data })
+  // HF12 boundary law (loginReplyBoundary.js): fml:handshake lockstep rounds
+  // are awaited by the server (its HandshakeHandler blocks on them — live-log
+  // receipt: "Sending ticking packet info ... sequence N" strictly alternates
+  // with "Received client indexed reply N") and are written synchronously
+  // through the guard; wrapped-MOD-channel and raw-channel replies belong to
+  // the fire-and-forget-capable class the server may complete negotiation
+  // without, so they are deferred one event-loop turn and dropped with a
+  // receipt when the negotiation is observably over — a late raw reply
+  // crossing the server's compression arming is the HF12 kill-shot
+  // ("Badly compressed packet - size of 2 is below server threshold of 256":
+  // login_plugin_response's packet id 0x02 read as a compressed-frame
+  // data-length).
+  function respond (messageId, data, context) {
+    const params = { messageId, data }
+    if (context && context.awaited) writeLoginReplyNow(client, params, context)
+    else writeLoginReplyDeferred(client, params, context || {})
   }
 
   client.on('login_plugin_request', (packet) => {
@@ -844,11 +860,11 @@ module.exports = function (client, options) {
       }
       if (reply) {
         debug(`answering raw login channel ${packet.channel} (${reply.length} bytes)`)
-        client.write('login_plugin_response', { messageId: packet.messageId, data: reply })
+        writeLoginReplyDeferred(client, { messageId: packet.messageId, data: reply }, { channel: packet.channel, kind: 'raw-channel reply' })
       } else {
         // we can't speak it, so give the vanilla "not understood" response
         debug(`unknown login channel ${packet.channel}, replying not-understood`)
-        client.write('login_plugin_response', { messageId: packet.messageId })
+        writeLoginReplyDeferred(client, { messageId: packet.messageId }, { channel: packet.channel, kind: 'raw-channel not-understood' })
       }
       return
     }
@@ -871,13 +887,17 @@ module.exports = function (client, options) {
         if (resolved && resolved.declined) {
           // HF8: vanilla "not understood" — messageId with NO data encodes
           // successful=false (byte-identical to the reference client's
-          // decline, ClientHandshakePacketListenerImpl patch).
-          client.write('login_plugin_response', { messageId: packet.messageId })
+          // decline, ClientHandshakePacketListenerImpl patch). HF12: written
+          // through the deferred boundary guard — the receipt's killer was
+          // exactly this decline (tacztweaks:handshake), computed for ~650ms
+          // by a cold jar assessment and then written RAW after the server
+          // had already completed negotiation and armed compression.
+          writeLoginReplyDeferred(client, { messageId: packet.messageId }, { channel: wrapper.channel, kind: 'wrapped decline' })
           return
         }
         if (resolved && resolved.reply) {
           debug(`answering ${wrapper.channel} login message disc=${disc.value} in its own index space via ${resolved.via} (${resolved.reply.length} bytes)`)
-          respond(packet.messageId, wrapLoginPayload(wrapper.channel, resolved.reply))
+          respond(packet.messageId, wrapLoginPayload(wrapper.channel, resolved.reply), { channel: wrapper.channel, kind: 'wrapped reply' })
           return
         }
         // null: no local knowledge of this channel — fall through to the FML
@@ -905,7 +925,20 @@ module.exports = function (client, options) {
             ? Object.entries(options.registries).map(([name, marker]) => ({ name, marker }))
             : modList.registries.map((name) => ({ name, marker: '1.0' }))
         }
-        respond(packet.messageId, wrapLoginPayload('fml:handshake', encodeModListReply(reply)))
+        respond(packet.messageId, wrapLoginPayload('fml:handshake', encodeModListReply(reply)), { channel: 'fml:handshake', kind: 'ModListReply', awaited: true })
+        return
+      }
+
+      // S2CModData (disc 5, "Sending ticking packet info ... S2CModData"):
+      // dispatched fire-and-forget — the reference client's HandshakeHandler
+      // stores the mod data and sends NOTHING back, and the live 1.20.1
+      // server ERROR-logs our unsolicited ack ("Recieved unexpected index 0
+      // in client reply", hf8rigC receipt) before tolerating it. HF12: an
+      // unsolicited login reply is exactly the class that can cross the
+      // compression-arming boundary, so the reference client's silence is
+      // the law — record the receipt, reply with nothing.
+      if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.MOD_DATA) {
+        debug(`S2CModData received (${wrapper.data.length} bytes) — no reply, matching the reference client`)
         return
       }
 
@@ -946,14 +979,17 @@ module.exports = function (client, options) {
       // channel's reply in fml:handshake would deliver it to the FML handshake
       // handler ("unexpected index") while the real channel waits forever.
       debug(`acknowledging loginwrapper message channel=${wrapper.channel} discriminator=${disc.value} length=${wrapper.data.length}`)
-      respond(packet.messageId, wrapLoginPayload(wrapper.channel, encodeAcknowledgement()))
+      respond(packet.messageId, wrapLoginPayload(wrapper.channel, encodeAcknowledgement()),
+        { channel: wrapper.channel, kind: 'convention ack', awaited: wrapper.channel === 'fml:handshake' })
     } catch (err) {
       // A request left unanswered hangs the login until the server times us
       // out, so an acknowledgement is always the least-bad answer. If even the
       // outer wrapper failed to parse there is no originating channel to name,
       // so fall back to fml:handshake.
       debug(`failed to handle loginwrapper payload (${err.message}), acknowledging anyway`)
-      respond(packet.messageId, wrapLoginPayload(wrapper ? wrapper.channel : 'fml:handshake', encodeAcknowledgement()))
+      const ch = wrapper ? wrapper.channel : 'fml:handshake'
+      respond(packet.messageId, wrapLoginPayload(ch, encodeAcknowledgement()),
+        { channel: ch, kind: 'fallback ack', awaited: ch === 'fml:handshake' })
     }
   })
 }

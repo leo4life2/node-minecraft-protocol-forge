@@ -115,8 +115,11 @@ function parseClassFile (b) {
   }
   // class-level attributes: BootstrapMethods is how invokedynamic call sites
   // (lambda suppliers in DeferredRegister registrations) resolve to their
-  // implementation methods.
+  // implementation methods; RuntimeVisibleAnnotations carries the class-level
+  // annotation table (the ANNOTATION-REGISTRY derivation shape reads it —
+  // annotation data is class-file DATA, nothing is reflected or executed).
   let bootstrapMethods = null
+  let annotations = null
   if (o + 2 <= b.length) {
     const attrCount = b.readUInt16BE(o); o += 2
     for (let a = 0; a < attrCount; a++) {
@@ -136,11 +139,68 @@ function parseClassFile (b) {
           bootstrapMethods.push({ ref, args })
           p += 4 + argc * 2
         }
+      } else if (name === 'RuntimeVisibleAnnotations') {
+        try { annotations = readAnnotationsAttr(b, o + 6, cp) } catch { annotations = null }
       }
       o += 6 + len
     }
   }
-  return { className, superName, interfaces, cp, codes, fields, bootstrapMethods }
+  return { className, superName, interfaces, cp, codes, fields, bootstrapMethods, annotations }
+}
+
+// --- RuntimeVisibleAnnotations reader (JVMS 4.7.16) ------------------------
+// Returns [{type, elements: {name: value}}] where value is:
+//   {enumType, constName} for an enum_const_value ('e'),
+//   a string for 's', an array for '[', and null for tags we do not model
+//   (numeric consts, class refs, nested annotations — skipped structurally,
+//   never mis-read). Defensive: any structural surprise aborts to null.
+function readAnnotationsAttr (b, start, cp) {
+  const n = b.readUInt16BE(start)
+  let p = start + 2
+  const out = []
+  const readElementValue = () => {
+    const tag = String.fromCharCode(b[p]); p += 1
+    switch (tag) {
+      case 'e': {
+        const enumType = cpUtf8(cp, b.readUInt16BE(p))
+        const constName = cpUtf8(cp, b.readUInt16BE(p + 2))
+        p += 4
+        return { enumType, constName }
+      }
+      case 's': {
+        const v = cpUtf8(cp, b.readUInt16BE(p)); p += 2
+        return v
+      }
+      case 'B': case 'C': case 'D': case 'F': case 'I': case 'J': case 'S': case 'Z': case 'c':
+        p += 2
+        return null
+      case '[': {
+        const count = b.readUInt16BE(p); p += 2
+        const arr = []
+        for (let i = 0; i < count; i++) arr.push(readElementValue())
+        return arr
+      }
+      case '@': {
+        readAnnotation() // nested: structurally consumed, value not modeled
+        return null
+      }
+      default:
+        throw new Error(`element_value tag ${tag}`)
+    }
+  }
+  const readAnnotation = () => {
+    const type = cpUtf8(cp, b.readUInt16BE(p))
+    const pairs = b.readUInt16BE(p + 2)
+    p += 4
+    const elements = {}
+    for (let i = 0; i < pairs; i++) {
+      const ename = cpUtf8(cp, b.readUInt16BE(p)); p += 2
+      elements[ename] = readElementValue()
+    }
+    return { type, elements }
+  }
+  for (let i = 0; i < n; i++) out.push(readAnnotation())
+  return out
 }
 
 // Linear instruction decode with operands resolved against the constant pool:

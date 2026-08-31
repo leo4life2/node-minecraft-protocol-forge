@@ -36,6 +36,15 @@
 //              and the per-call payload TYPE flow through; bounded by a
 //              re-entrancy cycle guard + a global frame budget that
 //              abstains loudly instead of spinning.
+//   ANNOTATION-REGISTRY (HF9, annotationRegistryDerivation.js)  a reflective
+//              class-name-codec registry: the subscriber iterates a supplier
+//              map's Class keys, reads a direction ANNOTATION off each class,
+//              builds the Type from getSimpleName() through a namespace
+//              helper, and dispatches on the enum through javac's $SwitchMap
+//              idiom (Pixelmon 9.4.0 PacketRegistry / tcg PacketRegistration,
+//              javap-verified). Runs as a post-pass over the same entry
+//              methods; contributes channel components AND the config-phase
+//              sync-ack contracts (syncContracts) the responder answers.
 //   ENUM-REGISTRY  an enum whose constants each build a Type from
 //              name().toLowerCase(ROOT) + a namespace helper and carry the
 //              payload class; a static method constructs a registry object
@@ -65,6 +74,7 @@ const fs = require('fs')
 const path = require('path')
 const debug = require('../../debug')
 const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
+const { deriveAnnotationRegistries } = require('./annotationRegistryDerivation')
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
@@ -2274,12 +2284,23 @@ function deriveNeoForgeComponents (jarPaths) {
     diagnostics.errors.push(`ack-contract derivation failed (${err.message}) — no contracts emitted`)
   }
 
+  // HF9 — ANNOTATION-REGISTRY shape (annotationRegistryDerivation.js):
+  // reflective class-name-codec registries (Pixelmon class). Contributes both
+  // channel components (negotiation claims) and config-phase sync-ack
+  // CONTRACTS (the mod's own task-finish protocol, jar-proven), which the
+  // config responder answers so the mod's blocking configuration tasks can
+  // complete. Fail-open: jars without the idiom contribute nothing here.
+  const annotationRun = deriveAnnotationRegistries(index, state, entryMethods)
+  for (const c of annotationRun.components) {
+    add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, 'annotation-registry')
+  }
+
   const components = {
     configuration: [...byProtocol.configuration.values()],
     play: [...byProtocol.play.values()]
   }
   debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${ackContracts.length} ack contracts, ${Date.now() - started}ms)`)
-  return { components, diagnostics, ackContracts }
+  return { components, diagnostics, ackContracts, syncContracts: annotationRun.syncContracts }
 }
 
 module.exports = { deriveNeoForgeComponents, deriveAckContracts, resolveAggregatedRegistrations }

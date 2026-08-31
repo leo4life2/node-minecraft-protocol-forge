@@ -170,23 +170,65 @@ class Asm {
   ifeq (offset) { this.bytes.push(0x99); this._u16(offset & 0xffff); return this }
   pop () { this.bytes.push(0x57); return this }
   ret () { this.bytes.push(0xb1); return this }
+  // HF9 additions (annotation-registry idiom fixtures)
+  aloadWide (n) { if (n <= 3) this.bytes.push(0x2a + n); else this.bytes.push(0x19, n); return this }
+  aaload () { this.bytes.push(0x32); return this }
+  iaload () { this.bytes.push(0x2e); return this }
+  iastore () { this.bytes.push(0x4f); return this }
+  newarrayInt () { this.bytes.push(0xbc, 10); return this }
+  arraylength () { this.bytes.push(0xbe); return this }
+  checkcast (name) { this.bytes.push(0xc0); this._u16(this.cp.cls(name)); return this }
+  areturnOp () { this.bytes.push(0xb0); return this }
+  raw (bytes) { for (const b of bytes) this.bytes.push(b & 0xff); return this }
+  get pc () { return this.bytes.length }
   code () { return Buffer.from(this.bytes) }
 }
 
 // Builds one .class file:
-//   { name, superName?, bootstrapMethods?: [{refKind, owner, name, desc}],
+//   { name, superName?, interfaces?: [name],
+//     fields?: [{name, desc, flags?}],
+//     annotations?: [{type: 'Lfoo/Bar;', elements: [{name, enums:
+//       [{type: 'Lfoo/Dir;', const: 'X'}]}]}]  (RuntimeVisibleAnnotations),
+//     bootstrapMethods?: [{refKind, owner, name, desc}],
 //     methods: [{name, desc, flags, code(asm)=>void}] }
 function buildClass (spec) {
   const cp = new ConstantPool()
   const thisIdx = cp.cls(spec.name)
   const superIdx = cp.cls(spec.superName || 'java/lang/Object')
   const codeAttr = cp.utf8('Code')
+  const ifaceIdxs = (spec.interfaces || []).map((n) => cp.cls(n))
+  const fieldSpecs = (spec.fields || []).map((f) => ({
+    flags: f.flags != null ? f.flags : 0x0019, // public static final
+    nameIdx: cp.utf8(f.name),
+    descIdx: cp.utf8(f.desc)
+  }))
   // bootstrap methods must be interned before the pool is frozen; each entry
   // becomes {ref: <handle>, args: [<same handle>]} — enough for
   // resolveLambdaImpl, which scans args for the implementation MethodHandle.
   const bsmHandles = (spec.bootstrapMethods || []).map((b) =>
     cp.methodHandle(b.refKind != null ? b.refKind : 6, b.owner, b.name, b.desc))
   const bsmAttrName = bsmHandles.length ? cp.utf8('BootstrapMethods') : null
+  // class-level RuntimeVisibleAnnotations (JVMS 4.7.16): enum-array elements
+  // only — exactly the shape the annotation-registry census reads.
+  let annoAttrName = null
+  let annoBody = null
+  if (spec.annotations && spec.annotations.length > 0) {
+    annoAttrName = cp.utf8('RuntimeVisibleAnnotations')
+    const chunks = []
+    const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16BE(v, 0); return b }
+    chunks.push(u16(spec.annotations.length))
+    for (const a of spec.annotations) {
+      chunks.push(u16(cp.utf8(a.type)), u16((a.elements || []).length))
+      for (const el of a.elements || []) {
+        chunks.push(u16(cp.utf8(el.name)))
+        chunks.push(Buffer.from('[', 'utf8'), u16(el.enums.length))
+        for (const e of el.enums) {
+          chunks.push(Buffer.from('e', 'utf8'), u16(cp.utf8(e.type)), u16(cp.utf8(e.const)))
+        }
+      }
+    }
+    annoBody = Buffer.concat(chunks)
+  }
 
   const methods = spec.methods.map((m) => {
     const asm = new Asm(cp)
@@ -202,13 +244,29 @@ function buildClass (spec) {
   head.writeUInt16BE(cp.entries.length + 1, 8)
   parts.push(head, ...cp.entries)
 
-  const mid = Buffer.alloc(10)
+  const mid = Buffer.alloc(8)
   mid.writeUInt16BE(0x21, 0)
   mid.writeUInt16BE(thisIdx, 2)
   mid.writeUInt16BE(superIdx, 4)
-  mid.writeUInt16BE(0, 6) // interfaces
-  mid.writeUInt16BE(0, 8) // fields
+  mid.writeUInt16BE(ifaceIdxs.length, 6)
   parts.push(mid)
+  for (const i of ifaceIdxs) {
+    const b = Buffer.alloc(2)
+    b.writeUInt16BE(i, 0)
+    parts.push(b)
+  }
+
+  const fCount = Buffer.alloc(2)
+  fCount.writeUInt16BE(fieldSpecs.length, 0)
+  parts.push(fCount)
+  for (const f of fieldSpecs) {
+    const fh = Buffer.alloc(8)
+    fh.writeUInt16BE(f.flags, 0)
+    fh.writeUInt16BE(f.nameIdx, 2)
+    fh.writeUInt16BE(f.descIdx, 4)
+    fh.writeUInt16BE(0, 6) // no attributes
+    parts.push(fh)
+  }
 
   const mCount = Buffer.alloc(2)
   mCount.writeUInt16BE(methods.length, 0)
@@ -230,6 +288,7 @@ function buildClass (spec) {
     const tail = Buffer.alloc(4) // exception_table_length=0, attributes_count=0
     parts.push(mh, ah, cb, m.body, tail)
   }
+  const classAttrs = []
   if (bsmAttrName != null) {
     const body = Buffer.alloc(2 + bsmHandles.length * 6)
     body.writeUInt16BE(bsmHandles.length, 0)
@@ -238,14 +297,17 @@ function buildClass (spec) {
       body.writeUInt16BE(1, 4 + i * 6) // num args
       body.writeUInt16BE(h, 6 + i * 6) // arg 0: the impl handle
     })
-    const classAttrs = Buffer.alloc(8)
-    classAttrs.writeUInt16BE(1, 0)
-    classAttrs.writeUInt16BE(bsmAttrName, 2)
-    classAttrs.writeUInt32BE(body.length, 4)
-    parts.push(classAttrs, body)
-  } else {
-    const classAttrs = Buffer.alloc(2)
-    parts.push(classAttrs)
+    classAttrs.push({ nameIdx: bsmAttrName, body })
+  }
+  if (annoAttrName != null) classAttrs.push({ nameIdx: annoAttrName, body: annoBody })
+  const acCount = Buffer.alloc(2)
+  acCount.writeUInt16BE(classAttrs.length, 0)
+  parts.push(acCount)
+  for (const a of classAttrs) {
+    const h = Buffer.alloc(6)
+    h.writeUInt16BE(a.nameIdx, 0)
+    h.writeUInt32BE(a.body.length, 2)
+    parts.push(h, a.body)
   }
   return Buffer.concat(parts)
 }

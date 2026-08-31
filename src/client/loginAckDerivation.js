@@ -837,6 +837,43 @@ function assessLoginChannel (channelId, modsPaths) {
 }
 
 /**
+ * HF12: warm the assessment cache OFF the login path. The receipt's killer
+ * reply was ~650ms late because a cold jar-bytecode assessment ran INLINE in
+ * the login_plugin_request handler — long enough for the server to complete
+ * negotiation and arm compression while the reply was still being computed.
+ * The ping already names every mod channel before the connection even
+ * starts, so the verdicts can be computed here, one channel per event-loop
+ * turn (each assessment itself is synchronous, so chunking keeps the ping ->
+ * connect path responsive), leaving the in-handshake lookup a cache hit.
+ * Purely an exposure-shrinker: correctness is owned by the reply boundary
+ * guard (loginReplyBoundary.js); an unwarmed channel still assesses inline.
+ *
+ * Infra channels (fml:*, forge:*, minecraft:*) never reach the wrapped-mod
+ * resolution ladder and are skipped.
+ *
+ * @param {Array.<string>} channelIds channel names from the server ping
+ * @param {Array.<string>} modsPaths jar files and/or directories of jars
+ * @returns {Promise<number>} resolves with the number of channels assessed
+ */
+function warmLoginAssessments (channelIds, modsPaths) {
+  const paths = (modsPaths || []).filter(Boolean)
+  const queue = (channelIds || []).filter((ch) =>
+    typeof ch === 'string' && ch.includes(':') &&
+    !/^(fml|forge|minecraft):/.test(ch))
+  if (paths.length === 0 || queue.length === 0) return Promise.resolve(0)
+  return new Promise((resolve) => {
+    let done = 0
+    const step = () => {
+      const ch = queue.shift()
+      if (!ch) return resolve(done)
+      try { assessLoginChannel(ch, paths); done++ } catch { /* inline path still covers it */ }
+      setImmediate(step)
+    }
+    setImmediate(step)
+  })
+}
+
+/**
  * Back-compat surface: the provable ack reply for `channelId`, or null.
  * Returns { reply: Buffer, index, msgClass, evidence } exactly as before;
  * the richer verdict lives in assessLoginChannel.
@@ -929,4 +966,4 @@ function assessUncached (channelId, paths) {
   }
 }
 
-module.exports = { deriveLoginAck, assessLoginChannel, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
+module.exports = { deriveLoginAck, assessLoginChannel, warmLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }

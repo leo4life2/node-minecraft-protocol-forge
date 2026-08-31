@@ -27,9 +27,13 @@ function makeClient () {
   return client
 }
 
+// HF12: wrapped-mod-channel replies are deferred one event-loop turn by the
+// reply boundary law (loginReplyBoundary.js) — drain before asserting.
+const drainDeferredReplies = () => new Promise((resolve) => setImmediate(() => setImmediate(() => setImmediate(resolve))))
+
 // Delivers one wrapped mod login message (inner channel + discriminator +
 // body) and returns the raw login_plugin_response payload.
-function loginReply (channel, disc, body = Buffer.alloc(0)) {
+async function loginReply (channel, disc, body = Buffer.alloc(0)) {
   const client = makeClient()
   forgeHandshake3(client, {})
   client.emit('login_plugin_request', {
@@ -37,6 +41,7 @@ function loginReply (channel, disc, body = Buffer.alloc(0)) {
     channel: 'fml:loginwrapper',
     data: wrap(channel, Buffer.concat([writeVarInt(disc), body]))
   })
+  await drainDeferredReplies()
   assert.strictEqual(client.written.length, 1, 'exactly one reply per request')
   const { name, params } = client.written[0]
   assert.strictEqual(name, 'login_plugin_response')
@@ -45,41 +50,41 @@ function loginReply (channel, disc, body = Buffer.alloc(0)) {
 }
 
 describe('WRAPPED_LOGIN_PROTOCOLS', function () {
-  it('framework:handshake: replies Acknowledge = index 1, empty body, to every S2C login message', () => {
+  it('framework:handshake: replies Acknowledge = index 1, empty body, to every S2C login message', async () => {
     // ForgeNetworkBuilder#build resets idCount to 1 and registers Acknowledge
     // first (S2CLoginData=2, S2CLoginConfigData=3), so the reply is always the
     // single byte 0x01 on the same inner channel.
     for (const disc of [2, 3]) {
       assert.deepStrictEqual(
-        loginReply('framework:handshake', disc, Buffer.from([0xaa, 0xbb, 0xcc])),
+        await loginReply('framework:handshake', disc, Buffer.from([0xaa, 0xbb, 0xcc])),
         wrap('framework:handshake', Buffer.from([0x01]))
       )
     }
   })
 
-  it('tacz:handshake: unchanged — single 0x01 ack byte regardless of message', () => {
+  it('tacz:handshake: unchanged — single 0x01 ack byte regardless of message', async () => {
     assert.deepStrictEqual(
-      loginReply('tacz:handshake', 2, Buffer.from([1, 2, 3])),
+      await loginReply('tacz:handshake', 2, Buffer.from([1, 2, 3])),
       wrap('tacz:handshake', Buffer.from([0x01]))
     )
   })
 
-  it('zeta:main: unchanged — S2CLoginFlag(98) body echoed back as C2SLoginFlag(99)', () => {
+  it('zeta:main: unchanged — S2CLoginFlag(98) body echoed back as C2SLoginFlag(99)', async () => {
     const body = Buffer.from([9, 8, 7, 6, 5])
     assert.deepStrictEqual(
-      loginReply('zeta:main', 98, body),
+      await loginReply('zeta:main', 98, body),
       wrap('zeta:main', Buffer.concat([writeVarInt(99), body]))
     )
     // any other zeta message falls through to the FML ack
     assert.deepStrictEqual(
-      loginReply('zeta:main', 1, body),
+      await loginReply('zeta:main', 1, body),
       wrap('zeta:main', writeVarInt(99))
     )
   })
 
-  it('unknown wrapped channels: unchanged — FML C2SAcknowledge (99) fall-through', () => {
+  it('unknown wrapped channels: unchanged — FML C2SAcknowledge (99) fall-through', async () => {
     assert.deepStrictEqual(
-      loginReply('somemod:handshake', 3, Buffer.from([1])),
+      await loginReply('somemod:handshake', 3, Buffer.from([1])),
       wrap('somemod:handshake', writeVarInt(99))
     )
   })
@@ -98,7 +103,7 @@ describe('FML2 responder default case', function () {
     return client
   }
 
-  it('empty wrapped payload: length-guarded FML convention ack, never a readVarInt throw (L2 pin)', () => {
+  it('empty wrapped payload: length-guarded FML convention ack, never a readVarInt throw (L2 pin)', async () => {
     // An empty inner payload has no discriminator to read. The guard must
     // answer it as its own honest shape (convention ack on the originating
     // channel) instead of reaching readVarInt and replying from a catch.
@@ -109,6 +114,7 @@ describe('FML2 responder default case', function () {
       channel: 'fml:loginwrapper',
       data: wrap('somemod:channel', Buffer.alloc(0))
     })
+    await drainDeferredReplies() // HF12
     assert.strictEqual(client.written.length, 1, 'exactly one reply')
     const { name, params } = client.written[0]
     assert.strictEqual(name, 'login_plugin_response')

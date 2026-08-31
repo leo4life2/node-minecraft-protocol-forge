@@ -224,7 +224,11 @@ function makeClient () {
   return client
 }
 
-function loginReply (channel, disc, options) {
+// HF12: wrapped-mod-channel replies are deferred one event-loop turn by the
+// reply boundary law (loginReplyBoundary.js) — drain before asserting.
+const drainDeferredReplies = () => new Promise((resolve) => setImmediate(() => setImmediate(() => setImmediate(resolve))))
+
+async function loginReply (channel, disc, options) {
   const client = makeClient()
   forgeHandshake3(client, options || {})
   client.emit('login_plugin_request', {
@@ -232,20 +236,21 @@ function loginReply (channel, disc, options) {
     channel: 'fml:loginwrapper',
     data: wrap(channel, Buffer.concat([writeVarInt(disc), Buffer.from([0xde, 0xad])]))
   })
+  await drainDeferredReplies()
   assert.strictEqual(client.written.length, 1)
   return client.written[0].params.data
 }
 
 describe('wrapped login resolution order (table > derivation > FML 99)', function () {
-  it('jar-derived ack answers wrapped login messages on channels the table does not know', () => {
+  it('jar-derived ack answers wrapped login messages on channels the table does not know', async () => {
     const dir = synthCounterMod({ ns: 'omicron' })
     assert.deepStrictEqual(
-      loginReply('omicron:handshake', 3, { modsPaths: [dir] }),
+      await loginReply('omicron:handshake', 3, { modsPaths: [dir] }),
       wrap('omicron:handshake', Buffer.from([0x01]))
     )
   })
 
-  it('table override wins over derivation for known channels', () => {
+  it('table override wins over derivation for known channels', async () => {
     // tacz:handshake is in the table; hand it mods that would derive a
     // DIFFERENT (wrong-on-purpose) index and assert the table still answers
     const owner = 'synth/tz/Net'
@@ -262,15 +267,15 @@ describe('wrapped login resolution order (table > derivation > FML 99)', functio
       { name: `${ack}.class`, data: emptyEncoderClass(ack) }
     ])
     assert.deepStrictEqual(
-      loginReply('tacz:handshake', 2, { modsPaths: [dir] }),
+      await loginReply('tacz:handshake', 2, { modsPaths: [dir] }),
       wrap('tacz:handshake', Buffer.from([0x01]))
     )
   })
 
-  it('falls through to the FML acknowledge (99) when derivation abstains', () => {
+  it('falls through to the FML acknowledge (99) when derivation abstains', async () => {
     const dir = synthCounterMod({ ns: 'rho' })
     assert.deepStrictEqual(
-      loginReply('unknown:channel', 2, { modsPaths: [dir] }),
+      await loginReply('unknown:channel', 2, { modsPaths: [dir] }),
       wrap('unknown:channel', writeVarInt(99))
     )
   })

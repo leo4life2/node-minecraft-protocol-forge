@@ -9,6 +9,7 @@ const forgeHandshakeConfig = require('./forgeHandshakeConfig')
 const decodeOptimized = require('./decodeOptimized')
 const { deriveNeoForgeComponents } = require('./neoForgePayloadDerivation')
 const { installNeoForgeConfigNegotiation } = require('./neoForgeConfig')
+const { warmLoginAssessments } = require('./loginAckDerivation')
 
 // top-level jars in the resolved local mods folder(s)
 function listModJars (modsPaths) {
@@ -86,7 +87,14 @@ module.exports = function (client, options) {
 
     // modsPaths: same source as FML3 — jar-derived wrapped-channel login
     // replies (and honest failures) also apply to the FML2 login phase
-    forgeHandshake2(client, { forgeMods, modsPaths: options.modsPaths || options.owoModsPaths })
+    const fml2ModsPaths = options.modsPaths || options.owoModsPaths
+    forgeHandshake2(client, { forgeMods, modsPaths: fml2ModsPaths })
+    // HF12: same off-path warmup as FML3 (see below) — the FML2 wrapped-mod
+    // login lane shares the inline assessment and its exposure.
+    if (Array.isArray(response.forgeData.channels)) {
+      warmLoginAssessments(response.forgeData.channels.map((ch) => ch.res), fml2ModsPaths)
+        .catch(() => { /* inline assessment still covers every channel */ })
+    }
   })
 
   // FML3 (1.18 - 1.20.1): fmlNetworkVersion 3; mods and channels are packed
@@ -134,6 +142,7 @@ module.exports = function (client, options) {
     }
 
     debug(`FML3 server detected (${ping ? ping.mods.length : 'unknown'} mods), installing handshake spoof`)
+    const modsPaths = options.modsPaths || options.owoModsPaths
     forgeHandshake3(client, {
       forgeMods: options.forgeMods,
       channels: options.channels,
@@ -142,9 +151,20 @@ module.exports = function (client, options) {
       // replies (owo fingerprints, SimpleChannel login acks). The embedding
       // app resolves it (or the MINEPAL_FORGE_MODS_DIR env var applies
       // downstream). Previously dropped here, which orphaned owoModsPaths.
-      modsPaths: options.modsPaths || options.owoModsPaths,
+      modsPaths,
       pingModVersions
     })
+    // HF12: precompute the jar verdicts for every pinged mod channel while
+    // the connection is still being set up — the inline cold assessment used
+    // to run INSIDE the login_plugin_request handler (~650ms on the receipt's
+    // TACZ pack), long enough for the server to complete negotiation and arm
+    // compression while our reply was still being computed. Chunked one
+    // channel per turn; failures leave the inline path as the fallback.
+    if (ping && Array.isArray(ping.channels)) {
+      warmLoginAssessments(ping.channels.map((ch) => ch.name), modsPaths)
+        .then((n) => { if (n > 0) debug(`warmed ${n} login-channel assessments off the login path`) })
+        .catch(() => { /* inline assessment still covers every channel */ })
+    }
   })
 
   // NeoForge 1.20.5+: the ping carries isModded with NO forgeData (NeoForge
@@ -172,7 +192,7 @@ module.exports = function (client, options) {
       return
     }
     try {
-      const { components, diagnostics } = deriveNeoForgeComponents([...jarPaths, ...loaderJars])
+      const { components, diagnostics, syncContracts } = deriveNeoForgeComponents([...jarPaths, ...loaderJars])
       // channels the transport does not implement must not be claimed:
       // neoforge:split would invite split payloads this responder cannot
       // reassemble yet.
@@ -180,8 +200,8 @@ module.exports = function (client, options) {
         components[proto] = components[proto].filter((c) => c.id !== 'neoforge:split')
       }
       debug(`NeoForge 1.20.5+ server detected — claiming ${components.configuration.length} configuration + ${components.play.length} play jar-derived components (${jarPaths.length} mod jars, ${loaderJars.length} loader jars, ${diagnostics.abstains.length} abstains)`)
-      installNeoForgeConfigNegotiation(client, { components })
-      client.emit('neoForgeDerivation', { components, diagnostics })
+      installNeoForgeConfigNegotiation(client, { components, syncContracts })
+      client.emit('neoForgeDerivation', { components, diagnostics, syncContracts })
     } catch (err) {
       debug(`NeoForge component derivation failed (${err.message}) — attempting vanilla join`)
     }
