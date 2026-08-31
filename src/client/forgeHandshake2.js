@@ -123,6 +123,17 @@ module.exports = function (client, options) {
             case 'ModList': {
               const modlist = handshake.data
 
+              // HF13: stash the server's announced reality in the same shape
+              // FML3 keeps (mods: id strings, channels: {name, marker}) so the
+              // shared wrapped-mod-channel corroboration gate
+              // (forgeHandshake3.announcedChannelAttribution) works on both
+              // login-phase FML eras.
+              client.forgeModList = {
+                mods: Array.isArray(modlist.modNames) ? modlist.modNames : [],
+                channels: Array.isArray(modlist.channels) ? modlist.channels : [],
+                registries: Array.isArray(modlist.registries) ? modlist.registries.map((r) => r && r.name).filter(Boolean) : []
+              }
+
               const modlistreply = {
                 modNames,
                 channels: [],

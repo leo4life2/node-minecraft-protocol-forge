@@ -807,7 +807,10 @@ const assessCache = new Map()
  *       ServerLoginPacketListenerImpl patch + NetworkHooks.onCustomPayload).
  *   { verdict: 'unknown' }
  *       No local jar creates this channel (or no jars are configured); the
- *       caller keeps its least-bad convention default.
+ *       caller corroborates against the server's own announced mod list
+ *       (HF13, forgeHandshake3.announcedChannelAttribution) — an announced
+ *       channel gets the vanilla not-understood decline, only a channel the
+ *       announcement doesn't know keeps the least-bad convention default.
  *
  * @param {string} channelId e.g. 'calio:channel'
  * @param {Array.<string>} modsPaths jar files and/or directories of jars

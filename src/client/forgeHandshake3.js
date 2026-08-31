@@ -171,12 +171,16 @@ function encodeAcknowledgement () {
 // Wrapped (fml:loginwrapper) mod login messages: builder(disc, body) returns
 // the reply payload for the SAME inner channel, or null to fall through to
 // the FML acknowledge. Channels with NO local knowledge (not in this table,
-// not created by any local jar) keep getting the FML ack 99: mods that copy
-// FML's HandshakeMessages convention register their acknowledge at login
-// index 99, so it stays the least-bad default. Channels a local jar DOES
-// create resolve through assessLoginChannel instead — derived ack, or an
-// honest join stop when no correct reply is provable (see
-// resolveWrappedModLogin below).
+// not created by any local jar) fall to the HF13 corroboration gate: when the
+// server's own announcement attributes the channel to a mod, the answer is
+// the vanilla not-understood decline (the ack-99 guess is a proven kick in a
+// modern mod's own index space — see announcedChannelAttribution); only
+// channels NEITHER the jars NOR the announcement know keep the FML ack 99
+// (mods that copy FML's HandshakeMessages convention register their
+// acknowledge at login index 99, so it stays the least-bad default there).
+// Channels a local jar DOES create resolve through assessLoginChannel
+// instead — derived ack, or an honest join stop when no correct reply is
+// provable (see resolveWrappedModLogin below).
 const WRAPPED_LOGIN_PROTOCOLS = {
   // TACZ (tacz:handshake): NetworkHandler seeds HANDSHAKE_ID_COUNT at 1, so
   // its Acknowledge login message is index 1 with an empty body. The server
@@ -720,14 +724,93 @@ function parseServerRegistry (client, buffer, offset) {
 //                         with THEIR named copy (surfaced, with our decline
 //                         receipt attached). Aborting here — the pre-HF8
 //                         behavior — forfeited every tolerant server.
-//        'unknown'     -> null: caller falls back to the FML convention
+//        'unknown'     -> HF13 CORROBORATION LAW (the half-matching-instance
+//                         kill shot, 2026-08-31, deterministic 6/6): before
+//                         falling back to the FML convention acknowledge,
+//                         the guess is corroborated against the server's OWN
+//                         ANNOUNCED REALITY (the FML ModList it sent us this
+//                         login + the ping's mod list). When the announcement
+//                         attributes the queried channel to a mod — the
+//                         channel appears in the announced channel list, or
+//                         its namespace names an announced mod id — and the
+//                         local jars carry NO knowledge of it, the convention
+//                         byte 99 is an UNCORROBORATED CLAIM in a message
+//                         space the server just told us belongs to a mod we
+//                         provably do not hold. The live receipt for what
+//                         that claim does: Leo's half-matching Modrinth
+//                         instance (3/6 server mods, tacztweaks jars absent)
+//                         sent ack-99 on tacztweaks:handshake; the server
+//                         dispatched it into tacztweaks's IndexedMessageCodec,
+//                         found no message at index 99, logged "Unexpected
+//                         custom data from client" and kicked with
+//                         multiplayer.disconnect.unexpected_query_response
+//                         (one attempt raced the handshake iteration into a
+//                         server-side ConcurrentModificationException). The
+//                         reference client WITHOUT that mod answers exactly
+//                         the vanilla not-understood decline (same primary
+//                         sources as HF8 above), so that is what we send —
+//                         receipted, naming the announced owner mod@version
+//                         and the instance remedy. Channels the announcement
+//                         does NOT attribute (bare/exotic flows, infra
+//                         namespaces fml/forge/minecraft) keep the legacy
+//                         99 floor byte-for-byte:
+//                         null -> caller falls back to the FML convention
 //                         acknowledge byte 99 on the ORIGINATING channel
 //                         (mods that copy FML's HandshakeMessages register
 //                         their acknowledge at index 99 — the least-bad
-//                         default when the local jars carry no knowledge).
+//                         default when NEITHER the local jars NOR the
+//                         server's announcement know the channel).
 //
 // Returns { reply, via } (inner payload for the SAME channel), { failed:
-// true } (join already stopped honestly), or null (use the 99 convention).
+// true } (join already stopped honestly), { declined: true } (vanilla
+// not-understood decline — HF8 jar-proven or HF13 uncorroborated), or null
+// (use the 99 convention).
+
+// --- HF13: the server's announced reality, as attribution evidence ---------
+//
+// Sources, all in-protocol BEFORE any wrapped mod-channel query is answered:
+//   - client.forgeModList: the FML3 S2CModList this login (mods: id strings,
+//     channels: {name, marker}) — the server's own gathered login payloads
+//     put ModList first (HandshakeHandler's ordered "ticking packet info"
+//     queue), so it is stashed before mod-channel queries arrive. The FML2
+//     responder stashes the same shape from its ModList case.
+//   - client.forgePingMods / options.pingModVersions: the ping's forgeData
+//     mod list ({id, version}), available before the connection even starts.
+// Returns null when nothing announced attributes the channel (the legacy
+// floor stands), else { channel, announcedChannel, ownerMod, ownerVersion }.
+const INFRA_NAMESPACES = new Set(['fml', 'forge', 'minecraft'])
+function announcedChannelAttribution (client, options, channel) {
+  const colon = typeof channel === 'string' ? channel.indexOf(':') : -1
+  if (colon <= 0) return null
+  const ns = channel.slice(0, colon).toLowerCase()
+  // Infra namespaces never HF13-convert: they are the loader's own lanes,
+  // not a mod's message space (same filter as warmLoginAssessments).
+  if (INFRA_NAMESPACES.has(ns)) return null
+
+  const mods = new Map() // announced mod id (lowercase) -> version | null
+  const noteMod = (id, version) => {
+    if (id == null) return
+    const key = String(id).trim().toLowerCase()
+    if (!key) return
+    if (!mods.has(key) || (mods.get(key) == null && version != null)) mods.set(key, version ?? null)
+  }
+  const pingVersions = (options && options.pingModVersions) || {}
+  for (const id of Object.keys(pingVersions)) noteMod(id, pingVersions[id])
+  if (client && Array.isArray(client.forgePingMods)) {
+    for (const m of client.forgePingMods) { if (m) noteMod(m.id, m.version) }
+  }
+  const modList = client && client.forgeModList
+  if (modList && Array.isArray(modList.mods)) {
+    for (const id of modList.mods) noteMod(id, null)
+  }
+  let announcedChannel = false
+  if (modList && Array.isArray(modList.channels)) {
+    announcedChannel = modList.channels.some((ch) => ch && ch.name === channel)
+  }
+  const ownerMod = mods.has(ns) ? ns : null
+  if (!announcedChannel && ownerMod == null) return null
+  return { channel, announcedChannel, ownerMod, ownerVersion: ownerMod != null ? (mods.get(ownerMod) ?? null) : null }
+}
 function resolveWrappedModLogin (client, channel, disc, body, options) {
   if (WRAPPED_LOGIN_PROTOCOLS[channel]) {
     try {
@@ -745,7 +828,31 @@ function resolveWrappedModLogin (client, channel, disc, body, options) {
     debug(`assessment for ${channel} failed (${err.message})`)
     return null
   }
-  if (assessed.verdict === 'ack') return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}` }
+  if (assessed.verdict === 'ack') {
+    // HF13 corroboration receipt: record the announced owner facts NEXT TO
+    // the jar evidence, so a version-mismatched-but-present jar is visible
+    // in every following kick's classification (P6). The wire answer stays
+    // the bytecode-proven ack — reference-faithful: a real client running
+    // this exact instance sends its own mod's ack (converting mismatch into
+    // a decline would re-break the HF2 founding case, tacz 1.1.7 on a
+    // 1.1.8 server: the derived index is version-stable, the decline kicks).
+    try {
+      const attribution = announcedChannelAttribution(client, options, channel)
+      if (attribution && client) {
+        if (!Array.isArray(client.forgeLoginCorroboration)) client.forgeLoginCorroboration = []
+        client.forgeLoginCorroboration.push({
+          channel,
+          via: 'jar-derived-ack',
+          index: assessed.index,
+          jarEvidence: assessed.evidence,
+          announcedChannel: attribution.announcedChannel,
+          ownerMod: attribution.ownerMod,
+          ownerVersion: attribution.ownerVersion
+        })
+      }
+    } catch { /* receipts never break the reply path */ }
+    return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}` }
+  }
   if (assessed.verdict === 'underivable') {
     if (assessed.reason === 'substantive-reply') {
       // Jar-proven mandatory-and-unanswerable: the reply must carry data we
@@ -759,6 +866,14 @@ function resolveWrappedModLogin (client, channel, disc, body, options) {
     // empty login_plugin_response; this records the receipt.
     declineWrappedLoginHonestly(client, channel, assessed)
     return { declined: true, assessed }
+  }
+  // verdict 'unknown' (no local jar creates this channel, or no jars are
+  // configured): HF13 — corroborate the convention-99 guess against the
+  // server's own announced reality before letting it ride the wire.
+  const attribution = announcedChannelAttribution(client, options, channel)
+  if (attribution) {
+    declineUncorroboratedLogin(client, channel, attribution)
+    return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution } }
   }
   return null
 }
@@ -800,6 +915,48 @@ function declineWrappedLoginHonestly (client, channel, assessed) {
   if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
   client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence })
   client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence })
+}
+
+// The HF13 decline: same wire bytes as the HF8 decline (the vanilla
+// not-understood login_plugin_response — successful=false, no payload), for
+// the class where the LOCAL JARS know nothing but the SERVER'S OWN
+// ANNOUNCEMENT proves the channel belongs to a mod we do not hold. The old
+// behavior — the FML convention acknowledge byte 99 — is then an
+// uncorroborated claim in that mod's own IndexedMessageCodec space, and the
+// live receipt for it is a deterministic kick ("Unexpected custom data from
+// client" -> multiplayer.disconnect.unexpected_query_response; one attempt
+// raced into a server-side ConcurrentModificationException). The reference
+// Forge client WITHOUT the mod sends exactly this decline
+// (ClientHandshakePacketListenerImpl patch), so a half-matching or absent
+// local instance now answers as the real client it is honest about being —
+// never worse than no instance at all, and join-viable on every server whose
+// message tolerates the vanilla-shaped answer (proven live: tacztweaks
+// accepts it).
+function declineUncorroboratedLogin (client, channel, attribution) {
+  const owner = attribution.ownerMod
+    ? `mod "${attribution.ownerMod}"${attribution.ownerVersion ? ` (announced version ${attribution.ownerVersion})` : ''}`
+    : 'one of its mods'
+  const evidence = `server-announced channel${attribution.announcedChannel ? ' (in the FML ModList)' : ''} attributed to ${owner}; no local jar carries it`
+  const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline: ` +
+    `the server itself announced this channel belongs to ${owner}, and the local mod jars carry no knowledge of it — ` +
+    'the legacy FML convention acknowledgement (index 99) would be an uncorroborated claim in that mod\'s own message space ' +
+    '(live receipt: the server dispatches it, finds no message registered at 99, logs "Unexpected custom data from client" ' +
+    'and kicks with multiplayer.disconnect.unexpected_query_response). A decline is not a claim — it is byte-identical to ' +
+    'what a real Forge client without this mod answers. The server now decides: mods that tolerate a vanilla-shaped answer ' +
+    'continue the login; mods that require the reply kick with their own message. If this join fails, pointing MinePal at ' +
+    'the server\'s own modpack instance (its mods folder) gives the derivation the jars it needs for a real answer.'
+  console.warn(`[forge] ${message}`)
+  if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
+  client.forgeDeclinedLoginChannels.push({
+    channel,
+    verdict: 'unknown',
+    reason: 'uncorroborated-by-local-jars',
+    evidence,
+    ownerMod: attribution.ownerMod,
+    ownerVersion: attribution.ownerVersion,
+    announcedChannel: attribution.announcedChannel
+  })
+  client.emit('forgeLoginDeclined', { channel, reason: 'uncorroborated-by-local-jars', evidence })
 }
 
 /**
@@ -1010,6 +1167,9 @@ module.exports.WRAPPED_LOGIN_PROTOCOLS = WRAPPED_LOGIN_PROTOCOLS
 // channels across both login-phase FML eras.
 module.exports.resolveWrappedModLogin = resolveWrappedModLogin
 module.exports.failWrappedLoginHonestly = failWrappedLoginHonestly
+// HF13: announced-reality attribution (exported for tests — the corroboration
+// gate between the local jars' 'unknown' verdict and the legacy 99 floor).
+module.exports.announcedChannelAttribution = announcedChannelAttribution
 module.exports.wrapLoginPayload = wrapLoginPayload
 module.exports.encodeAcknowledgement = encodeAcknowledgement
 module.exports.modsPathsFor = modsPathsFor

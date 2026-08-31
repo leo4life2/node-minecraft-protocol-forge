@@ -88,7 +88,14 @@ module.exports = function (client, options) {
     // modsPaths: same source as FML3 — jar-derived wrapped-channel login
     // replies (and honest failures) also apply to the FML2 login phase
     const fml2ModsPaths = options.modsPaths || options.owoModsPaths
-    forgeHandshake2(client, { forgeMods, modsPaths: fml2ModsPaths })
+    // HF13: the ping's mod list is announced-reality evidence for the
+    // wrapped-channel corroboration gate, same as FML3 below.
+    const fml2PingVersions = {}
+    for (const mod of forgeMods || []) {
+      const id = mod && (mod.modId ?? mod.modid ?? mod.id)
+      if (id != null) fml2PingVersions[id] = mod.modmarker ?? mod.version ?? null
+    }
+    forgeHandshake2(client, { forgeMods, modsPaths: fml2ModsPaths, pingModVersions: fml2PingVersions })
     // HF12: same off-path warmup as FML3 (see below) — the FML2 wrapped-mod
     // login lane shares the inline assessment and its exposure.
     if (Array.isArray(response.forgeData.channels)) {

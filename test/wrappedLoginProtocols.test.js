@@ -90,6 +90,72 @@ describe('WRAPPED_LOGIN_PROTOCOLS', function () {
   })
 })
 
+// HF13 — the corroboration gate between the jars' 'unknown' verdict and the
+// FML-99 floor (live receipt 2026-08-31: a half-matching local instance sent
+// ack-99 on tacztweaks:handshake, a channel the server itself had announced;
+// the server found no message at index 99, logged "Unexpected custom data
+// from client" and kicked with unexpected_query_response, 6/6 deterministic).
+describe('HF13 announced-reality corroboration', function () {
+  async function replyWithAnnouncement (channel, stampAnnouncement) {
+    const client = makeClient()
+    stampAnnouncement(client)
+    forgeHandshake3(client, {})
+    client.emit('login_plugin_request', {
+      messageId: 42,
+      channel: 'fml:loginwrapper',
+      data: wrap(channel, Buffer.concat([writeVarInt(0), Buffer.from([1])]))
+    })
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 1, 'exactly one reply per request')
+    const { name, params } = client.written[0]
+    assert.strictEqual(name, 'login_plugin_response')
+    assert.strictEqual(params.messageId, 42)
+    return { client, data: params.data }
+  }
+
+  it('a server-announced channel with no local jar gets the vanilla not-understood DECLINE, not ack-99, with a receipt naming the announced owner', async () => {
+    const { client, data } = await replyWithAnnouncement('tweaksmod:handshake', (c) => {
+      c.forgeModList = {
+        mods: ['tweaksmod'],
+        channels: [{ name: 'tweaksmod:handshake', marker: '2.14.2' }],
+        registries: []
+      }
+      c.forgePingMods = [{ id: 'tweaksmod', version: '2.14.2' }]
+    })
+    assert.strictEqual(data, undefined, 'messageId with NO data = successful=false, the reference client\'s decline')
+    assert.strictEqual(client.forgeDeclinedLoginChannels.length, 1)
+    const receipt = client.forgeDeclinedLoginChannels[0]
+    assert.strictEqual(receipt.reason, 'uncorroborated-by-local-jars')
+    assert.strictEqual(receipt.ownerMod, 'tweaksmod')
+    assert.strictEqual(receipt.ownerVersion, '2.14.2')
+  })
+
+  it('announcement via ping mod list alone (no ModList yet) also corroborates', async () => {
+    const client = makeClient()
+    client.forgePingMods = [{ id: 'earlymod', version: '1.0' }]
+    forgeHandshake3(client, {})
+    client.emit('login_plugin_request', {
+      messageId: 7,
+      channel: 'fml:loginwrapper',
+      data: wrap('earlymod:gate', Buffer.concat([writeVarInt(0), Buffer.from([1])]))
+    })
+    await drainDeferredReplies()
+    assert.strictEqual(client.written[0].params.data, undefined, 'declined on ping evidence alone')
+  })
+
+  it('infra namespaces (fml/forge/minecraft) never convert — announced or not', async () => {
+    const { data } = await replyWithAnnouncement('forge:gate', (c) => {
+      c.forgeModList = { mods: ['forge'], channels: [{ name: 'forge:gate', marker: '1' }], registries: [] }
+    })
+    assert.deepStrictEqual(data, wrap('forge:gate', writeVarInt(99)), 'loader-infra lanes keep the legacy floor')
+  })
+
+  it('unannounced channels keep the FML-99 floor byte-for-byte (the frozen legacy default)', async () => {
+    const { data } = await replyWithAnnouncement('nobodyknows:gate', () => {})
+    assert.deepStrictEqual(data, wrap('nobodyknows:gate', writeVarInt(99)))
+  })
+})
+
 // FML2 responder (forgeHandshake2) — the same default case, guarded shapes.
 describe('FML2 responder default case', function () {
   const forgeHandshake2 = require('../src/client/forgeHandshake2')
