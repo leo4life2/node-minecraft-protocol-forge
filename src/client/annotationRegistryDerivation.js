@@ -410,6 +410,12 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
     const annotationDescBytes = Buffer.from(annotationDescriptor, 'utf8')
     const siteJar = entryInfo.jar ? entryInfo.jar.label : null
     if (siteJar) siteJars.add(siteJar)
+    if (clinitCensus.size === 0) {
+      // LOW-2 (HF9 verify): the strong census is the site-<clinit>'s own class
+      // constants; falling back to every annotated class in the site jar is
+      // weaker provenance — say so loudly instead of silently widening.
+      abstain(`${site}: census provenance: jar-wide annotated (no clinit constants) — orphan channels possible`)
+    }
     const censusClasses = []
     for (const name of state.allClassNames) {
       if (clinitCensus.size > 0) {
