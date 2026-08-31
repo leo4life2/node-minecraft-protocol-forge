@@ -464,11 +464,32 @@ function encodeKnownDataMapsReply (maps) {
  *     // handler contract over `minecraft:register` at query time (HF6 —
  *     // populates the server's ad-hoc channel set so its send-path guard
  *     // accepts the configuration built-ins its tasks send unconditionally)
+ *   ackContracts: Array<{trigger: string, ack: string}> | undefined,
+ *     // HF11: jar-proven blocking-task rows — on receiving `trigger` during
+ *     // configuration, send `ack` with an EMPTY body (the derivation proved
+ *     // the ack's codec is StreamCodec.unit and its handler is what calls
+ *     // finishCurrentTask server-side). Never guessed, receipted in
+ *     // state.acked + the neoForgeConfigAck event.
  * }} options
  */
 function installNeoForgeConfigNegotiation (client, options = {}) {
   const rawComponents = options.components || { configuration: [], play: [] }
   const declareListening = options.declareListening !== false
+  // HF11 — blocking-task ACK CONTRACTS, jar-derived rows {trigger, ack}:
+  // a mod configuration task that sends `trigger` and parks the phase until
+  // the client answers `ack` (tacz's NetworkHandler$Task — the server calls
+  // finishCurrentTask only in its `tacz:acknowledge` handler, and that ack's
+  // codec is StreamCodec.unit, i.e. an EMPTY body). Every row was PROVEN
+  // from the mod's own bytecode by the derivation (unit codec +
+  // finishCurrentTask + the task's run() constructing the trigger payload);
+  // nothing here is guessed, and a channel without a proven contract is
+  // never acked (it surfaces instead).
+  const ackContracts = new Map()
+  for (const row of options.ackContracts || []) {
+    if (row && typeof row.trigger === 'string' && typeof row.ack === 'string') {
+      ackContracts.set(row.trigger, row.ack)
+    }
+  }
   // HF6 intersection law (header §1): a clientbound/bidirectional neoforge:*
   // built-in outside the phase's contract must never be claimed — a
   // configuration task may block on a reply we cannot give, and an unknown
@@ -499,6 +520,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     declaredListening: null,
     queryAnswer: null, // HF8: {configuration, play, bytes} once answered
     setupFailed: null, // HF8: the server's per-channel failure reasons
+    acked: [], // HF11: {trigger, ack} rows actually answered this phase
     unclaimedBuiltins,
     unhandled: [],
     log: []
@@ -625,6 +647,18 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           break
         }
         default:
+          // HF11 — a jar-proven blocking-task trigger: answer with its
+          // proven empty ack so the server's configuration task finishes
+          // (without this, a claimed mod config channel parks the phase
+          // FOREVER — keepalives keep the socket up, progress never comes).
+          if (typeof channel === 'string' && ackContracts.has(channel)) {
+            const ack = ackContracts.get(channel)
+            debug(`neoforge config: blocking-task trigger ${channel} (${data.length} bytes) — sending its jar-proven empty ack ${ack}`)
+            state.acked.push({ trigger: channel, ack })
+            send(ack, Buffer.alloc(0))
+            client.emit('neoForgeConfigAck', { trigger: channel, ack })
+            break
+          }
           // HF6 boundary honesty: a neoforge:* configuration payload outside
           // the handler contract is SURFACED, never silently swallowed and
           // never answered with an invented reply. (Post-intersection we

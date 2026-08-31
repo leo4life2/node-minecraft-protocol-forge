@@ -31,6 +31,7 @@ module.exports = {
   neoForgeConfig: require('./src/client/neoForgeConfig'),
   neoForgeLoaderLocator: require('./src/client/neoForgeLoaderLocator'),
   deriveNeoForgeComponents: require('./src/client/neoForgePayloadDerivation').deriveNeoForgeComponents,
+  deriveAckContracts: require('./src/client/neoForgePayloadDerivation').deriveAckContracts,
   resolveForgeRegistryName,
   resolveForgeItemName,
   resolveForgeEntityName

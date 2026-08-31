@@ -100,6 +100,7 @@ class ConstantPool {
 
   fieldRef (o, n, d) { return this.ref(9, o, n, d) }
   methodRef (o, n, d) { return this.ref(10, o, n, d) }
+  iMethodRef (o, n, d) { return this.ref(11, o, n, d) }
 
   methodHandle (refKind, owner, name, desc) {
     const r = this.methodRef(owner, name, desc)
@@ -152,6 +153,14 @@ class Asm {
   invokespecial (o, n, d) { this.bytes.push(0xb7); this._u16(this.cp.methodRef(o, n, d)); return this }
   invokestatic (o, n, d) { this.bytes.push(0xb8); this._u16(this.cp.methodRef(o, n, d)); return this }
   invokedynamic (bsmIndex, name, desc) { this.bytes.push(0xba); this._u16(this.cp.invokeDynamic(bsmIndex, name, desc)); this.bytes.push(0, 0); return this }
+  // HF11 additions: the aggregator-shape fixtures need instance state +
+  // interface dispatch
+  getfield (o, n, d) { this.bytes.push(0xb4); this._u16(this.cp.fieldRef(o, n, d)); return this }
+  putfield (o, n, d) { this.bytes.push(0xb5); this._u16(this.cp.fieldRef(o, n, d)); return this }
+  invokeinterface (o, n, d, count) { this.bytes.push(0xb9); this._u16(this.cp.iMethodRef(o, n, d)); this.bytes.push(count != null ? count : 1, 0); return this }
+  athrow () { this.bytes.push(0xbf); return this }
+  ifne (offset) { this.bytes.push(0x9a); this._u16(offset & 0xffff); return this }
+  aconstNull () { this.bytes.push(0x01); return this }
   areturn () { this.bytes.push(0xb0); return this }
   goto_ (offset) { this.bytes.push(0xa7); this._u16(offset & 0xffff); return this }
   iload (n) { if (n <= 3) this.bytes.push(0x1a + n); else this.bytes.push(0x15, n); return this }

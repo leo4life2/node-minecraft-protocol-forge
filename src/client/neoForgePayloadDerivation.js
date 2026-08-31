@@ -64,7 +64,7 @@
 const fs = require('fs')
 const path = require('path')
 const debug = require('../../debug')
-const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef } = require('./jarAnalysis')
+const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
@@ -131,6 +131,20 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel) {
       if (!out.raw.has(className)) {
         out.raw.set(className, { buf, entry: e, jar: jarInfo })
       }
+    } else if (e.name.startsWith('META-INF/services/') && !e.name.endsWith('/')) {
+      // HF11: ServiceLoader ground truth — veil's platform Factory (and the
+      // wider @ExpectPlatform service idiom) binds its implementation here,
+      // not in bytecode. Names are dotted; store internal-form.
+      try {
+        const iface = e.name.slice('META-INF/services/'.length).replace(/\./g, '/')
+        const impls = zipEntryData(buf, e).toString('utf8')
+          .split('\n').map((l) => l.replace(/#.*$/, '').trim()).filter(Boolean)
+          .map((l) => l.replace(/\./g, '/'))
+        if (impls.length > 0) {
+          const list = out.services.get(iface) || []
+          out.services.set(iface, list.concat(impls))
+        }
+      } catch { /* tolerated: services are an optional resolution aid */ }
     } else if ((e.name.startsWith('META-INF/jars/') || e.name.startsWith('META-INF/jarjar/')) && e.name.endsWith('.jar')) {
       try {
         collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${e.name.split('/').pop()}`)
@@ -143,9 +157,11 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel) {
 
 function makeClassIndex () {
   const raw = new Map() // internalName -> {buf, entry, jar}
+  const services = new Map() // interface internalName -> [impl internalName]
   const parsed = new Map()
   const index = {
     raw,
+    services,
     get (name) {
       if (!name) return null
       if (parsed.has(name)) return parsed.get(name)
@@ -234,7 +250,12 @@ function resolveNamespaceHelper (index, owner, name, desc, cache) {
           if (c && c.tag === 8) strings.push(cpUtf8(cp, c.strIndex))
         } else if (op === 0xb8) {
           const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-          if (ref && ref.owner === RESLOC_TYPE && (ref.name === 'fromNamespaceAndPath' || ref.name === 'm_339182_')) sawFrom = true
+          // HF11: `tryBuild` is ResourceLocation's null-returning sibling of
+          // fromNamespaceAndPath (same (String,String) shape, same namespace
+          // semantics) — tracks_plus 1.0.6b2's `Tracks.path` helper builds
+          // every payload id through it and the old list silently missed the
+          // whole mod (3 required play channels abstained).
+          if (ref && ref.owner === RESLOC_TYPE && (ref.name === 'fromNamespaceAndPath' || ref.name === 'tryBuild' || ref.name === 'm_339182_')) sawFrom = true
           if (ref && ref.owner === RESLOC_TYPE && (ref.name === 'parse' || ref.name === 'tryParse')) sawConcatParse = true
         }
       })
@@ -300,6 +321,9 @@ function resolveStringValue (index, val, state) {
 // ---------- the linear abstract interpreter ----------
 
 function simulate (index, classInfo, method, state, opts = {}) {
+  // HF11: every registration carries its true site-method identity so the
+  // aggregation pass can re-simulate exactly the method that abstained.
+  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags } }
   const cp = classInfo.cp
   const code = method.code
   const stack = []
@@ -369,9 +393,17 @@ function simulate (index, classInfo, method, state, opts = {}) {
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         const obj = stack.pop()
         if (obj && obj.k === 'obj' && ref) {
+          // HF11: a construction-context object carries CONCRETE field values
+          // bound by the aggregation pass's ctor-body simulation — read them.
+          if (obj.fields && ref.name in obj.fields) { push(obj.fields[ref.name]); break }
           // record-style position binding: match ctor arg by declared order of
           // same-typed fields is overkill here; wrapper consumers read ctorArgs
           push({ k: 'instfield', obj, name: ref.name, desc: ref.desc })
+        } else if (obj && (obj.k === 'this' || obj.k === 'param') && ref) {
+          // HF11 provenance: an instance-field read on the entry receiver (or
+          // a parameter) stays symbolic so the aggregation pass can see WHAT
+          // the abstained id depended on and go find binding candidates.
+          push({ k: 'provfield', src: obj, name: ref.name, desc: ref.desc })
         } else push(UNKNOWN)
         break
       }
@@ -430,6 +462,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
     if (recv && recv.k === 'new') {
       recv.k = 'obj'
       recv.ctorArgs = argVals
+      recv.ctorDesc = ref.desc // HF11: lets the aggregation pass bind fields on demand
       if (recv.cls === PAYLOAD_TYPE_CLASS && argVals[0] && argVals[0].k === 'resloc') {
         recv.k = 'type'
         recv.v = argVals[0].v
@@ -473,6 +506,8 @@ function handleInvoke (index, classInfo, state, opts, call) {
       opts.onRegistration?.({
         method: ref.name,
         id: typeId,
+        idVal: argVals[0],
+        methodCtx: opts.methodCtx,
         registrar: recv,
         jar: classInfo.jar,
         site: `${classInfo.className}`
@@ -500,6 +535,8 @@ function handleInvoke (index, classInfo, state, opts, call) {
         opts.onRegistration?.({
           method: regMethod,
           id: typeId,
+          idVal: argVals[0],
+          methodCtx: opts.methodCtx,
           registrar,
           jar: classInfo.jar,
           site: `${classInfo.className} via ${recv.cls}.${ref.name}`
@@ -550,12 +587,28 @@ function handleInvoke (index, classInfo, state, opts, call) {
     const helper = resolveNamespaceHelper(index, ref.owner, ref.name, ref.desc, state.helperCache)
     const s = asStr(argVals[0])
     if (helper && s !== null) { push(vResloc(`${helper.nsPrefix}:${s}`)); return }
-    push(UNKNOWN)
+    // HF11 helper-CHAIN fallback: the single-method pattern scan above only
+    // reads one body, but mods layer their id helpers (createbigcannons
+    // 5.11.7: `CreateBigCannons.resource(p)` = ldc ns + delegate to
+    // `CBCUtils.location(ns, p)` which performs the real
+    // fromNamespaceAndPath). Simulating the body value-faithfully resolves
+    // any depth of straight-line delegation under the shared frame budget,
+    // or returns null and the registration abstains exactly as before.
+    const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'resloc')
+    push(chained && chained.k === 'resloc' ? chained : UNKNOWN)
     return
   }
   if (call.kind === 'static' && ref.owner === RESLOC_TYPE && ref.desc === `(Ljava/lang/String;Ljava/lang/String;)L${RESLOC_TYPE};`) {
     const ns = asStr(argVals[0]); const p = asStr(argVals[1])
     push(ns !== null && p !== null ? vResloc(`${ns}:${p}`) : UNKNOWN)
+    return
+  }
+  // HF11: any OTHER in-index static helper returning a ResourceLocation
+  // ((String,String) two-arg wrappers included) resolves by simulating its
+  // body — same bounds, honest UNKNOWN on miss.
+  if (call.kind === 'static' && ref.owner !== RESLOC_TYPE && ref.desc.endsWith(`)L${RESLOC_TYPE};`) && index.get(ref.owner)) {
+    const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'resloc')
+    push(chained && chained.k === 'resloc' ? chained : UNKNOWN)
     return
   }
   if (call.kind === 'static' && ref.owner === 'java/lang/String' && ref.name === 'valueOf' && argVals[0] && argVals[0].k === 'int') {
@@ -656,10 +709,11 @@ function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
   }
 }
 
-// Simulate a method body to learn its RETURN value (TYPE-factory helpers).
+// Simulate a method body to learn its RETURN value (TYPE-factory helpers;
+// HF11: ResourceLocation-returning helper chains via want='resloc').
 // Shares the registrar-helper bounds (cycle guard + frame budget); returns
-// the last type-shaped value the body returned, else the last returned value.
-function simulateForReturn (index, ref, kind, recv, argVals, state, opts) {
+// the last want-shaped value the body returned, else the last returned value.
+function simulateForReturn (index, ref, kind, recv, argVals, state, opts, want = 'type') {
   state.helperStack = state.helperStack || new Set()
   state.helperFrames = state.helperFrames || 0
   const key = `${ref.owner}.${ref.name}${ref.desc}`
@@ -678,7 +732,7 @@ function simulateForReturn (index, ref, kind, recv, argVals, state, opts) {
       locals,
       onReturn: (v) => {
         last = v
-        if (v && v.k === 'type') best = v
+        if (v && v.k === want) best = v
       }
     })
   } finally {
@@ -922,6 +976,1154 @@ function discoverFlowMarkers (index, entryMethods) {
   return markers
 }
 
+// ---------- HF11: AGGREGATOR shape — collection/instance/lambda-mediated ----
+//
+// A fifth ecosystem shape (field receipt 40cd36c4, the NeoForge 1.21.1
+// silent-close cluster): a REUSABLE REGISTRATION OBJECT whose per-channel
+// facts (id, version, phase) enter at its jar-wide POPULATION SITES, not at
+// the registrar call. Exemplars read from the shipped bytecode of that
+// receipt's own pack:
+//
+//   - glitchcore 2.1.0.2 `MixinPacketHandler.register(RL, packet)` — the
+//     registration lambda's captures carry the channel; its phase is the
+//     packet class's own getPhase() routed through a javac $SwitchMap; its
+//     negotiation VERSION is literally the channel's namespace string
+//     (`event.registrar(namespace)` — and the `.versioned()` result is
+//     discarded by the mod, `pop` at bc13, so the namespace stays). Callers:
+//     GlitchCore.registerPackets (glitchcore:sync_config, CONFIGURATION) and
+//     sereneseasons' ModPackets.init -> register (sync_season_cycle, PLAY).
+//   - supermartijn642 core 1.1.21 `PacketChannel.handleRegistration` — the
+//     channel Type lives in an instance field written by the constructor;
+//     population sites are `PacketChannel.create(ns, name)` call chains
+//     (rechiseled: create("rechiseled") -> "rechiseled:main",
+//     commonBidirectional, versioned("1"), non-optional).
+//
+// Resolution = three generic moves, no mod names anywhere:
+//   1. PROVENANCE: pass-1 entry simulation tags parameters/receiver, so an
+//      abstained registration knows the method it fired in.
+//   2. CONTEXT HARVEST: find jar-wide invocation sites of that method
+//      (virtual calls, constructor calls, and invokedynamic captures for
+//      lambda bodies — including the mixin/@ExpectPlatform graft idiom where
+//      the referenced owner's own body is a throw-only stub and exactly one
+//      substantive same-name+desc implementation exists elsewhere), binding
+//      argument values; call sites whose arguments are themselves unresolved
+//      parameters recurse into THEIR callers (bounded depth/breadth).
+//   3. CANDIDATE RE-EVALUATION: re-run the site method once per concrete
+//      context under a BRANCH-FOLLOWING evaluator (decided conditionals and
+//      enum switches are taken for real: Class.isAssignableFrom over the
+//      class index, enum-constant ordinals, the javac $SwitchMap idiom,
+//      guard-clause throw avoidance) so each candidate registers through
+//      exactly the arm the server itself would take. Only fully concrete
+//      tuples are claimed; anything else stays a loud abstain, and a channel
+//      resolving with CONFLICTING flows/versions is dropped loudly (a wrong
+//      claim is worse than no claim).
+//
+// Honest limits (growth path, not silent): registration loops over runtime
+// collections (catnip's packetsView — covered separately by the
+// ENUM-REGISTRY shape; balm/jade/veil/DH — all `.optional()` and therefore
+// lawfully unclaimed) and architectury's multi-hop aggregator chain remain
+// abstains.
+
+const CLASS_TYPE = 'java/lang/Class'
+const AGG_MAX_DEPTH = 3
+const AGG_MAX_CONTEXTS = 24
+const AGG_MAX_STEPS_PER_EVAL = 30000
+const AGG_TOTAL_STEP_BUDGET = 2400000
+
+function seedProvenanceLocals (desc, isStatic, cls) {
+  const locals = isStatic ? [] : [{ k: 'this', cls }]
+  const types = argSlots(desc)
+  for (let i = 0; i < types.length; i++) {
+    locals.push({ k: 'param', i })
+    if (types[i] === 'J' || types[i] === 'D') locals.push(UNKNOWN)
+  }
+  return locals
+}
+
+function isConcreteish (v) {
+  return !!v && (v.k === 'str' || v.k === 'int' || v.k === 'resloc' || v.k === 'type' ||
+    v.k === 'cls' || v.k === 'obj' || v.k === 'enumconst')
+}
+
+// Method lookup through the hierarchy (superclasses, then interfaces — the
+// interface walk is what resolves default methods like glitchcore
+// CustomPacket.getPhase()'s PLAY default).
+function findVirtualMethod (index, cls, name, desc, depth = 0) {
+  if (!cls || depth > 8) return null
+  const info = index.get(cls)
+  if (!info) return null
+  const m = info.codes.find((c) => c.method === name && c.desc === desc && c.code && c.code.length > 0)
+  if (m) return { info, m }
+  const viaSuper = findVirtualMethod(index, info.superName, name, desc, depth + 1)
+  if (viaSuper) return viaSuper
+  for (const i of info.interfaces || []) {
+    const viaIface = findVirtualMethod(index, i, name, desc, depth + 1)
+    if (viaIface) return viaIface
+  }
+  return null
+}
+
+// A throw-only stub: the platform/mixin graft idiom — body constructs one
+// exception and athrows, nothing else (glitchcore's common PacketHandler,
+// architectury @ExpectPlatform stubs). The real body lives in exactly one
+// substantive same-name+desc method elsewhere in the scanned jars.
+function isThrowOnlyStub (m) {
+  if (!m || !m.code || m.code.length === 0 || m.code.length > 16) return false
+  return m.code[m.code.length - 1] === 0xbf // athrow last
+}
+
+function resolveGraftImpl (index, state, owner, name, desc) {
+  const key = `graft:${owner}.${name}${desc}`
+  if (state.aggCache.has(key)) return state.aggCache.get(key)
+  let result = null
+  const candidates = []
+  for (const cls of state.allClassNames) {
+    if (cls === owner) continue
+    const bytes = index.rawBytes(cls)
+    if (!bytes) continue
+    const info = index.get(cls)
+    if (!info) continue
+    const m = info.codes.find((c) => c.method === name && c.desc === desc && !isThrowOnlyStub(c))
+    if (m) candidates.push(cls)
+    if (candidates.length > 1) break
+  }
+  if (candidates.length === 1) result = candidates[0]
+  state.aggCache.set(key, result)
+  return result
+}
+
+// Enum constant ordinal by <clinit> putstatic order of self-typed fields.
+function enumOrdinal (index, state, cls, constName) {
+  const key = `enumord:${cls}`
+  if (!state.aggCache.has(key)) {
+    const order = []
+    const info = index.get(cls)
+    const clinit = info && info.codes.find((c) => c.method === '<clinit>')
+    if (info && clinit) {
+      walkLinear(clinit.code, info.cp, (op, pc, cp, code) => {
+        if (op === 0xb3) { // putstatic
+          const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+          if (ref && ref.owner === cls && ref.desc === `L${cls};`) order.push(ref.name)
+        }
+      })
+    }
+    state.aggCache.set(key, order)
+  }
+  const order = state.aggCache.get(key)
+  const i = order.indexOf(constName)
+  return i >= 0 ? i : null
+}
+
+// The javac enum-switch idiom: a synthetic `$SwitchMap$...` int[] whose
+// <clinit> stores a case index per enum constant (each store wrapped in its
+// own try/catch; the normal path is linear). Returns {byName: {CONST: k}}.
+function resolveSwitchMap (index, state, owner, fieldName) {
+  const key = `swmap:${owner}.${fieldName}`
+  if (state.aggCache.has(key)) return state.aggCache.get(key)
+  let result = null
+  const info = index.get(owner)
+  const clinit = info && info.codes.find((c) => c.method === '<clinit>')
+  if (info && clinit) {
+    const byName = {}
+    const byOrd = {}
+    let pendingConst = null
+    let pendingInt = null
+    walkLinear(clinit.code, info.cp, (op, pc, cp, code) => {
+      if (op === 0xb2) { // getstatic
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (ref && ref.desc === `L${ref.owner};`) pendingConst = { owner: ref.owner, name: ref.name }
+      } else if (op >= 0x02 && op <= 0x08) {
+        pendingInt = op - 0x03
+      } else if (op === 0x10) {
+        pendingInt = code.readInt8(pc + 1)
+      } else if (op === 0x11) {
+        pendingInt = code.readInt16BE(pc + 1)
+      } else if (op === 0x4f) { // iastore
+        if (pendingConst !== null && pendingInt !== null) {
+          byName[pendingConst.name] = pendingInt
+          const ord = enumOrdinal(index, state, pendingConst.owner, pendingConst.name)
+          if (ord !== null) byOrd[ord] = pendingInt
+        }
+        pendingConst = null
+        pendingInt = null
+      }
+    })
+    if (Object.keys(byName).length > 0) result = { byName, byOrd }
+  }
+  state.aggCache.set(key, result)
+  return result
+}
+
+// Bind an abstract object's instance fields by evaluating its constructor
+// body with the construction-site arguments (putfield writes land in
+// obj.fields; chained getfields inside the ctor read them back).
+function bindCtorFields (index, state, obj) {
+  if (!obj || obj.k !== 'obj' || obj.fieldsBound) return
+  obj.fieldsBound = true
+  obj.fields = obj.fields || {}
+  const info = index.get(obj.cls)
+  if (!info || !obj.ctorDesc) return
+  const m = info.codes.find((c) => c.method === '<init>' && c.desc === obj.ctorDesc)
+  if (!m) return
+  const locals = seedArgLocals(obj.ctorDesc, obj.ctorArgs || [], obj)
+  evaluateMethod(index, info, m, state, { locals, recordPutstatic: false }, {})
+}
+
+// Peek ahead from pc: does this arm hit an athrow within a few instructions
+// before branching away? (Guard-clause idiom: `if (!valid(x)) throw ...` —
+// with the condition unknown, prefer the arm that does not immediately
+// throw, so validation guards don't silently kill the harvest.)
+function armThrowsImmediately (code, startPc, cp) {
+  let pc = startPc
+  let steps = 0
+  const { JVM_OP_LEN } = require('./jarAnalysis')
+  while (pc < code.length && steps < 16) {
+    const op = code[pc]
+    if (op === 0xbf) return true // athrow
+    if (op === 0xa7 || op === 0xc8 || (op >= 0x99 && op <= 0xa6) || op === 0xb0 || op === 0xb1 || op === 0xac) return false
+    let len = JVM_OP_LEN[op]
+    if (op === 0xaa) { const p = (pc + 4) & ~3; len = (p - pc) + 12 + (code.readInt32BE(p + 8) - code.readInt32BE(p + 4) + 1) * 4 } else if (op === 0xab) { const p = (pc + 4) & ~3; len = (p - pc) + 8 + code.readInt32BE(p + 4) * 8 } else if (op === 0xc4) { len = code[pc + 1] === 0x84 ? 6 : 4 }
+    pc += len
+    steps++
+  }
+  return false
+}
+
+// The branch-following evaluator: simulate()'s value model with real control
+// flow. Decided conditionals and enum switches are TAKEN (so a candidate
+// registers through exactly the arm the server would take); unknown
+// conditionals fall through, except that an arm which immediately athrows is
+// avoided. Bounded by per-pc revisit counts, a per-evaluation step cap and a
+// shared total budget — exhaustion is a loud abstain upstream, never a spin.
+function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {}) {
+  state.aggCache = state.aggCache || new Map()
+  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags } }
+  const cp = classInfo.cp
+  const code = method.code
+  const stack = []
+  const locals = opts.locals ? opts.locals.slice() : []
+  const pop = (n = 1) => { for (let i = 0; i < n; i++) stack.pop() }
+  const push = (v) => stack.push(v)
+  const visits = new Map()
+  const { JVM_OP_LEN } = require('./jarAnalysis')
+  state.aggSteps = state.aggSteps || 0
+  let steps = 0
+  let pc = 0
+
+  const instrLen = (p) => {
+    const op = code[p]
+    let len = JVM_OP_LEN[op]
+    if (op === 0xaa) { const a = (p + 4) & ~3; len = (a - p) + 12 + (code.readInt32BE(a + 8) - code.readInt32BE(a + 4) + 1) * 4 } else if (op === 0xab) { const a = (p + 4) & ~3; len = (a - p) + 8 + code.readInt32BE(a + 4) * 8 } else if (op === 0xc4) { len = code[p + 1] === 0x84 ? 6 : 4 }
+    return len
+  }
+
+  while (pc >= 0 && pc < code.length) {
+    if (++steps > AGG_MAX_STEPS_PER_EVAL || ++state.aggSteps > AGG_TOTAL_STEP_BUDGET) {
+      state.aggBudgetBlown = true
+      return
+    }
+    const seen = (visits.get(pc) || 0) + 1
+    visits.set(pc, seen)
+    if (seen > 64) return // loop bound (collection expansion iterates for real)
+    const op = code[pc]
+    const next = pc + instrLen(pc)
+    let jumped = false
+    const jump = (target) => { pc = target; jumped = true }
+    const condBranch = (target, known, takeJump) => {
+      if (known) {
+        if (takeJump) jump(target)
+        return
+      }
+      // unknown condition: avoid an immediately-throwing arm
+      if (armThrowsImmediately(code, next, cp) && !armThrowsImmediately(code, target, cp)) jump(target)
+      // else fall through
+    }
+
+    switch (op) {
+      case 0x01: push(UNKNOWN); break
+      case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
+        push(vInt(op - 0x03)); break
+      case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f: push(UNKNOWN); break
+      case 0x10: push(vInt(code.readInt8(pc + 1))); break
+      case 0x11: push(vInt(code.readInt16BE(pc + 1))); break
+      case 0x12: case 0x13: {
+        const idx = op === 0x12 ? code[pc + 1] : code.readUInt16BE(pc + 1)
+        const c = cp[idx]
+        if (c && c.tag === 8) push(vStr(cpUtf8(cp, c.strIndex)))
+        else if (c && c.tag === 7) push(vCls(cpUtf8(cp, c.nameIndex)))
+        else if (c && c.tag === 3) push(vInt(c.int))
+        else push(UNKNOWN)
+        break
+      }
+      case 0x14: push(UNKNOWN); break
+      case 0x15: case 0x16: case 0x17: case 0x18: case 0x19:
+        push(locals[code[pc + 1]] ?? UNKNOWN); break
+      case 0x1a: case 0x1b: case 0x1c: case 0x1d: push(locals[op - 0x1a] ?? UNKNOWN); break
+      case 0x1e: case 0x1f: case 0x20: case 0x21: push(locals[op - 0x1e] ?? UNKNOWN); break
+      case 0x22: case 0x23: case 0x24: case 0x25: push(locals[op - 0x22] ?? UNKNOWN); break
+      case 0x26: case 0x27: case 0x28: case 0x29: push(locals[op - 0x26] ?? UNKNOWN); break
+      case 0x2a: case 0x2b: case 0x2c: case 0x2d: push(locals[op - 0x2a] ?? UNKNOWN); break
+      case 0x32: { // aaload — materialized arrays (enum values()) yield elements
+        const idx = stack.pop()
+        const arr = stack.pop()
+        if (arr && arr.k === 'varr' && idx && idx.k === 'int') push(arr.items[idx.v] ?? UNKNOWN)
+        else push(UNKNOWN)
+        break
+      }
+      case 0xbe: { // arraylength
+        const arr = stack.pop()
+        push(arr && arr.k === 'varr' ? vInt(arr.items.length) : UNKNOWN)
+        break
+      }
+      case 0x2e: { // iaload — the $SwitchMap read
+        const idx = stack.pop()
+        const arr = stack.pop()
+        if (arr && arr.k === 'switchmap' && idx && idx.k === 'enumconst' && idx.name in arr.byName) {
+          push(vInt(arr.byName[idx.name]))
+        } else if (arr && arr.k === 'switchmap' && idx && idx.k === 'int' && idx.v in arr.byOrd) {
+          push(vInt(arr.byOrd[idx.v]))
+        } else push(UNKNOWN)
+        break
+      }
+      case 0x36: case 0x37: case 0x38: case 0x39: case 0x3a:
+        locals[code[pc + 1]] = stack.pop(); break
+      case 0x3b: case 0x3c: case 0x3d: case 0x3e: locals[op - 0x3b] = stack.pop(); break
+      case 0x3f: case 0x40: case 0x41: case 0x42: locals[op - 0x3f] = stack.pop(); break // lstore_n
+      case 0x43: case 0x44: case 0x45: case 0x46: locals[op - 0x43] = stack.pop(); break // fstore_n
+      case 0x47: case 0x48: case 0x49: case 0x4a: locals[op - 0x47] = stack.pop(); break // dstore_n
+      case 0x4b: case 0x4c: case 0x4d: case 0x4e: locals[op - 0x4b] = stack.pop(); break
+      case 0x57: pop(); break
+      case 0x58: pop(2); break
+      case 0x59: push(stack[stack.length - 1]); break
+      case 0x5a: { const a = stack.pop(); const b = stack.pop(); push(a); push(b); push(a); break }
+      case 0x5c: { const a = stack[stack.length - 1]; const b = stack[stack.length - 2]; push(b); push(a); break }
+      case 0x84: { // iinc — real counters keep enum-values() loops finite
+        const slot = code[pc + 1]
+        const delta = code.readInt8(pc + 2)
+        const cur = locals[slot]
+        locals[slot] = cur && cur.k === 'int' ? vInt(cur.v + delta) : UNKNOWN
+        break
+      }
+      case 0xb2: { // getstatic — switchmaps and enum constants get real values
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (!ref) { push(UNKNOWN); break }
+        if (ref.desc === '[I' && ref.name.startsWith('$SwitchMap$')) {
+          const map = resolveSwitchMap(index, state, ref.owner, ref.name)
+          push(map ? { k: 'switchmap', byName: map.byName, byOrd: map.byOrd || {} } : UNKNOWN)
+          break
+        }
+        if (ref.desc === `L${ref.owner};`) {
+          const ownerInfo = index.get(ref.owner)
+          if (ownerInfo && ownerInfo.superName === 'java/lang/Enum') {
+            push({ k: 'enumconst', cls: ref.owner, name: ref.name })
+            break
+          }
+        }
+        const key = `${ref.owner}.${ref.name}`
+        if (key in state.fieldValues) push(state.fieldValues[key])
+        else push({ k: 'field', owner: ref.owner, name: ref.name, desc: ref.desc })
+        break
+      }
+      case 0xb3: { // putstatic
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        const val = stack.pop()
+        if (ref && val && opts.recordPutstatic) state.fieldValues[`${ref.owner}.${ref.name}`] = val
+        break
+      }
+      case 0xb4: { // getfield — construction-bound objects read real values
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        const obj = stack.pop()
+        if (obj && obj.k === 'obj' && ref) {
+          if (!obj.fieldsBound && obj.ctorDesc && index.get(obj.cls)) bindCtorFields(index, state, obj)
+          if (obj.fields && ref.name in obj.fields) { push(obj.fields[ref.name]); break }
+          push({ k: 'instfield', obj, name: ref.name, desc: ref.desc })
+        } else push(UNKNOWN)
+        break
+      }
+      case 0xb5: { // putfield — binds fields on the object under construction
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        const val = stack.pop()
+        const obj = stack.pop()
+        if (obj && obj.k === 'obj' && ref) {
+          obj.fields = obj.fields || {}
+          obj.fields[ref.name] = val
+        }
+        break
+      }
+      case 0xbb: {
+        const cls = cpClassName(cp, code.readUInt16BE(pc + 1))
+        push({ k: 'new', cls })
+        break
+      }
+      case 0xbd: pop(1); push({ k: 'arr' }); break
+      case 0x53: pop(3); break
+      case 0xb6: case 0xb7: case 0xb9: {
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (!ref) break
+        const args = argSlots(ref.desc)
+        const argVals = []
+        for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
+        const recv = stack.pop()
+        if (hooks.onCall) hooks.onCall(ref, 'instance', recv, argVals)
+        if (evaluatorPreInvoke(index, state, opts, ref, recv, argVals, push, hooks)) break
+        handleInvoke(index, classInfo, state, opts, { kind: 'instance', ref, recv, argVals, push, pc })
+        // focus-pass hook: an aggregator instance just finished constructing
+        if (ref.name === '<init>' && recv && recv.k === 'obj' && state.aggFocus &&
+            recv.cls === state.aggFocus && state.aggConstructed && !state.aggConstructed.includes(recv)) {
+          state.aggConstructed.push(recv)
+        }
+        break
+      }
+      case 0xb8: {
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (!ref) break
+        const args = argSlots(ref.desc)
+        const argVals = []
+        for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
+        if (hooks.onCall) hooks.onCall(ref, 'static', null, argVals)
+        if (evaluatorPreInvoke(index, state, opts, ref, null, argVals, push, hooks)) break
+        handleInvoke(index, classInfo, state, opts, { kind: 'static', ref, recv: null, argVals, push, pc })
+        break
+      }
+      case 0xba: { // invokedynamic — capture values surface to the harvest
+        const c = cp[code.readUInt16BE(pc + 1)]
+        const nat = c && cp[c.natIndex]
+        const desc = nat ? cpUtf8(cp, nat.descIndex) : '()V'
+        const nArgs = argSlots(desc).length
+        const captured = []
+        for (let i = nArgs - 1; i >= 0; i--) captured[i] = stack.pop()
+        if (hooks.onIndy && c && classInfo.bootstrapMethods) {
+          const impl = resolveLambdaImpl(classInfo, c.bsmIndex)
+          if (impl) hooks.onIndy(impl, captured)
+        }
+        if (!returnsVoid(desc)) push(UNKNOWN)
+        break
+      }
+      case 0xb0: {
+        const v = stack.pop()
+        if (opts.onReturn) opts.onReturn(v)
+        return
+      }
+      case 0xac: case 0xad: case 0xae: case 0xaf: pop(); return // ireturn family
+      case 0xb1: return // return
+      case 0xbf: return // athrow: path ends
+      case 0xc0: break // checkcast
+      case 0xc1: pop(); push(UNKNOWN); break // instanceof
+      case 0xa7: jump(pc + code.readInt16BE(pc + 1)); break // goto
+      case 0xc8: jump(pc + code.readInt32BE(pc + 1)); break // goto_w
+      case 0x99: { // ifeq
+        const v = stack.pop()
+        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v === 0)
+        break
+      }
+      case 0x9a: { // ifne
+        const v = stack.pop()
+        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v !== 0)
+        break
+      }
+      case 0x9b: case 0x9c: case 0x9d: case 0x9e: { // iflt/ge/gt/le
+        const v = stack.pop()
+        const known = v && v.k === 'int'
+        const take = known && (
+          (op === 0x9b && v.v < 0) || (op === 0x9c && v.v >= 0) ||
+          (op === 0x9d && v.v > 0) || (op === 0x9e && v.v <= 0))
+        condBranch(pc + code.readInt16BE(pc + 1), known, take)
+        break
+      }
+      case 0x9f: case 0xa0: case 0xa1: case 0xa2: case 0xa3: case 0xa4: { // if_icmp*
+        const b = stack.pop(); const a = stack.pop()
+        const known = a && a.k === 'int' && b && b.k === 'int'
+        const take = known && (
+          (op === 0x9f && a.v === b.v) || (op === 0xa0 && a.v !== b.v) ||
+          (op === 0xa1 && a.v < b.v) || (op === 0xa2 && a.v >= b.v) ||
+          (op === 0xa3 && a.v > b.v) || (op === 0xa4 && a.v <= b.v))
+        condBranch(pc + code.readInt16BE(pc + 1), known, take)
+        break
+      }
+      case 0xa5: case 0xa6: { // if_acmpeq/ne — undecidable here
+        pop(2)
+        condBranch(pc + code.readInt16BE(pc + 1), false, false)
+        break
+      }
+      case 0xc6: case 0xc7: { // ifnull / ifnonnull
+        const v = stack.pop()
+        const knownNonnull = !!v && (v.k === 'str' || v.k === 'int' || v.k === 'resloc' || v.k === 'type' || v.k === 'cls' || v.k === 'obj' || v.k === 'new' || v.k === 'enumconst' || v.k === 'registrar')
+        condBranch(pc + code.readInt16BE(pc + 1), knownNonnull, knownNonnull && op === 0xc7)
+        break
+      }
+      case 0xaa: { // tableswitch
+        const v = stack.pop()
+        const a = (pc + 4) & ~3
+        const def = pc + code.readInt32BE(a)
+        const lo = code.readInt32BE(a + 4)
+        const hi = code.readInt32BE(a + 8)
+        if (v && v.k === 'int' && v.v >= lo && v.v <= hi) jump(pc + code.readInt32BE(a + 12 + (v.v - lo) * 4))
+        else jump(def)
+        break
+      }
+      case 0xab: { // lookupswitch
+        const v = stack.pop()
+        const a = (pc + 4) & ~3
+        const def = pc + code.readInt32BE(a)
+        const n = code.readInt32BE(a + 4)
+        let target = def
+        if (v && v.k === 'int') {
+          for (let i = 0; i < n; i++) {
+            if (code.readInt32BE(a + 8 + i * 8) === v.v) { target = pc + code.readInt32BE(a + 12 + i * 8); break }
+          }
+        }
+        jump(target)
+        break
+      }
+      default: break
+    }
+    if (!jumped) pc = next
+  }
+}
+
+// Evaluator-only invoke semantics layered ABOVE handleInvoke: real answers
+// for the reflection/enum/RL calls the aggregator shapes route ids through.
+// Returns true when the call was fully handled (value pushed as needed).
+function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}) {
+  // collection modeling by OBJECT IDENTITY: `add` on any abstract object
+  // gathers concrete elements onto that object; `iterator` replays exactly
+  // them. This is what keeps multi-instance aggregators separate (each
+  // manager's HashSet is its own vObj) — per-instance versions never mix.
+  if (recv && recv.k === 'obj' && ref.name === 'add' && ref.desc === '(Ljava/lang/Object;)Z') {
+    recv.items = recv.items || []
+    if (isConcreteish(argVals[0]) && recv.items.length < 192) recv.items.push(argVals[0])
+    push(vInt(1))
+    return true
+  }
+  // NOTE: every {k:'obj'} was CONSTRUCTED inside this evaluation universe
+  // (symbolic values stay {k:'field'}/{k:'param'}/UNKNOWN), so an obj with
+  // no captured adds truthfully iterates EMPTY — an unknown-hasNext loop
+  // would instead spin to the visit cap and abort the whole method (the
+  // aeronautics manager's empty clientbound set killed its serverbound
+  // harvest exactly that way).
+  if (recv && (recv.k === 'collection' || recv.k === 'obj') && ref.name === 'iterator' && argVals.length === 0) {
+    push({ k: 'iter', items: recv.items || [], i: 0 })
+    return true
+  }
+  if (recv && recv.k === 'iter') {
+    if (ref.name === 'hasNext') { push(vInt(recv.i < recv.items.length ? 1 : 0)); return true }
+    if (ref.name === 'next') { push(recv.items[recv.i++] ?? UNKNOWN); return true }
+  }
+  // Class.isAssignableFrom over the scanned hierarchy
+  if (ref.owner === CLASS_TYPE && ref.name === 'isAssignableFrom' && recv && recv.k === 'cls' && argVals[0] && argVals[0].k === 'cls') {
+    const a = recv.v; const b = argVals[0].v
+    push(vInt(a === b || isSubclassOf(index, b, a) ? 1 : 0))
+    return true
+  }
+  // Enum.ordinal() on a known constant
+  if (ref.name === 'ordinal' && ref.desc === '()I' && recv && recv.k === 'enumconst') {
+    const ord = enumOrdinal(index, state, recv.cls, recv.name)
+    push(ord === null ? UNKNOWN : vInt(ord))
+    return true
+  }
+  // Enum name()/ordinal() on a construction-bound constant: javac passes
+  // (name, ordinal) as the first two ctor args of every enum constructor —
+  // this is what makes `name().toLowerCase(ROOT)` channel ids concrete
+  // (Create's AllPackets idiom) under the aggregation evaluator.
+  if (recv && recv.k === 'obj' && recv.ctorArgs && index.get(recv.cls) && index.get(recv.cls).superName === 'java/lang/Enum') {
+    if (ref.name === 'name' && ref.desc === '()Ljava/lang/String;' && recv.ctorArgs[0]) {
+      push(recv.ctorArgs[0])
+      return true
+    }
+    if (ref.name === 'ordinal' && ref.desc === '()I' && recv.ctorArgs[1]) {
+      push(recv.ctorArgs[1])
+      return true
+    }
+  }
+  // ResourceLocation accessors on a resolved id
+  if (recv && recv.k === 'resloc' && ref.desc === '()Ljava/lang/String;') {
+    const [ns, ...rest] = String(recv.v).split(':')
+    if (ref.name === 'getNamespace') { push(vStr(ns)); return true }
+    if (ref.name === 'getPath') { push(vStr(rest.join(':'))); return true }
+    if (ref.name === 'toString') { push(vStr(recv.v)); return true }
+  }
+  // String.toLowerCase on a known string
+  if (ref.owner === 'java/lang/String' && ref.name === 'toLowerCase' && recv && recv.k === 'str') {
+    push(vStr(recv.v.toLowerCase()))
+    return true
+  }
+  // chained constructor delegation on an object under construction
+  if (ref.name === '<init>' && recv && recv.k === 'obj' && index.get(ref.owner)) {
+    const info = index.get(ref.owner)
+    const m = info.codes.find((c) => c.method === '<init>' && c.desc === ref.desc)
+    if (m && !state.aggCtorStack?.has(`${ref.owner}${ref.desc}`)) {
+      state.aggCtorStack = state.aggCtorStack || new Set()
+      const key = `${ref.owner}${ref.desc}`
+      state.aggCtorStack.add(key)
+      try {
+        evaluateMethod(index, info, m, state, { locals: seedArgLocals(ref.desc, argVals, recv), recordPutstatic: false }, {})
+      } finally {
+        state.aggCtorStack.delete(key)
+      }
+      return true
+    }
+    return false
+  }
+  // enum values(): materialize the constant array by evaluating the enum's
+  // own <clinit> once — each constant is a construction-bound object whose
+  // fields (payload class, codec, the Type built from name()) are readable.
+  if (!recv && ref.name === 'values' && ref.desc === `()[L${ref.owner};`) {
+    const info = index.get(ref.owner)
+    if (info && info.superName === 'java/lang/Enum') {
+      const cacheKey = `enumvals:${ref.owner}`
+      if (!state.aggCache.has(cacheKey)) {
+        state.aggCache.set(cacheKey, { items: [] }) // cycle guard
+        const clinit = info.codes.find((c) => c.method === '<clinit>')
+        if (clinit) {
+          evaluateMethod(index, info, clinit, state, { locals: [], recordPutstatic: true }, {})
+        }
+        const items = []
+        walkLinear(clinit ? clinit.code : Buffer.alloc(0), info.cp, (op2, pc2, cp2, code2) => {
+          if (op2 === 0xb3) {
+            const fref = cpRef(cp2, code2.readUInt16BE(pc2 + 1))
+            if (fref && fref.owner === ref.owner && fref.desc === `L${ref.owner};`) {
+              const v = state.fieldValues[`${fref.owner}.${fref.name}`]
+              items.push(v ?? UNKNOWN)
+            }
+          }
+        })
+        state.aggCache.set(cacheKey, { items })
+      }
+      push({ k: 'varr', items: state.aggCache.get(cacheKey).items })
+      return true
+    }
+  }
+  // JDK collection view wrappers are identity for our purposes: the wrapped
+  // collection's captured elements ARE the view's elements (catnip's
+  // packetsView = Collections.unmodifiableSet(packets)).
+  if (!recv && ref.owner === 'java/util/Collections' &&
+      (ref.name.startsWith('unmodifiable') || ref.name.startsWith('synchronized')) && argVals.length === 1) {
+    push(argVals[0])
+    return true
+  }
+  // ServiceLoader idiom: a call written against an interface whose unique
+  // implementation is named by a META-INF/services file dispatches into that
+  // implementation (veil's platform Factory.create). The services file is
+  // primary-source truth, never a guess; ambiguity (several impls) abstains.
+  if ((!recv || recv.k === 'field' || recv === UNKNOWN) && index.services) {
+    const impls = index.services.get(ref.owner)
+    if (impls && new Set(impls).size === 1 && index.get(impls[0])) {
+      const implRecv = { k: 'obj', cls: impls[0], fields: {}, fieldsBound: true, serviceImpl: true }
+      return inlineDispatch(index, state, opts, implRecv, ref, argVals, push, hooks)
+    }
+  }
+  // in-index virtual call on an abstract object: run the REAL body
+  // (hierarchy-resolved, interface defaults included) — this is what turns
+  // packet.getPhase() / factory.type() into concrete values and lets an
+  // aggregator's registerX(...) population methods execute for real against
+  // the exact instance being resolved.
+  if (recv && recv.k === 'obj' && ref.name !== '<init>') {
+    return inlineDispatch(index, state, opts, recv, ref, argVals, push, hooks)
+  }
+  // in-index STATIC call within the aggregation focus scope (the aggregator
+  // class and its ancestors): factory chains like PacketChannel.create /
+  // VeilPacketManager.create evaluate for real, yielding the constructed
+  // aggregator object.
+  if (!recv && ((state.aggStaticScope && state.aggStaticScope.has(ref.owner)) || state.aggInlineAll) && index.get(ref.owner)) {
+    const info = index.get(ref.owner)
+    const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
+    if (m) {
+      state.aggInlineStack = state.aggInlineStack || new Set()
+      const key = `s:${ref.owner}.${ref.name}${ref.desc}`
+      if (state.aggInlineStack.has(key) || state.aggInlineStack.size > 24) return false
+      state.aggInlineStack.add(key)
+      let returned
+      try {
+        evaluateMethod(index, info, m, state, {
+          locals: seedArgLocals(ref.desc, argVals),
+          recordPutstatic: false,
+          onReturn: (v) => { returned = v },
+          onRegistration: opts.onRegistration
+        }, hooks)
+      } finally {
+        state.aggInlineStack.delete(key)
+      }
+      if (!returnsVoid(ref.desc)) push(returned ?? UNKNOWN)
+      return true
+    }
+  }
+  return false
+}
+
+// Inline a virtual/interface call against a concrete receiver's real method
+// body; adopts the return value. Cycle-guarded and depth-bounded — a miss
+// falls back to handleInvoke's abstract handling (returns false).
+function inlineDispatch (index, state, opts, recv, ref, argVals, push, hooks = {}) {
+  const target = findVirtualMethod(index, recv.cls, ref.name, ref.desc)
+  if (!target) return false
+  state.aggInlineStack = state.aggInlineStack || new Set()
+  const key = `${recv.cls}.${ref.name}${ref.desc}`
+  if (state.aggInlineStack.has(key) || state.aggInlineStack.size > 24) return false
+  state.aggInlineStack.add(key)
+  let returned
+  try {
+    evaluateMethod(index, target.info, target.m, state, {
+      locals: seedArgLocals(ref.desc, argVals, recv),
+      recordPutstatic: false,
+      onReturn: (v) => { returned = v },
+      onRegistration: opts.onRegistration
+    }, hooks)
+  } finally {
+    state.aggInlineStack.delete(key)
+  }
+  if (!returnsVoid(ref.desc)) push(returned ?? UNKNOWN)
+  return true
+}
+
+// Jar-wide invocation harvest for one method: every (class, method) whose
+// bytecode invokes the target (owner-exact, subclass owners, throw-only-stub
+// grafts) or captures it through an invokedynamic. Bounded by the rawBytes
+// prefilter (a caller must name the owner or the graft stub's owner).
+function findInvocationSites (index, state, target) {
+  const key = `sites:${target.cls}.${target.name}${target.desc}`
+  if (state.aggCache.has(key)) return state.aggCache.get(key)
+  const sites = []
+  const simpleOwner = target.cls.split('/').pop()
+  // owners whose invocation resolves to the target: itself + throw-only
+  // stubs it grafts onto (glitchcore PacketHandler <- MixinPacketHandler)
+  const ownerAliases = new Set([target.cls])
+  for (const cls of state.allClassNames) {
+    if (cls === target.cls) continue
+    const info = index.get(cls)
+    if (!info) continue
+    const stub = info.codes.find((c) => c.method === target.name && c.desc === target.desc && isThrowOnlyStub(c))
+    if (stub && resolveGraftImpl(index, state, cls, target.name, target.desc) === target.cls) ownerAliases.add(cls)
+  }
+  // abstract-owner aliasing: an invocation written against an interface or
+  // abstract ancestor (VeilPacketManager.registerClientbound, the platform
+  // Factory.create service idiom) resolves to the target implementation —
+  // but ONLY when the target is the unique coded implementer among that
+  // ancestor's scanned subclasses (two-loader merged jars ship several).
+  for (const anc of state.allClassNames) {
+    if (ownerAliases.has(anc)) continue
+    if (!isSubclassOf(index, target.cls, anc)) continue
+    const ancInfo = index.get(anc)
+    if (!ancInfo) continue
+    if (ancInfo.codes.some((c) => c.method === target.name && c.desc === target.desc)) continue
+    let implementers = 0
+    for (const sub of state.allClassNames) {
+      if (!isSubclassOf(index, sub, anc) && sub !== anc) continue
+      const subInfo = index.get(sub)
+      if (subInfo && subInfo.codes.some((c) => c.method === target.name && c.desc === target.desc && !isThrowOnlyStub(c))) implementers++
+      if (implementers > 1) break
+    }
+    if (implementers === 1) ownerAliases.add(anc)
+  }
+  const aliasSimple = [...ownerAliases].map((o) => o.split('/').pop())
+  for (const cls of state.allClassNames) {
+    const bytes = index.rawBytes(cls)
+    if (!bytes) continue
+    if (!aliasSimple.some((s) => bytes.includes(s))) continue
+    const info = index.get(cls)
+    if (!info) continue
+    for (const m of info.codes) {
+      if (cls === target.cls && m.method === target.name && m.desc === target.desc) continue
+      let matched = false
+      walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+        if (matched) return
+        if (op === 0xb6 || op === 0xb7 || op === 0xb8 || op === 0xb9) {
+          const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+          if (ref && ref.name === target.name && ref.desc === target.desc && ownerAliases.has(ref.owner)) matched = true
+        } else if (op === 0xba && info.bootstrapMethods) {
+          const c = cp[code.readUInt16BE(pc + 1)]
+          const impl = c && resolveLambdaImpl(info, c.bsmIndex)
+          if (impl && impl.name === target.name && impl.desc === target.desc && ownerAliases.has(impl.owner)) matched = true
+        }
+      })
+      if (matched) sites.push({ cls, method: m.method, desc: m.desc })
+    }
+    if (sites.length > 64) break
+  }
+  if (process.env.MINEPAL_AGG_DEBUG) {
+    debug(`agg sites ${target.cls}.${target.name}: aliases=${[...ownerAliases].join(',')} sites=${sites.map((s) => `${s.cls}.${s.method}`).join(' | ')}`)
+  }
+  state.aggCache.set(key, sites)
+  return sites
+}
+
+// Concrete calling contexts for a method: run each invocation site under the
+// evaluator, collect the argument values at the matching call; sites whose
+// arguments are themselves unresolved parameters recurse into THEIR callers.
+// A context is {recv, args}; for constructors, recv is the construction-bound
+// object.
+function resolveCallContexts (index, state, target, depth) {
+  const key = `ctx:${target.cls}.${target.name}${target.desc}`
+  if (state.aggCache.has(key)) return state.aggCache.get(key)
+  state.aggCtxStack = state.aggCtxStack || new Set()
+  if (depth > AGG_MAX_DEPTH || state.aggCtxStack.has(key)) return { contexts: [], partial: true }
+  state.aggCtxStack.add(key)
+  const contexts = []
+  let partial = false
+  try {
+    const sites = findInvocationSites(index, state, target)
+    if (sites.length === 0) partial = true
+    for (const site of sites) {
+      const info = index.get(site.cls)
+      const m = info && info.codes.find((c) => c.method === site.method && c.desc === site.desc)
+      if (!m) continue
+      const makeHooks = (sink) => ({
+        onCall: (ref, kind, recv, argVals) => {
+          if (ref.name === target.name && ref.desc === target.desc) sink.push({ recv, args: argVals.slice() })
+        },
+        onIndy: (impl, captured) => {
+          if (impl.name === target.name && impl.desc === target.desc) sink.push({ recv: null, args: captured.slice(), viaIndy: true })
+        }
+      })
+      const collect = (bindingLocals) => {
+        const matches = []
+        const locals = bindingLocals || seedProvenanceLocals(m.desc, (m.flags & 0x0008) !== 0, site.cls)
+        evaluateMethod(index, info, m, state, { locals, recordPutstatic: false }, makeHooks(matches))
+        return matches
+      }
+      let matches = collect(null)
+      const isUnresolvedCtx = (mt) => mt.args.some((a) => a && (a.k === 'param' || a.k === 'provfield' || a.k === 'this'))
+      const unresolvedMatch = matches.some(isUnresolvedCtx)
+      if (unresolvedMatch && depth < AGG_MAX_DEPTH) {
+        // the call site itself depends on its own inputs — bind them from
+        // ITS callers and re-collect
+        const parent = resolveCallContexts(index, state, { cls: site.cls, name: site.method, desc: site.desc }, depth + 1)
+        partial = partial || parent.partial
+        const rebound = []
+        for (const pctx of parent.contexts.slice(0, AGG_MAX_CONTEXTS)) {
+          const isStatic = (m.flags & 0x0008) !== 0
+          const locals = isStatic
+            ? seedArgLocals(site.desc, pctx.args)
+            : seedArgLocals(site.desc, pctx.args, pctx.recv ?? UNKNOWN)
+          rebound.push(...collect(locals))
+        }
+        if (rebound.some((mt) => !isUnresolvedCtx(mt))) {
+          matches = rebound
+        } else {
+          // TRANSITIVE ROOT CLIMB: some chains only become concrete at the
+          // method where the aggregator is BORN (catnip: the registry is
+          // constructed in a mod's AllPackets.register, mutated through a
+          // register-once guard, and only then handed down the service
+          // chain). Walk the caller graph upward and run each frontier
+          // method for real with our hooks propagated through every inline
+          // dispatch — the match then fires from inside the true chain, in
+          // its natural single-execution order.
+          const prevInlineAll = state.aggInlineAll
+          state.aggInlineAll = true
+          try {
+            let frontier = [{ cls: site.cls, method: site.method, desc: site.desc }]
+            const visited = new Set()
+            for (let level = 0; level < AGG_MAX_DEPTH && !matches.some((mt) => !isUnresolvedCtx(mt)); level++) {
+              const nextFrontier = []
+              for (const f of frontier) {
+                for (const up of findInvocationSites(index, state, { cls: f.cls, name: f.method, desc: f.desc })) {
+                  const upKey = `${up.cls}.${up.method}${up.desc}`
+                  if (visited.has(upKey)) continue
+                  visited.add(upKey)
+                  nextFrontier.push(up)
+                  if (nextFrontier.length > 32) break
+                }
+              }
+              if (nextFrontier.length === 0) { partial = true; break }
+              for (const up of nextFrontier) {
+                const upInfo = index.get(up.cls)
+                const upM = upInfo && upInfo.codes.find((c) => c.method === up.method && c.desc === up.desc)
+                if (!upM) continue
+                const locals = seedProvenanceLocals(upM.desc, (upM.flags & 0x0008) !== 0, up.cls)
+                evaluateMethod(index, upInfo, upM, state, { locals, recordPutstatic: true }, makeHooks(matches))
+              }
+              frontier = nextFrontier
+            }
+          } finally {
+            state.aggInlineAll = prevInlineAll
+          }
+        }
+      }
+      matches = matches.filter((mt) => !isUnresolvedCtx(mt))
+      for (const mt of matches) {
+        if (contexts.length >= AGG_MAX_CONTEXTS) { partial = true; break }
+        if (target.name === '<init>') {
+          // materialize the constructed object with bound fields
+          const obj = { k: 'obj', cls: target.cls, ctorArgs: mt.args, ctorDesc: target.desc, fields: {} }
+          bindCtorFields(index, state, obj)
+          contexts.push({ recv: obj, args: mt.args })
+        } else {
+          contexts.push({ recv: mt.recv, args: mt.args })
+        }
+      }
+    }
+  } finally {
+    state.aggCtxStack.delete(key)
+  }
+  const result = { contexts, partial }
+  if (process.env.MINEPAL_AGG_DEBUG) {
+    debug(`agg contexts ${target.cls}.${target.name} depth=${depth}: ${contexts.length} contexts, partial=${partial} args=${JSON.stringify(contexts.map((c) => (c.args || []).map((a) => a && a.k)))}`)
+  }
+  state.aggCache.set(key, result)
+  return result
+}
+
+// The FOCUS PASS: build every real instance of an aggregator class the jars
+// themselves build. All classes referencing the aggregator (or an ancestor
+// it is invoked through) get their initializers and methods evaluated with
+// static factory chains in scope inlined, service-file dispatch live, and
+// constructor field binding on — so `VeilPacketManager.create("sable","1")`
+// materializes an object whose fields carry the true per-instance version
+// and whose population calls (`registerClientbound(...)`) land elements on
+// that same object's own collections (object identity IS the instance
+// separation). Returns the constructed aggregator objects.
+function collectFocusInstances (index, state, focusCls) {
+  const key = `focus:${focusCls}`
+  if (state.aggCache.has(key)) return state.aggCache.get(key)
+  const constructed = []
+  state.aggCache.set(key, constructed)
+  // scope: the aggregator + its in-index ancestors (interfaces included) —
+  // the classes whose static factories are worth evaluating for real
+  const scope = new Set([focusCls])
+  const addAncestors = (cls, depth) => {
+    if (!cls || depth > 8) return
+    const info = index.get(cls)
+    if (!info) return
+    for (const s of [info.superName, ...(info.interfaces || [])]) {
+      if (s && index.get(s) && !scope.has(s)) {
+        scope.add(s)
+        addAncestors(s, depth + 1)
+      }
+    }
+  }
+  addAncestors(focusCls, 0)
+  scope.delete('java/lang/Object')
+  const scopeSimple = [...scope].map((s) => s.split('/').pop())
+  const prevScope = state.aggStaticScope
+  const prevFocus = state.aggFocus
+  const prevConstructed = state.aggConstructed
+  state.aggStaticScope = scope
+  state.aggFocus = focusCls
+  state.aggConstructed = constructed
+  try {
+    const referencing = []
+    for (const cls of state.allClassNames) {
+      if (scope.has(cls)) continue
+      const bytes = index.rawBytes(cls)
+      if (!bytes) continue
+      if (scopeSimple.some((s) => bytes.includes(s))) referencing.push(cls)
+      if (referencing.length > 512) { constructed.truncated = true; break }
+    }
+    // initializers first (they publish the instances into static fields),
+    // then the remaining methods (they populate them)
+    const roots = []
+    for (const cls of referencing) {
+      const info = index.get(cls)
+      if (!info) continue
+      for (const m of info.codes) roots.push({ info, m, isClinit: m.method === '<clinit>' })
+    }
+    roots.sort((a, b) => (b.isClinit ? 1 : 0) - (a.isClinit ? 1 : 0))
+    for (const { info, m } of roots) {
+      if (state.aggBudgetBlown) break
+      const locals = seedProvenanceLocals(m.desc, (m.flags & 0x0008) !== 0, info.className)
+      evaluateMethod(index, info, m, state, { locals, recordPutstatic: true }, {})
+      if (process.env.MINEPAL_AGG_DEBUG) {
+        debug(`focus ${focusCls}: after ${info.className}.${m.method} — ${constructed.length} instances`)
+      }
+    }
+  } finally {
+    state.aggStaticScope = prevScope
+    state.aggFocus = prevFocus
+    state.aggConstructed = prevConstructed
+  }
+  return constructed
+}
+
+// The aggregation resolver: for every pending (id-unresolved) registration,
+// bind concrete calling contexts to its site method and re-evaluate. Emits
+// fully-resolved rows; conflicting resolutions for the same channel drop the
+// channel loudly.
+function resolveAggregatedRegistrations (index, state, pending) {
+  const rows = []
+  const resolvedSites = new Set()
+  const partialSites = new Set()
+  state.aggCache = state.aggCache || new Map()
+  const siteKey = (reg) => reg.methodCtx ? `${reg.methodCtx.cls}.${reg.methodCtx.name}${reg.methodCtx.desc}` : reg.site
+  const doneSiteMethods = new Set()
+  for (const reg of pending) {
+    if (!reg.methodCtx) continue
+    const sk = siteKey(reg)
+    if (doneSiteMethods.has(sk)) continue
+    doneSiteMethods.add(sk)
+    const info = index.get(reg.methodCtx.cls)
+    const m = info && info.codes.find((c) => c.method === reg.methodCtx.name && c.desc === reg.methodCtx.desc)
+    if (!m) continue
+    // Constructor-context or call-context binding for the site method itself
+    const isStatic = (m.flags & 0x0008) !== 0
+    let bindings = []
+    let partial = false
+    if (!isStatic && reg.methodCtx.name !== '<init>') {
+      // instance site: candidates are the aggregator instances the jars
+      // themselves construct AND populate (the focus pass — per-instance
+      // versions and per-instance collection contents by object identity)
+      const instances = collectFocusInstances(index, state, reg.methodCtx.cls)
+      for (const inst of instances.slice(0, AGG_MAX_CONTEXTS)) bindings.push({ recv: inst, args: null })
+      if (instances.length === 0 || instances.truncated || instances.length > AGG_MAX_CONTEXTS) partial = true
+    }
+    const callCtx = resolveCallContexts(index, state, { cls: reg.methodCtx.cls, name: reg.methodCtx.name, desc: reg.methodCtx.desc }, 0)
+    partial = partial || callCtx.partial
+    for (const c of callCtx.contexts) bindings.push({ recv: c.recv, args: c.args })
+    if (bindings.length === 0) {
+      if (partial) partialSites.add(sk)
+      continue
+    }
+    let produced = 0
+    let unresolvedInSite = 0
+    for (const b of bindings.slice(0, AGG_MAX_CONTEXTS)) {
+      const locals = []
+      if (!isStatic) locals.push(b.recv ?? { k: 'this', cls: reg.methodCtx.cls })
+      const types = argSlots(reg.methodCtx.desc)
+      for (let i = 0; i < types.length; i++) {
+        locals.push((b.args && b.args[i] !== undefined) ? b.args[i] : { k: 'param', i })
+        if (types[i] === 'J' || types[i] === 'D') locals.push(UNKNOWN)
+      }
+      evaluateMethod(index, info, m, state, {
+        locals,
+        recordPutstatic: false,
+        onRegistration: (r) => {
+          if (process.env.MINEPAL_AGG_DEBUG) debug(`agg re-eval ${sk}: ${r.method} id=${r.id} version=${r.registrar && r.registrar.version}`)
+          if (!r.id) { unresolvedInSite++; return }
+          const spec = REGISTRATION_METHODS[r.method]
+          if (!spec) return
+          produced++
+          rows.push({
+            id: r.id,
+            version: r.registrar ? r.registrar.version : null,
+            versionSource: 'aggregated',
+            optional: r.registrar ? r.registrar.optional : false,
+            flow: spec.flow,
+            protocols: spec.protocols,
+            method: r.method,
+            source: `aggregated ${reg.methodCtx.cls}`,
+            jar: r.jar,
+            siteKey: sk
+          })
+        }
+      }, {})
+    }
+    if (produced > 0) resolvedSites.add(sk)
+    if (partial || unresolvedInSite > 0) partialSites.add(sk)
+  }
+  // conflict guard: one channel, one truth — conflicting flow/version/
+  // optionality across candidates drops the channel LOUDLY (a wrong tuple
+  // claim fails the negotiation with a worse diagnostic than an honest miss)
+  const byChannel = new Map()
+  for (const row of rows) {
+    for (const proto of row.protocols) {
+      const key = `${proto}:${row.id}`
+      const prev = byChannel.get(key)
+      if (!prev) byChannel.set(key, row)
+      else if (prev.flow !== row.flow || prev.version !== row.version || prev.optional !== row.optional) {
+        prev.conflicted = true
+        row.conflicted = true
+      }
+    }
+  }
+  const conflicted = new Set()
+  for (const row of rows) {
+    if (row.conflicted) conflicted.add(row.id)
+  }
+  const clean = rows.filter((r) => !conflicted.has(r.id))
+  for (const id of conflicted) {
+    state.diagnostics.abstains.push(`${id}: aggregated candidates disagree on flow/version — unclaimed (a wrong tuple would fail the negotiation)`)
+  }
+  // versionless mandatory rows fall back to their jar's mods.toml version
+  // downstream via the same rule as pass 1 (handled by the caller)
+  return { rows: clean, resolvedSites, partialSites }
+}
+
+// ---------- HF11: blocking-task ACK contracts ----------
+//
+// tacz 1.1.8's configuration task (`NetworkHandler$Task.run`) sends
+// `tacz:server_synced_entity_data_mapping` and does NOT finish itself: the
+// server parks the configuration phase until the client answers
+// `tacz:acknowledge` — whose handler calls IPayloadContext.finishCurrentTask
+// and whose codec is StreamCodec.unit(INSTANCE) (an EMPTY wire payload).
+// Claiming the mapping channel without speaking the ack wedges the join
+// forever (keepalives keep the socket alive, no progress ever comes).
+//
+// The contract is derivable, generically, from three proofs read out of the
+// same jar: (1) a payload class whose (IPayloadContext)V handler calls
+// finishCurrentTask against a task TYPE owner; (2) that payload's codec is
+// unit (empty encode is protocol-true); (3) the task class whose run()
+// constructs the triggering payload. All three must hold or no contract is
+// emitted — a guessed ack is worse than a wedge (it desyncs the phase).
+const IPAYLOAD_CONTEXT = 'net/neoforged/neoforge/network/handling/IPayloadContext'
+const CONFIG_TASK_TYPE = 'net/minecraft/server/network/ConfigurationTask$Type'
+const STREAM_CODEC_TYPE = 'net/minecraft/network/codec/StreamCodec'
+
+function classTypeId (index, state, cls) {
+  // the class's own registered channel id: any Type-valued static resolved
+  // out of its <clinit> (resolveClassTypeFields caches into fieldValues)
+  resolveClassTypeFields(index, cls, state)
+  for (const [key, val] of Object.entries(state.fieldValues)) {
+    if (key.startsWith(`${cls}.`) && val && val.k === 'type') return val.v
+  }
+  return null
+}
+
+function deriveAckContracts (index, state) {
+  const contracts = []
+  for (const cls of state.allClassNames) {
+    const bytes = index.rawBytes(cls)
+    if (!bytes || !bytes.includes('finishCurrentTask')) continue
+    const info = index.get(cls)
+    if (!info) continue
+    const handler = info.codes.find((c) => c.desc === `(L${IPAYLOAD_CONTEXT};)V`)
+    if (!handler) continue
+    // proof 1: the handler finishes a configuration task
+    let taskOwner = null
+    let lastTypeField = null
+    walkLinear(handler.code, info.cp, (op, pc, cp, code) => {
+      if (op === 0xb2) {
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (ref && ref.desc === `L${CONFIG_TASK_TYPE};`) lastTypeField = ref
+      } else if (op === 0xb9 || op === 0xb6) {
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (ref && ref.name === 'finishCurrentTask' && lastTypeField) taskOwner = lastTypeField.owner
+      }
+    })
+    if (!taskOwner) continue
+    // proof 2: the ack payload's codec is unit (empty wire body)
+    const clinit = info.codes.find((c) => c.method === '<clinit>')
+    let unitCodec = false
+    if (clinit) {
+      walkLinear(clinit.code, info.cp, (op, pc, cp, code) => {
+        if (op === 0xb8 || op === 0xb9) {
+          const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+          if (ref && ref.owner === STREAM_CODEC_TYPE && ref.name === 'unit') unitCodec = true
+        }
+      })
+    }
+    if (!unitCodec) continue
+    const ackId = classTypeId(index, state, cls)
+    if (!ackId) continue
+    // proof 3: the task's run() constructs the triggering payload
+    const taskInfo = index.get(taskOwner)
+    if (!taskInfo) continue
+    const run = taskInfo.codes.find((c) => c.method === 'run' && c.desc === '(Ljava/util/function/Consumer;)V')
+    if (!run) continue
+    const constructed = []
+    walkLinear(run.code, taskInfo.cp, (op, pc, cp, code) => {
+      if (op === 0xbb) {
+        const c = cpClassName(cp, code.readUInt16BE(pc + 1))
+        if (c && c !== cls && index.get(c)) constructed.push(c)
+      }
+    })
+    for (const triggerCls of constructed) {
+      const triggerId = classTypeId(index, state, triggerCls)
+      if (triggerId && triggerId !== ackId) {
+        contracts.push({ trigger: triggerId, ack: ackId, task: taskOwner, source: cls })
+      }
+    }
+  }
+  return contracts
+}
+
 // ---------- top-level derivation ----------
 
 /**
@@ -966,9 +2168,15 @@ function deriveNeoForgeComponents (jarPaths) {
     registrations.push({ ...reg, ...spec })
   }
   for (const { info, method } of entryMethods) {
-    // locals seeded with unknowns; the event/registrar values are produced by
-    // the interpreter when registrar() is invoked on the event argument.
-    simulate(index, info, method, state, { onRegistration: record, recordPutstatic: false })
+    // HF11: locals seeded with PROVENANCE tags instead of bare unknowns (the
+    // receiver as {k:'this'}, each argument as {k:'param', i}) — same null
+    // results everywhere a value stays unresolved, but an abstained
+    // registration now records WHERE its id would have come from, which is
+    // what the aggregation pass binds candidates to. The event/registrar
+    // values are still produced by the interpreter when registrar() is
+    // invoked on the event argument.
+    const locals = seedProvenanceLocals(method.desc, (method.flags & 0x0008) !== 0, info.className)
+    simulate(index, info, method, state, { onRegistration: record, recordPutstatic: false, locals })
   }
 
   const markers = discoverFlowMarkers(index, entryMethods)
@@ -984,13 +2192,17 @@ function deriveNeoForgeComponents (jarPaths) {
       }
     }
   }
+  const pendingAgg = []
   for (const reg of registrations) {
     diagnostics.registrations++
     let version = reg.registrar ? reg.registrar.version : null
     let versionSource = reg.registrar ? reg.registrar.versionSource : 'unresolved'
     const optional = reg.registrar ? reg.registrar.optional : false
     if (!reg.id) {
-      diagnostics.abstains.push(`${reg.site}: ${reg.method} with unresolved payload type id`)
+      // HF11: don't abstain yet — the AGGREGATOR pass may resolve this site
+      // from its jar-wide population contexts. Unresolved leftovers abstain
+      // below with the registrar's own optionality in the copy.
+      pendingAgg.push(reg)
       continue
     }
     if (version === null) {
@@ -1013,12 +2225,61 @@ function deriveNeoForgeComponents (jarPaths) {
     add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, 'enum-registry')
   }
 
+  // HF11 AGGREGATOR pass: resolve id-less registrations from their jar-wide
+  // population contexts (see the shape header above); leftovers abstain with
+  // honest optionality wording so P5 surfaces only real negotiation risk.
+  const agg = resolveAggregatedRegistrations(index, state, pendingAgg)
+  for (const row of agg.rows) {
+    let version = row.version
+    let versionSource = row.versionSource
+    if (version === null) {
+      const metaVersion = row.jar && row.jar.modVersion
+      if (row.optional) {
+        diagnostics.abstains.push(`${row.id}: aggregated optional channel with unresolved version — safely unclaimed`)
+        continue
+      }
+      if (metaVersion) {
+        version = metaVersion
+        versionSource = 'mods.toml'
+      } else {
+        diagnostics.abstains.push(`${row.id}: aggregated required channel with no derivable version — join will be refused by the server`)
+        continue
+      }
+    }
+    add(row.id, version, row.flow, row.optional, row.protocols, row.source, versionSource)
+  }
+  const abstainedSiteKeys = new Set()
+  for (const reg of pendingAgg) {
+    const sk = reg.methodCtx ? `${reg.methodCtx.cls}.${reg.methodCtx.name}${reg.methodCtx.desc}` : reg.site
+    if (agg.resolvedSites.has(sk) && !agg.partialSites.has(sk)) continue
+    if (abstainedSiteKeys.has(`${sk}#${reg.method}`)) continue
+    abstainedSiteKeys.add(`${sk}#${reg.method}`)
+    const opt = reg.registrar && reg.registrar.optional
+    const partially = agg.resolvedSites.has(sk) ? ' (partially aggregated — remainder unresolved)' : ''
+    diagnostics.abstains.push(opt
+      ? `${reg.site}: ${reg.method} optional registration with unresolved payload type id — safely unclaimed${partially}`
+      : `${reg.site}: ${reg.method} with unresolved payload type id${partially}`)
+  }
+  if (state.aggBudgetBlown) {
+    diagnostics.abstains.push('aggregation budget exhausted — remaining aggregated registrations abstained')
+  }
+
+  // HF11: blocking-task ack contracts (see deriveAckContracts header) — the
+  // responder answers each proven trigger with its proven empty ack so a
+  // claimed mod config channel cannot park the phase forever.
+  let ackContracts = []
+  try {
+    ackContracts = deriveAckContracts(index, state)
+  } catch (err) {
+    diagnostics.errors.push(`ack-contract derivation failed (${err.message}) — no contracts emitted`)
+  }
+
   const components = {
     configuration: [...byProtocol.configuration.values()],
     play: [...byProtocol.play.values()]
   }
-  debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${Date.now() - started}ms)`)
-  return { components, diagnostics }
+  debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${ackContracts.length} ack contracts, ${Date.now() - started}ms)`)
+  return { components, diagnostics, ackContracts }
 }
 
-module.exports = { deriveNeoForgeComponents }
+module.exports = { deriveNeoForgeComponents, deriveAckContracts, resolveAggregatedRegistrations }
