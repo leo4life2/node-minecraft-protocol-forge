@@ -75,6 +75,7 @@ const path = require('path')
 const debug = require('../../debug')
 const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
 const { deriveAnnotationRegistries } = require('./annotationRegistryDerivation')
+const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, assembleListenOnly } = require('./listenOnlyDerivation')
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
@@ -2203,6 +2204,12 @@ function deriveNeoForgeComponents (jarPaths) {
     }
   }
   const pendingAgg = []
+  // HF15 tier (a): a registration whose ID resolved but whose VERSION did
+  // not is a LISTEN-ONLY fact — the id is jar truth, and the version-free
+  // ad-hoc declaration tier (minecraft:register) is exactly the lawful home
+  // for it. Today these abstain and vanish; now they abstain AND ride the
+  // listen-only surface (never a claim — no version is ever invented).
+  const listenOnlyNamed = []
   for (const reg of registrations) {
     diagnostics.registrations++
     let version = reg.registrar ? reg.registrar.version : null
@@ -2219,6 +2226,7 @@ function deriveNeoForgeComponents (jarPaths) {
       const metaVersion = reg.jar && reg.jar.modVersion
       if (optional) {
         diagnostics.abstains.push(`${reg.id}: optional channel with unresolved version — safely unclaimed`)
+        listenOnlyNamed.push(reg.id)
         continue
       }
       if (metaVersion) {
@@ -2226,6 +2234,7 @@ function deriveNeoForgeComponents (jarPaths) {
         versionSource = 'mods.toml'
       } else {
         diagnostics.abstains.push(`${reg.id}: required channel with no derivable version — join will be refused by the server`)
+        listenOnlyNamed.push(reg.id)
         continue
       }
     }
@@ -2246,6 +2255,7 @@ function deriveNeoForgeComponents (jarPaths) {
       const metaVersion = row.jar && row.jar.modVersion
       if (row.optional) {
         diagnostics.abstains.push(`${row.id}: aggregated optional channel with unresolved version — safely unclaimed`)
+        listenOnlyNamed.push(row.id)
         continue
       }
       if (metaVersion) {
@@ -2253,6 +2263,7 @@ function deriveNeoForgeComponents (jarPaths) {
         versionSource = 'mods.toml'
       } else {
         diagnostics.abstains.push(`${row.id}: aggregated required channel with no derivable version — join will be refused by the server`)
+        listenOnlyNamed.push(row.id)
         continue
       }
     }
@@ -2299,8 +2310,26 @@ function deriveNeoForgeComponents (jarPaths) {
     configuration: [...byProtocol.configuration.values()],
     play: [...byProtocol.play.values()]
   }
-  debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${ackContracts.length} ack contracts, ${Date.now() - started}ms)`)
-  return { components, diagnostics, ackContracts, syncContracts: annotationRun.syncContracts }
+
+  // HF15 — the LISTEN-ONLY surface (see listenOnlyDerivation.js header):
+  // named-abstain ids (tier a, collected above) + wrapper-registrar factory
+  // enumerations (tier b, the CreativeCore shape) + connector-served fabric
+  // clientbound ids (tier c). Version-free by construction; declared over
+  // minecraft:register into the server's ad-hoc send-permission tier, never
+  // claimed. Fail-open: a scan failure lands in diagnostics.errors and the
+  // derivation's components are untouched.
+  let listenOnly = []
+  try {
+    const factoryIds = deriveWrapperFactoryListenChannels(index, diagnostics)
+    const fabricIds = deriveFabricListenChannels(index, diagnostics)
+    const claimedIds = new Set(['configuration', 'play'].flatMap((p) => components[p].map((c) => c.id)))
+    listenOnly = assembleListenOnly({ named: listenOnlyNamed, factory: factoryIds, fabric: fabricIds, claimedIds, diagnostics })
+  } catch (err) {
+    diagnostics.errors.push(`listen-only derivation failed (${err.message}) — declaration rides the handler contract alone`)
+  }
+
+  debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components + ${listenOnly.length} listen-only ids from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${ackContracts.length} ack contracts, ${Date.now() - started}ms)`)
+  return { components, diagnostics, ackContracts, syncContracts: annotationRun.syncContracts, listenOnly }
 }
 
 module.exports = { deriveNeoForgeComponents, deriveAckContracts, resolveAggregatedRegistrations }

@@ -464,6 +464,14 @@ function encodeKnownDataMapsReply (maps) {
  *     // handler contract over `minecraft:register` at query time (HF6 —
  *     // populates the server's ad-hoc channel set so its send-path guard
  *     // accepts the configuration built-ins its tasks send unconditionally)
+ *   listenOnly: Array<string> | undefined, // HF15: jar-derived LISTEN-ONLY
+ *     // channel ids (listenOnlyDerivation.js — named-abstain ids, wrapper-
+ *     // factory enumerations, connector-served fabric clientbound ids, plus
+ *     // any per-host learned hints) appended to the HF6 declaration. The
+ *     // ad-hoc tier is version-free by primary source, so declaring these
+ *     // is truthful tolerance, never a claim; a server-side mod's
+ *     // unconditional send (checkPacket, the HF15 placement-abort receipt)
+ *     // becomes lawful instead of killing the placement.
  *   ackContracts: Array<{trigger: string, ack: string}> | undefined,
  *     // HF11: jar-proven blocking-task rows — on receiving `trigger` during
  *     // configuration, send `ack` with an EMPTY body (the derivation proved
@@ -475,6 +483,11 @@ function encodeKnownDataMapsReply (maps) {
 function installNeoForgeConfigNegotiation (client, options = {}) {
   const rawComponents = options.components || { configuration: [], play: [] }
   const declareListening = options.declareListening !== false
+  // HF15 — the listen-only surface: sanitized here so a malformed id can
+  // never ride a declaration frame (ids are jar-derived or hint-learned
+  // upstream; this is the wire boundary's own belt).
+  const listenOnly = (options.listenOnly || []).filter((id) =>
+    typeof id === 'string' && /^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(id))
   // HF11 — blocking-task ACK CONTRACTS, jar-derived rows {trigger, ack}:
   // a mod configuration task that sends `trigger` and parks the phase until
   // the client answers `ack` (tacz's NetworkHandler$Task — the server calls
@@ -545,6 +558,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     frozenRegistryCount: 0,
     dataMapsAnswered: false,
     declaredListening: null,
+    listenOnlyDeclared: null, // HF15: how many jar-derived listen-only ids rode the declaration
     queryAnswer: null, // HF8: {configuration, play, bytes} once answered
     setupFailed: null, // HF8: the server's per-channel failure reasons
     acked: [], // HF11: {trigger, ack} rows actually answered this phase
@@ -599,8 +613,17 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           // the declaration is version-free and names only channels this
           // responder implements.
           if (declareListening) {
-            state.declaredListening = [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS]
-            debug(`neoforge config: declaring ${state.declaredListening.length} listening channels over minecraft:register`)
+            // HF15: the HF6 handler contract keeps frame-front position
+            // (race-sensitive: CheckExtensibleEnums sends the moment
+            // negotiation completes); the jar-derived listen-only surface
+            // rides behind it, deduped. onMinecraftRegister is addAll-
+            // additive server-side, so extra frames are lawful (HF8).
+            const contract = [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS]
+            const contractSet = new Set(contract)
+            const extras = listenOnly.filter((id) => !contractSet.has(id))
+            state.declaredListening = [...contract, ...extras]
+            state.listenOnlyDeclared = extras.length
+            debug(`neoforge config: declaring ${state.declaredListening.length} listening channels over minecraft:register (${extras.length} jar-derived listen-only)`)
             // HF8 size law: register frames are additive server-side
             // (onMinecraftRegister addAll), so an oversize declaration rides
             // multiple lawful frames instead of one over-cap frame.

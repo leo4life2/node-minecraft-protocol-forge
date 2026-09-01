@@ -33,6 +33,7 @@ module.exports = {
   deriveNeoForgeComponents: require('./src/client/neoForgePayloadDerivation').deriveNeoForgeComponents,
   deriveAckContracts: require('./src/client/neoForgePayloadDerivation').deriveAckContracts,
   annotationRegistryDerivation: require('./src/client/annotationRegistryDerivation'),
+  listenOnlyDerivation: require('./src/client/listenOnlyDerivation'),
   resolveForgeRegistryName,
   resolveForgeItemName,
   resolveForgeEntityName

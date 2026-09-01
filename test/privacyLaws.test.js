@@ -27,7 +27,7 @@ const { buildClass, buildJar } = require('./helpers/synthJar')
 
 const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js',
   'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js',
-  'loginReplyBoundary.js', 'annotationRegistryDerivation.js']
+  'loginReplyBoundary.js', 'annotationRegistryDerivation.js', 'listenOnlyDerivation.js']
 const SRC = path.join(__dirname, '..', 'src', 'client')
 
 // build a synthetic mod that DOES derive, so the network-spy test exercises
@@ -304,8 +304,11 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
       // HF9 (fixed forward at HF11 landing): annotationRegistryDerivation is a
       // pure local bytecode-walk parser, same purpose-limited class — audited
       // by these laws itself via MODULES above
+      // HF15 (fixed forward at landing): listenOnlyDerivation is a pure local
+      // bytecode-walk parser (requires only ../../debug + ./jarAnalysis) —
+      // audited by these laws itself via MODULES above
       const allowed = new Set(['fs', 'path', 'zlib', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation',
-        './loginReplyBoundary', './annotationRegistryDerivation', './data/blockShapeTables.json'])
+        './loginReplyBoundary', './annotationRegistryDerivation', './listenOnlyDerivation', './data/blockShapeTables.json'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

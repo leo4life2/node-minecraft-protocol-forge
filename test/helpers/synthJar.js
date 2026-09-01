@@ -203,10 +203,14 @@ function buildClass (spec) {
     descIdx: cp.utf8(f.desc)
   }))
   // bootstrap methods must be interned before the pool is frozen; each entry
-  // becomes {ref: <handle>, args: [<same handle>]} — enough for
-  // resolveLambdaImpl, which scans args for the implementation MethodHandle.
-  const bsmHandles = (spec.bootstrapMethods || []).map((b) =>
-    cp.methodHandle(b.refKind != null ? b.refKind : 6, b.owner, b.name, b.desc))
+  // becomes {ref: <handle>, args: [<same handle>, ...strArgs]} — enough for
+  // resolveLambdaImpl (scans args for the implementation MethodHandle) AND
+  // HF15's concatRecipeOf (scans args for the String recipe constant of a
+  // makeConcatWithConstants call site — pass strArgs: ['s']).
+  const bsmHandles = (spec.bootstrapMethods || []).map((b) => ({
+    handle: cp.methodHandle(b.refKind != null ? b.refKind : 6, b.owner, b.name, b.desc),
+    strArgs: (b.strArgs || []).map((s) => cp.str(s))
+  }))
   const bsmAttrName = bsmHandles.length ? cp.utf8('BootstrapMethods') : null
   // class-level RuntimeVisibleAnnotations (JVMS 4.7.16): enum-array elements
   // only — exactly the shape the annotation-registry census reads.
@@ -290,14 +294,16 @@ function buildClass (spec) {
   }
   const classAttrs = []
   if (bsmAttrName != null) {
-    const body = Buffer.alloc(2 + bsmHandles.length * 6)
-    body.writeUInt16BE(bsmHandles.length, 0)
-    bsmHandles.forEach((h, i) => {
-      body.writeUInt16BE(h, 2 + i * 6) // bootstrap_method_ref
-      body.writeUInt16BE(1, 4 + i * 6) // num args
-      body.writeUInt16BE(h, 6 + i * 6) // arg 0: the impl handle
-    })
-    classAttrs.push({ nameIdx: bsmAttrName, body })
+    const chunks = []
+    const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16BE(v, 0); return b }
+    chunks.push(u16(bsmHandles.length))
+    for (const h of bsmHandles) {
+      chunks.push(u16(h.handle)) // bootstrap_method_ref
+      chunks.push(u16(1 + h.strArgs.length)) // num args
+      chunks.push(u16(h.handle)) // arg 0: the impl handle
+      for (const s of h.strArgs) chunks.push(u16(s)) // recipe/extra String constants
+    }
+    classAttrs.push({ nameIdx: bsmAttrName, body: Buffer.concat(chunks) })
   }
   if (annoAttrName != null) classAttrs.push({ nameIdx: annoAttrName, body: annoBody })
   const acCount = Buffer.alloc(2)
