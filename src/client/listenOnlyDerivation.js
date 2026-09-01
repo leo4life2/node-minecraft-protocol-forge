@@ -428,9 +428,33 @@ function deriveFabricListenChannels (index, diagnostics) {
 function assembleListenOnly ({ named = [], factory = [], fabric = [], claimedIds = new Set(), diagnostics }) {
   const out = []
   const seen = new Set()
+  const excludedCommon = new Set()
   for (const id of [...named, ...factory, ...fabric]) {
     if (typeof id !== 'string' || !RESOURCE_ID_RE.test(id)) continue
     if (id.startsWith('neoforge:') || id.startsWith('minecraft:')) continue
+    // HF16 (J2) — the c: COMMON-PROTOCOL namespace is loader-family-scoped
+    // (the HF8 family decision) and its ids are PROTOCOL-OPENERS, never
+    // passive listen channels. Primary source (NeoForge 21.1
+    // ConfigurationInitialization.configureModdedClient): the server queues
+    // the MANDATORY blocking CommonVersionTask + CommonRegisterTask the
+    // moment listener.hasChannel(c:version) AND hasChannel(c:register) hold
+    // — and hasChannel's third tier is the AD-HOC set populated by our own
+    // minecraft:register declaration. This surface is only ever declared by
+    // the NeoForge responder, whose connection identity lawfully withholds
+    // and refuses the c: protocol (HF8): declaring the pair summons blocking
+    // tasks we then cannot answer, parking the configuration phase until the
+    // server drops us. Rig-proven (HF16 J2: DistantHorizons' bundled
+    // fabric-networking-api jar-in-jar contributed the pair via tier (c),
+    // 20s c:version stall, "Disconnected"). Exclusion, not answering, is the
+    // fix: unclaimed, the hasChannel gate never fires on a stock server, and
+    // answering would re-enter the HF8 REPLACE-semantics trap.
+    if (id.startsWith('c:')) {
+      if (diagnostics && !excludedCommon.has(id)) {
+        excludedCommon.add(id)
+        diagnostics.abstains.push(`${id}: common-protocol opener excluded from listen-only — HF8 family law; declaring it summons CommonVersion/CommonRegister blocking tasks this connection's identity refuses to answer`)
+      }
+      continue
+    }
     if (claimedIds.has(id) || seen.has(id)) continue
     seen.add(id)
     out.push(id)

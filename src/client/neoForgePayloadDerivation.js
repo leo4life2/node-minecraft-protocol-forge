@@ -329,6 +329,26 @@ function resolveStringValue (index, val, state) {
   return null
 }
 
+// HF16 rider — the third member of the static-field resolution family
+// (String fields and Type fields already resolve through the owning class's
+// own initializers): a static ResourceLocation FIELD on another class
+// (`new Type(JadeIds.PACKET_SERVER_PING)` where JadeIds.<clinit> does
+// JADE("server_ping_v1") → fromNamespaceAndPath("jade", ...)). Pre-fix these
+// registrations abstained "unresolved payload type id" — negotiation-safe,
+// but the HF15 send guard still kills the join when such a channel carries a
+// login-time unconditional send and is neither claimed nor declared.
+function resolveReslocValue (index, val, state) {
+  if (!val) return null
+  if (val.k === 'resloc') return val.v
+  if (val.k === 'field' && val.desc === `L${RESLOC_TYPE};`) {
+    const key = `${val.owner}.${val.name}`
+    if (!(key in state.fieldValues)) resolveClassTypeFields(index, val.owner, state)
+    const resolved = state.fieldValues[key]
+    if (resolved && resolved.k === 'resloc') return resolved.v
+  }
+  return null
+}
+
 // ---------- the linear abstract interpreter ----------
 
 function simulate (index, classInfo, method, state, opts = {}) {
@@ -474,9 +494,15 @@ function handleInvoke (index, classInfo, state, opts, call) {
       recv.k = 'obj'
       recv.ctorArgs = argVals
       recv.ctorDesc = ref.desc // HF11: lets the aggregation pass bind fields on demand
-      if (recv.cls === PAYLOAD_TYPE_CLASS && argVals[0] && argVals[0].k === 'resloc') {
-        recv.k = 'type'
-        recv.v = argVals[0].v
+      if (recv.cls === PAYLOAD_TYPE_CLASS && argVals[0]) {
+        // HF16 rider: the ctor arg may be a cross-class static
+        // ResourceLocation field — resolve it through the owner's own
+        // initializer (resolveReslocValue), same law as String/Type fields.
+        const rl = argVals[0].k === 'resloc' ? argVals[0].v : resolveReslocValue(index, argVals[0], state)
+        if (rl !== null) {
+          recv.k = 'type'
+          recv.v = rl
+        }
       }
     }
     // CTOR-BODY shape (HF-R2, same silent-miss family as the HELPER shape):
@@ -500,13 +526,23 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // RegisterPayloadHandlersEvent.registrar(version)
   if (ref.name === 'registrar' && ref.desc === `(Ljava/lang/String;)L${REGISTRAR_TYPE};`) {
     const version = asStr(argVals[0]) ?? resolveStringValue(index, argVals[0], state)
-    push({ k: 'registrar', version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved' })
+    // HF16 PARAM-PROVENANCE VERSION LAW: when the version argument is an
+    // UNBOUND method parameter ({k:'param'} provenance), the true version
+    // provably lives at the CALL SITES of this method (the event-helper
+    // dispatch binds it there). Such a registration must never take the
+    // mods.toml fallback downstream — that heuristic is justified only for
+    // the registrar(modVersion) runtime idiom, and substituting the mod
+    // version for an explicit per-channel constant fails the negotiation
+    // (rig-proven: create_connected 1.3.2-mc1.21.1 vs "2.0.0").
+    const fromParam = version === null && !!argVals[0] && argVals[0].k === 'param'
+    push({ k: 'registrar', version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam })
     return
   }
   if (recv && recv.k === 'registrar') {
     if (ref.name === 'versioned') {
       const version = asStr(argVals[0]) ?? resolveStringValue(index, argVals[0], state)
-      push({ ...recv, version, versionSource: version !== null ? 'constant' : 'unresolved' })
+      const fromParam = version === null && !!argVals[0] && argVals[0].k === 'param'
+      push({ ...recv, version, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam })
       return
     }
     if (ref.name === 'optional') { push({ ...recv, optional: true }); return }
@@ -572,6 +608,23 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // once per CALL SITE, because each call carries a different payload TYPE.
   if (argVals.some((a) => a && a.k === 'registrar')) {
     dispatchRegistrarHelper(index, ref, call.kind, recv, argVals, state, opts)
+    if (!retVoid) push(UNKNOWN)
+    return
+  }
+
+  // EVENT-HELPER shape (HF16, the sixth registration shape): the EVENT rides
+  // as an argument into a helper whose body calls event.registrar(...) —
+  // with the version as an EXPLICIT CONSTANT AT THE CALL SITE
+  // (create_connected 1.3.2: CCommon.register does
+  // registerAsSyncRoot(event, "2.0.0"), the body living in superclass
+  // SyncConfigBase). Dispatch into the callee with ALL call-site argument
+  // values bound as locals so the constant reaches the registrar() the body
+  // performs. Without this, the callee is only ever simulated as a bare
+  // phantom entry (its version parameter unresolved) and the mods.toml
+  // fallback silently claims the MOD version as the CHANNEL version — the
+  // server refuses the join ("Incompatible client").
+  if (argSlots(ref.desc).some((t) => t === `L${EVENT_TYPE};`)) {
+    dispatchEventHelper(index, ref, call.kind, recv, argVals, state, opts)
     if (!retVoid) push(UNKNOWN)
     return
   }
@@ -715,6 +768,58 @@ function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
     // onReturn stripped for the same reason as the helper dispatch: a ctor
     // body's stray areturn must never leak into a TYPE-factory resolution.
     simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
+  } finally {
+    state.helperStack.delete(key)
+  }
+}
+
+// EVENT-HELPER shape dispatch (HF16): simulate a method that receives the
+// RegisterPayloadHandlersEvent as an ARGUMENT, binding every call-site value
+// (version constants included) as its locals. Resolution is
+// invokevirtual-faithful: the ref owner may be a SUBCLASS of the class that
+// declares the body (create_connected: the invokevirtual ref names CCommon
+// while registerAsSyncRoot lives in SyncConfigBase), so the lookup walks the
+// owner's superclass chain (findVirtualMethod — bounded, in-index only);
+// instance calls additionally fan out to scanned subclass OVERRIDES with the
+// same >12 loud-abstain bound the wrapper dispatch uses. Shares the
+// registrar-helper cycle guard + global frame budget.
+function dispatchEventHelper (index, ref, kind, recv, argVals, state, opts) {
+  state.helperStack = state.helperStack || new Set()
+  state.helperFrames = state.helperFrames || 0
+  const key = `${ref.owner}.${ref.name}${ref.desc}`
+  if (state.helperStack.has(key)) return // recursive helper: cycle guard
+  if (++state.helperFrames > HELPER_FRAME_BUDGET) {
+    if (!state.helperBudgetBlown) {
+      state.helperBudgetBlown = true
+      state.diagnostics.abstains.push(`registration dispatch budget exhausted at ${key} — remaining registrations abstained`)
+    }
+    return
+  }
+  const targets = [] // {info, m}
+  const resolved = findVirtualMethod(index, ref.owner, ref.name, ref.desc)
+  if (resolved) targets.push(resolved)
+  if (kind === 'instance') {
+    for (const name of state.allClassNames) {
+      if (name === ref.owner) continue
+      if (isSubclassOf(index, name, ref.owner)) {
+        const info = index.get(name)
+        const m = info && info.codes.find((c) => c.method === ref.name && c.desc === ref.desc && c.code && c.code.length > 0)
+        if (m) targets.push({ info, m })
+      }
+    }
+    if (targets.length > 12) {
+      state.diagnostics.abstains.push(`${key}: ${targets.length} overrides carrying the payload-handlers event — too many, abstaining`)
+      return
+    }
+  }
+  if (targets.length === 0) return
+  state.helperStack.add(key)
+  try {
+    for (const t of targets) {
+      const locals = kind === 'static' ? seedArgLocals(ref.desc, argVals) : seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
+      // onReturn stripped: same leak law as the registrar-helper dispatch.
+      simulate(index, t.info, t.m, state, { ...opts, locals, onReturn: undefined })
+    }
   } finally {
     state.helperStack.delete(key)
   }
@@ -2005,6 +2110,7 @@ function resolveAggregatedRegistrations (index, state, pending) {
             id: r.id,
             version: r.registrar ? r.registrar.version : null,
             versionSource: 'aggregated',
+            versionFromParam: r.registrar ? !!r.registrar.versionFromParam : false,
             optional: r.registrar ? r.registrar.optional : false,
             flow: spec.flow,
             protocols: spec.protocols,
@@ -2195,12 +2301,36 @@ function deriveNeoForgeComponents (jarPaths) {
 
   // assemble, applying the version rules
   const byProtocol = { configuration: new Map(), play: new Map() }
+  // HF16 ASSEMBLE CONFLICT GUARD: version sources that are BYTECODE-PROVEN
+  // (a compile-time constant read at/through the registration site) outrank
+  // the mods.toml fallback heuristic. A constant-proven tuple REPLACES a
+  // fallback-sourced one for the same channel; two DISAGREEING constant
+  // proofs drop the channel loudly (mirror of the aggregator conflict law —
+  // a wrong tuple claim fails the negotiation with a worse diagnostic than
+  // an honest miss).
+  const CONSTANT_VERSION_SOURCES = new Set(['constant', 'enum-registry', 'annotation-registry'])
+  const droppedConflicts = new Set()
   const add = (id, version, flow, optional, protocols, source, versionSource) => {
     for (const proto of protocols) {
       if (!byProtocol[proto]) continue
-      if (!byProtocol[proto].has(id)) {
+      if (droppedConflicts.has(`${proto}:${id}`)) continue
+      const prev = byProtocol[proto].get(id)
+      if (!prev) {
         byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource })
+        continue
       }
+      const prevConst = CONSTANT_VERSION_SOURCES.has(prev.versionSource)
+      const newConst = CONSTANT_VERSION_SOURCES.has(versionSource)
+      if (newConst && !prevConst) {
+        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource })
+        continue
+      }
+      if (newConst && prevConst && (prev.version !== version || prev.flow !== flow || prev.optional !== optional)) {
+        byProtocol[proto].delete(id)
+        droppedConflicts.add(`${proto}:${id}`)
+        diagnostics.abstains.push(`${id}: constant-proven registrations disagree on version/flow/optionality — unclaimed (a wrong tuple would fail the negotiation)`)
+      }
+      // otherwise the standing claim holds (identical or equally-provenanced)
     }
   }
   const pendingAgg = []
@@ -2226,6 +2356,17 @@ function deriveNeoForgeComponents (jarPaths) {
       const metaVersion = reg.jar && reg.jar.modVersion
       if (optional) {
         diagnostics.abstains.push(`${reg.id}: optional channel with unresolved version — safely unclaimed`)
+        listenOnlyNamed.push(reg.id)
+        continue
+      }
+      // HF16 PARAM-PROVENANCE VERSION LAW: the version rode an unbound
+      // method parameter — the truth provably lives at the method's call
+      // sites (the event-helper dispatch claims it there when a constant is
+      // bound). The mods.toml fallback is FORBIDDEN for such rows: it is a
+      // heuristic for the registrar(modVersion) runtime idiom only, and
+      // substituting the mod version here claims a wrong tuple.
+      if (reg.registrar && reg.registrar.versionFromParam) {
+        diagnostics.abstains.push(`${reg.id}: version rides a caller parameter — claimed only where a call site binds a constant; mods.toml fallback forbidden (riding listen-only)`)
         listenOnlyNamed.push(reg.id)
         continue
       }
@@ -2255,6 +2396,12 @@ function deriveNeoForgeComponents (jarPaths) {
       const metaVersion = row.jar && row.jar.modVersion
       if (row.optional) {
         diagnostics.abstains.push(`${row.id}: aggregated optional channel with unresolved version — safely unclaimed`)
+        listenOnlyNamed.push(row.id)
+        continue
+      }
+      // HF16 PARAM-PROVENANCE VERSION LAW (same rule as the direct rows).
+      if (row.versionFromParam) {
+        diagnostics.abstains.push(`${row.id}: aggregated version rides a caller parameter — claimed only where a call site binds a constant; mods.toml fallback forbidden (riding listen-only)`)
         listenOnlyNamed.push(row.id)
         continue
       }

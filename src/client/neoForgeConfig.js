@@ -591,6 +591,69 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     })
   }
 
+  // HF16 (D2, clock-blindness) — SPEAK THE TIME PROTOCOL WE SUMMON.
+  // NeoForge 21.1's patched MinecraftServer.synchronizeTime (javap over the
+  // rig's own neoforge-21.1.249-server.jar) builds BOTH time packets every
+  // 20 ticks and picks per player:
+  //   hasChannel(neoforge:custom_time_packet) ? send ClientboundCustomSetTime
+  //                                           : send vanilla set_time
+  // Our HF6/HF15 `minecraft:register` declaration puts that channel in the
+  // connection's AD-HOC set, so the server sends time EXCLUSIVELY as the
+  // custom payload — and a client that declares-but-ignores it is clock-blind
+  // forever (rig-proven: 89 custom_time_packet payloads and ZERO update_time
+  // in 90s on a BARE 21.1.249 server). Same law as the J2 c:-opener fix:
+  // a declaration is a claim to speak the protocol. The reference NeoForge
+  // client parses this payload and applies it as time truth — so do we,
+  // translating it to the vanilla update_time shape mineflayer already
+  // ingests (including vanilla's negative-dayTime encoding of a false
+  // doDaylightCycle — ClientboundSetTimePacket ctor (JJZ) semantics).
+  // Wire format (ClientboundCustomSetTimePayload STREAM_CODEC, javap):
+  //   VAR_LONG gameTime, VAR_LONG dayTime, BOOL gameRule,
+  //   FLOAT dayTimeFraction, FLOAT dayTimePerTick (extras informational).
+  client.on('packet', (packet, meta) => {
+    if (meta.state !== 'play' || meta.name !== 'custom_payload') return
+    if (!packet || packet.channel !== 'neoforge:custom_time_packet') return
+    try {
+      const data = packet.data || Buffer.alloc(0)
+      let off = 0
+      const readVarLong = () => {
+        let result = 0n
+        let shift = 0n
+        for (;;) {
+          const b = data[off++]
+          if (b === undefined) throw new Error('varlong past end')
+          result |= BigInt(b & 0x7f) << shift
+          if ((b & 0x80) === 0) break
+          shift += 7n
+          if (shift > 70n) throw new Error('varlong too long')
+        }
+        return BigInt.asIntN(64, result)
+      }
+      const gameTime = readVarLong()
+      const dayTime = readVarLong()
+      const gameRule = data[off] !== 0
+      // vanilla encoding: daylight-cycle OFF rides as negated dayTime (-1 for 0)
+      let encodedDayTime = dayTime
+      if (!gameRule) encodedDayTime = dayTime === 0n ? -1n : -dayTime
+      const pair = (v) => {
+        const x = BigInt.asUintN(64, v)
+        return [Number(BigInt.asIntN(32, x >> 32n)), Number(x & 0xffffffffn)]
+      }
+      if (!state.customTimeTranslated) {
+        state.customTimeTranslated = 0
+        debug('neoforge play: translating neoforge:custom_time_packet -> vanilla update_time semantics (NeoForge sends time only as this payload once the channel is declared)')
+      }
+      state.customTimeTranslated++
+      client.emit('update_time', { age: pair(gameTime), time: pair(encodedDayTime) }, { name: 'update_time', state: 'play' })
+    } catch (err) {
+      // never throw on the packet path; one loud line, then quiet
+      if (!state.customTimeParseFailed) {
+        state.customTimeParseFailed = true
+        debug(`neoforge play: custom_time_packet translation failed (${err.message}) — time stays vanilla-absent`)
+      }
+    }
+  })
+
   client.on('packet', (packet, meta) => {
     if (meta.state !== 'configuration' || meta.name !== 'custom_payload') return
     const channel = packet.channel
