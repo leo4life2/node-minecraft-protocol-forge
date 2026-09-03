@@ -46,13 +46,38 @@
 //       The clientbound Type ids are string constants of the jar (directly,
 //       or through a one-string helper like `asId` whose concat recipe is a
 //       constant) — derive them for the same listen-only tier.
+//   (d) HF15-R — the CONTAINER-CARRIED TYPE (map-transfer registrar) shape,
+//       pinned from a jar-in-jar networking library's bytecode (javap,
+//       2026-09-03): the registrar site never names a payload id at all —
+//       it iterates a COLLECTION of container records
+//       (`PACKET_MAP.forEach((cls, container) -> event.registrar(container
+//       .getType().id().getNamespace()).optional().playBidirectional(
+//       container.getType(), …))`) and reads the Type OFF THE CONTAINER
+//       through an accessor. The containers are constructed elsewhere
+//       (`new Container(Type|ResourceLocation, …)`) by a library entry point
+//       whose Type argument is a METHOD PARAMETER, and the constants only
+//       appear several calls up, in the mod's own init
+//       (`Network.registerPacket(Packet.type(), …)`). The contents cross a
+//       STATIC queue map + `putAll` into the registrar's own map, so HF11's
+//       instance-identity focus pass sees 0 populated entries and the
+//       event-bus lambda has no resolvable call site — both registrations
+//       abstain "unresolved payload type id" (silent for the listen-only
+//       surface). Tier (d) resolves the ids by PARAMETER PROVENANCE: from
+//       every construction site of the container class, the Type/
+//       ResourceLocation argument is traced up the caller graph (bounded
+//       depth, interface-declared aliases included — over-inclusion is
+//       truthful listen-tolerance) until it lands on a constant (a Type
+//       field, a `type()` factory over a static ResourceLocation, a
+//       two-string ResourceLocation factory). No mod names, no map
+//       semantics assumed: ANY container-carried Type registered through a
+//       collection lands here.
 //
 // PRIVACY LAWS (same as the rest of this lib): LOCAL-ONLY, READ-ONLY,
 // PURPOSE-LIMITED. Requires only the shared jar/class primitives. Nothing is
 // classloaded or executed; no network; no writes.
 
 const debug = require('../../debug')
-const { decodeInstructions, cpUtf8 } = require('./jarAnalysis')
+const { decodeInstructions, cpUtf8, resolveLambdaImpl } = require('./jarAnalysis')
 
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
 const PAYLOAD_TYPE_CLASSES = new Set([
@@ -415,6 +440,250 @@ function deriveFabricListenChannels (index, diagnostics) {
   return [...ids]
 }
 
+// ---------- tier (d): the container-carried Type (HF15-R) ----------
+
+// PayloadRegistrar registration methods that let the SERVER send on the
+// channel (clientbound or bidirectional) — the flows the send guard kills
+// when undeclared. Serverbound-only registrations never need listening.
+const CLIENTBOUND_CAPABLE_REGISTRATIONS = new Set([
+  'playToClient', 'playBidirectional',
+  'configurationToClient', 'configurationBidirectional',
+  'commonToClient', 'commonBidirectional'
+])
+const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
+const MOJMAP_PAYLOAD_TYPE = 'net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type'
+const MOJMAP_RESLOC = 'net/minecraft/resources/ResourceLocation'
+// Bounds — the LAW that keeps the provenance walk honest and finite.
+const CONTAINER_MAX_CLASSES = 12
+const CONTAINER_WALK_MAX_DEPTH = 8
+const CONTAINER_WALK_MAX_SITES = 96
+const CONTAINER_WALK_MAX_TARGETS = 256
+
+function simpleName (cls) { return cls.split('/').pop() }
+
+// In-index ancestors (superclasses + interfaces, transitively, bounded).
+function ancestorsOf (index, cls) {
+  const out = new Set()
+  const stack = [cls]
+  while (stack.length && out.size < 64) {
+    const cur = stack.pop()
+    const info = index.get(cur)
+    if (!info) continue
+    for (const s of [info.superName, ...(info.interfaces || [])]) {
+      if (s && !out.has(s) && s !== 'java/lang/Object') {
+        out.add(s)
+        stack.push(s)
+      }
+    }
+  }
+  return out
+}
+
+// Owners an invocation of `target` may be written against: the class itself
+// plus every in-index ancestor DECLARING the same name+descriptor (interface
+// or abstract). Deliberately over-inclusive versus the aggregator's
+// unique-implementer rule: a listen-only id is a tolerance statement, so a
+// sibling implementer's ids riding along is truthful (they are ids of the
+// pack), whereas a versioned CLAIM could not afford that.
+function invocationOwnersOf (index, target) {
+  const owners = new Set([target.cls])
+  if (target.name === '<init>') return owners
+  for (const anc of ancestorsOf(index, target.cls)) {
+    const info = index.get(anc)
+    if (!info) continue
+    const declares = (info.methods || []).some((c) => c.name === target.name && c.desc === target.desc) ||
+      info.codes.some((c) => c.method === target.name && c.desc === target.desc)
+    if (declares) owners.add(anc)
+  }
+  return owners
+}
+
+// Every (class, method) in the pack whose bytecode invokes `target`
+// (direct invoke on an accepted owner, or an invokedynamic whose bootstrap
+// implementation handle is the target — a `Owner::method` reference).
+function findInclusiveSites (index, target, owners, cache) {
+  const key = `${target.cls}.${target.name}${target.desc}`
+  if (cache.has(key)) return cache.get(key)
+  const sites = []
+  cache.set(key, sites)
+  const needles = [...owners].map((o) => Buffer.from(simpleName(o), 'utf8'))
+  for (const cls of [...index.raw.keys()]) {
+    let bytes
+    try { bytes = index.rawBytes(cls) } catch { continue }
+    if (!bytes || !needles.some((n) => bytes.includes(n))) continue
+    const info = index.get(cls)
+    if (!info) continue
+    for (const m of info.codes) {
+      if (cls === target.cls && m.method === target.name && m.desc === target.desc) continue
+      let rows
+      try { rows = decodeInstructions(m.code, info.cp) } catch { continue }
+      const hit = rows.some((r) => {
+        if ((r.op === 0xb6 || r.op === 0xb7 || r.op === 0xb8 || r.op === 0xb9) && r.ref) {
+          return r.ref.name === target.name && r.ref.desc === target.desc && owners.has(r.ref.owner)
+        }
+        if (r.op === 0xba && r.bsmIndex !== undefined && info.bootstrapMethods) {
+          const impl = resolveLambdaImpl(info, r.bsmIndex)
+          return !!impl && impl.name === target.name && impl.desc === target.desc && owners.has(impl.owner)
+        }
+        return false
+      })
+      if (hit) sites.push({ info, m })
+      if (sites.length >= CONTAINER_WALK_MAX_SITES) { sites.truncated = true; return sites }
+    }
+  }
+  return sites
+}
+
+// Per-arg (not per-slot) parameter types of a descriptor.
+function argTypesOf (desc) {
+  const out = []
+  let i = desc.indexOf('(') + 1
+  while (i < desc.length && desc[i] !== ')') {
+    let j = i
+    while (desc[j] === '[') j++
+    if (desc[j] === 'L') { const e = desc.indexOf(';', j); out.push(desc.slice(i, e + 1)); i = e + 1 } else { out.push(desc.slice(i, j + 1)); i = j + 1 }
+  }
+  return out
+}
+
+// Resolve an abstract argument value to a payload id, or return the
+// parameter index it rode in on ({param: i}) so the walk can climb, or null.
+function idOrParamOf (ev, v) {
+  if (!v) return null
+  if (v.k === 'type') return { id: v.v }
+  if (v.k === 'resloc') return { id: v.v }
+  if (v.k === 'param') return { param: v.i }
+  if (v.k === 'field') {
+    const id = ev.resolveTypeValue(v) ?? ev.resolveReslocValue(v)
+    return id ? { id } : null
+  }
+  if (v.k === 'obj' && v.cls === MOJMAP_PAYLOAD_TYPE && v.ctorArgs && v.ctorArgs[0]) {
+    // `new Type(<unresolved>)` built at this frame from a parameter: climb
+    // through the ResourceLocation argument instead.
+    return idOrParamOf(ev, v.ctorArgs[0])
+  }
+  return null
+}
+
+/**
+ * Tier (d). `ev` is the aggregator module's evaluator surface (injected —
+ * the interpreter lives in neoForgePayloadDerivation.js and requires this
+ * module): { evaluateMethod(info, m, opts, hooks), seedProvenanceLocals,
+ * resolveTypeValue(val), resolveReslocValue(val), budgetBlown() }.
+ */
+function deriveContainerCarriedListenChannels (index, diagnostics, ev) {
+  const ids = new Set()
+  if (!ev || typeof ev.evaluateMethod !== 'function') return []
+  // 1. registration sites that read the Type OFF A CONTAINER accessor
+  const containers = new Map() // K -> Set(registration methods seen)
+  for (const name of [...index.raw.keys()]) {
+    let bytes
+    try { bytes = index.rawBytes(name) } catch { continue }
+    if (!bytes || !bytes.includes(REGISTRAR_TYPE)) continue
+    const info = index.get(name)
+    if (!info) continue
+    for (const m of info.codes) {
+      let rows
+      try { rows = decodeInstructions(m.code, info.cp) } catch { continue }
+      const regs = rows.filter((r) => (r.op === 0xb6 || r.op === 0xb9) && r.ref && r.ref.owner === REGISTRAR_TYPE && CLIENTBOUND_CAPABLE_REGISTRATIONS.has(r.ref.name))
+      if (regs.length === 0) continue
+      for (const r of rows) {
+        if ((r.op !== 0xb6 && r.op !== 0xb9) || !r.ref) continue
+        if (r.ref.desc !== `()L${MOJMAP_PAYLOAD_TYPE};`) continue
+        const owner = r.ref.owner
+        if (owner === REGISTRAR_TYPE || owner === EVENT_TYPE || !index.raw.has(owner)) continue
+        if (!containers.has(owner)) containers.set(owner, new Set())
+        for (const g of regs) containers.get(owner).add(g.ref.name)
+      }
+    }
+    if (containers.size >= CONTAINER_MAX_CLASSES) break
+  }
+  if (containers.size === 0) return []
+
+  // 2./3. construction census + parameter-provenance walk
+  const siteCache = new Map()
+  const visited = new Set()
+  let targets = 0
+  let misses = 0
+  let partial = false
+  let current = null // the container whose construction census is walking
+  const perContainer = new Map()
+  const missesPer = new Map()
+  const walk = (target, argIndex, depth) => {
+    const key = `${target.cls}.${target.name}${target.desc}#${argIndex}`
+    if (visited.has(key)) return
+    visited.add(key)
+    if (depth > CONTAINER_WALK_MAX_DEPTH || ++targets > CONTAINER_WALK_MAX_TARGETS) { partial = true; return }
+    const owners = invocationOwnersOf(index, target)
+    const sites = findInclusiveSites(index, target, owners, siteCache)
+    if (sites.truncated) partial = true
+    for (const { info, m } of sites) {
+      if (ev.budgetBlown()) { partial = true; return }
+      const climbs = new Set()
+      const hooks = {
+        onCall: (ref, kind, recv, argVals) => {
+          if (ref.name !== target.name || ref.desc !== target.desc || !owners.has(ref.owner)) return
+          const r = idOrParamOf(ev, argVals[argIndex])
+          debug(`listen-only container walk ${target.cls.split('/').pop()}.${target.name}#${argIndex} @ ${info.className}.${m.method}: arg=${argVals[argIndex] && argVals[argIndex].k} -> ${JSON.stringify(r)}`)
+          if (r && r.id !== undefined) { if (RESOURCE_ID_RE.test(r.id)) { ids.add(r.id); perContainer.get(current).add(r.id) } } else if (r && r.param !== undefined) climbs.add(r.param)
+          else { misses++; missesPer.set(current, (missesPer.get(current) || 0) + 1) }
+        },
+        onIndy: (impl, captured) => {
+          // a method reference to the target: captured values bind its
+          // leading parameters; a captured constant at argIndex resolves,
+          // anything later is a runtime argument (miss)
+          if (impl.name !== target.name || impl.desc !== target.desc || !owners.has(impl.owner)) return
+          const r = idOrParamOf(ev, captured[argIndex])
+          if (r && r.id !== undefined) { if (RESOURCE_ID_RE.test(r.id)) { ids.add(r.id); perContainer.get(current).add(r.id) } } else if (r && r.param !== undefined) climbs.add(r.param)
+          else { misses++; missesPer.set(current, (missesPer.get(current) || 0) + 1) }
+        }
+      }
+      const locals = ev.seedProvenanceLocals(m.desc, (m.flags & 0x0008) !== 0, info.className)
+      try {
+        ev.evaluateMethod(info, m, { locals, recordPutstatic: false }, hooks)
+      } catch (err) {
+        diagnostics.errors.push(`listen-only container walk failed at ${info.className}.${m.method}: ${err.message}`)
+        continue
+      }
+      for (const p of climbs) walk({ cls: info.className, name: m.method, desc: m.desc }, p, depth + 1)
+    }
+  }
+  for (const [K] of containers) {
+    const info = index.get(K)
+    if (!info) continue
+    current = K
+    perContainer.set(K, new Set())
+    for (const m of info.codes) {
+      if (m.method !== '<init>') continue
+      const types = argTypesOf(m.desc)
+      const i = types.findIndex((t) => t === `L${MOJMAP_PAYLOAD_TYPE};` || t === `L${MOJMAP_RESLOC};`)
+      if (i < 0) continue
+      walk({ cls: K, name: '<init>', desc: m.desc }, i, 0)
+    }
+  }
+  const out = [...ids].sort()
+  diagnostics.listenOnlyNotes = diagnostics.listenOnlyNotes || []
+  for (const [K, regs] of containers) {
+    const n = perContainer.has(K) ? perContainer.get(K).size : 0
+    const miss = missesPer.get(K) || 0
+    diagnostics.listenOnlyNotes.push(`container-carried Type ${K} (${[...regs].sort().join('/')}): ${n} id(s) resolved by parameter provenance${miss ? `, ${miss} construction argument(s) unresolved` : ''}${partial ? ' (walk bounded — remainder unresolved)' : ''}`)
+    // Honest and scoped, as a NOTE rather than an abstain: an opaque
+    // construction argument (a runtime-computed id, a map lookup on the
+    // send path — the enum-registry and grafted-stub packs construct their
+    // containers from values the aggregator already CLAIMED through their
+    // own proofs) leaves only a channel reachable through it undeclared.
+    // The aggregator's own abstains already name every unclaimed
+    // registration site; a second abstain per container would double-count
+    // negotiation risk on every Create/GlitchCore pack for a tolerance
+    // surface. Blowing the walk's bounds IS a real loss and stays loud.
+  }
+  if (partial) {
+    diagnostics.abstains.push(`container-carried Type walk hit its bounds (${[...containers.keys()].join(', ')}) — remainder undeclared (loud)`)
+  }
+  debug(`listen-only container-carried Type: containers=[${[...containers.keys()].join(',')}] ids=${out.length} misses=${misses} partial=${partial}`)
+  return out
+}
+
 // ---------- assembly ----------
 
 /**
@@ -425,11 +694,11 @@ function deriveFabricListenChannels (index, diagnostics) {
  * minecraft:* (namespace-exempt in checkPacket). Deduped, deterministic
  * order, capped.
  */
-function assembleListenOnly ({ named = [], factory = [], fabric = [], claimedIds = new Set(), diagnostics }) {
+function assembleListenOnly ({ named = [], factory = [], fabric = [], container = [], claimedIds = new Set(), diagnostics }) {
   const out = []
   const seen = new Set()
   const excludedCommon = new Set()
-  for (const id of [...named, ...factory, ...fabric]) {
+  for (const id of [...named, ...factory, ...fabric, ...container]) {
     if (typeof id !== 'string' || !RESOURCE_ID_RE.test(id)) continue
     if (id.startsWith('neoforge:') || id.startsWith('minecraft:')) continue
     // HF16 (J2) — the c: COMMON-PROTOCOL namespace is loader-family-scoped
@@ -469,6 +738,7 @@ function assembleListenOnly ({ named = [], factory = [], fabric = [], claimedIds
 module.exports = {
   deriveWrapperFactoryListenChannels,
   deriveFabricListenChannels,
+  deriveContainerCarriedListenChannels,
   assembleListenOnly,
   concatRecipeOf,
   FACTORY_ENUM_CAP,

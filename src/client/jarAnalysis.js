@@ -107,7 +107,13 @@ function parseClassFile (b) {
   }
   const fields = readMembers().map((f) => ({ name: f.name, desc: f.desc, flags: f.flags }))
   const codes = []
+  // HF15-R: the full method table (name/desc/flags — ABSTRACT and interface
+  // members included, which carry no Code attribute and so never appear in
+  // `codes`). The container-carried-Type walk needs it to accept invocations
+  // written against an interface/abstract ancestor DECLARING the target.
+  const methods = []
   for (const m of readMembers()) {
+    methods.push({ name: m.name, desc: m.desc, flags: m.flags })
     const code = m.attrs.find((a) => a.name === 'Code')
     if (!code) continue
     const codeLen = b.readUInt32BE(code.start + 4)
@@ -145,7 +151,7 @@ function parseClassFile (b) {
       o += 6 + len
     }
   }
-  return { className, superName, interfaces, cp, codes, fields, bootstrapMethods, annotations }
+  return { className, superName, interfaces, cp, codes, methods, fields, bootstrapMethods, annotations }
 }
 
 // --- RuntimeVisibleAnnotations reader (JVMS 4.7.16) ------------------------

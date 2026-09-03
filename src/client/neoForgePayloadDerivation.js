@@ -75,7 +75,7 @@ const path = require('path')
 const debug = require('../../debug')
 const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
 const { deriveAnnotationRegistries } = require('./annotationRegistryDerivation')
-const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, assembleListenOnly } = require('./listenOnlyDerivation')
+const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveContainerCarriedListenChannels, assembleListenOnly } = require('./listenOnlyDerivation')
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
@@ -2469,8 +2469,21 @@ function deriveNeoForgeComponents (jarPaths) {
   try {
     const factoryIds = deriveWrapperFactoryListenChannels(index, diagnostics)
     const fabricIds = deriveFabricListenChannels(index, diagnostics)
+    // HF15-R tier (d): the container-carried Type shape (a registrar site
+    // reading payload Types off container records it iterates; the ids live
+    // at the containers' construction sites, several parameter hops up the
+    // caller graph). The walk rides THIS module's evaluator (injected — the
+    // interpreter cannot be required from the listen-only module), with the
+    // shared step budget as its ceiling.
+    const containerIds = deriveContainerCarriedListenChannels(index, diagnostics, {
+      evaluateMethod: (info, m, opts, hooks) => evaluateMethod(index, info, m, state, opts, hooks),
+      seedProvenanceLocals,
+      resolveTypeValue: (v) => resolveTypeValue(index, v, state),
+      resolveReslocValue: (v) => resolveReslocValue(index, v, state),
+      budgetBlown: () => !!state.aggBudgetBlown
+    })
     const claimedIds = new Set(['configuration', 'play'].flatMap((p) => components[p].map((c) => c.id)))
-    listenOnly = assembleListenOnly({ named: listenOnlyNamed, factory: factoryIds, fabric: fabricIds, claimedIds, diagnostics })
+    listenOnly = assembleListenOnly({ named: listenOnlyNamed, factory: factoryIds, fabric: fabricIds, container: containerIds, claimedIds, diagnostics })
   } catch (err) {
     diagnostics.errors.push(`listen-only derivation failed (${err.message}) — declaration rides the handler contract alone`)
   }
