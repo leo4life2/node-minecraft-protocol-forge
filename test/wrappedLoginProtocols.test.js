@@ -312,3 +312,65 @@ describe('HF23 announced-mod acquisition rung', function () {
     assert.ok(client.minepalAnnouncedModAcquisitionBackground.promise instanceof Promise)
   })
 })
+
+// HF23-R1 — the hidden-ping wire (receipt 7b63c3ed: a front/proxy strips
+// forgeData from the status ping, so no announced versions exist before the
+// connection). Forge's own S2CModData (fml:handshake disc 5, registered before
+// S2CModList) carries modid -> version on the login wire; the responder reads
+// it (never replies — the reference client stores it and sends nothing) and
+// the HF13/HF23 attribution learns the announced version from it, so the
+// acquisition rung fires exactly as it does on a ping that carried the list.
+describe('HF23-R1 S2CModData as the announced-version source on hidden-ping wires', function () {
+  const { parseModData, announcedChannelAttribution } = forgeHandshake3
+  function modData (entries) {
+    return Buffer.concat([writeVarInt(entries.length)].concat(entries.flatMap(([id, name, version]) => [writeString(id), writeString(name), writeString(version)])))
+  }
+  it('parseModData reads the FriendlyByteBuf map (modid -> displayName, version) byte-exactly', function () {
+    const parsed = parseModData(modData([['tacz', 'TACZ', '1.1.8-hotfix'], ['uteamcore', 'U Team Core', '5.1.4.382']]), 0)
+    assert.deepStrictEqual(parsed, { count: 2, mods: { tacz: { displayName: 'TACZ', version: '1.1.8-hotfix' }, uteamcore: { displayName: 'U Team Core', version: '5.1.4.382' } } })
+    assert.throws(() => parseModData(modData([['x', 'X', '1']]).subarray(0, 4), 0), /buffer ended/)
+  })
+  it('disc 5 on fml:handshake is READ (client.forgeModData + forgeModData event) and still gets NO reply, matching the reference client', async function () {
+    const client = makeClient()
+    const events = []
+    client.on('forgeModData', (d) => events.push(d))
+    forgeHandshake3(client, {})
+    client.emit('login_plugin_request', { messageId: 7, channel: 'fml:loginwrapper', data: wrap('fml:handshake', Buffer.concat([writeVarInt(5), modData([['tacz', 'TACZ', '1.1.8-hotfix']])])) })
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 0, 'the reference client sends nothing back for S2CModData')
+    assert.deepStrictEqual(client.forgeModData.mods.tacz, { displayName: 'TACZ', version: '1.1.8-hotfix' })
+    assert.strictEqual(events.length, 1)
+    // a truncated body is tolerated: still no reply, nothing stamped
+    const bad = makeClient()
+    forgeHandshake3(bad, {})
+    bad.emit('login_plugin_request', { messageId: 8, channel: 'fml:loginwrapper', data: wrap('fml:handshake', Buffer.concat([writeVarInt(5), Buffer.from([0x02, 0x01, 0x61])])) })
+    await drainDeferredReplies()
+    assert.strictEqual(bad.written.length, 0)
+    assert.strictEqual(bad.forgeModData, undefined)
+  })
+  it('attribution: with NO ping versions, the announced owner version comes from S2CModData; the ping keeps precedence when both exist; ModList ids alone stay version-less', function () {
+    const hidden = makeClient()
+    hidden.forgeModList = { mods: ['tacz'], channels: [{ name: 'tacz:handshake', marker: '1' }], registries: [] }
+    hidden.forgeModData = { count: 1, mods: { tacz: { displayName: 'TACZ', version: '1.1.8-hotfix' } } }
+    assert.deepStrictEqual(announcedChannelAttribution(hidden, {}, 'tacz:handshake'), { channel: 'tacz:handshake', announcedChannel: true, ownerMod: 'tacz', ownerVersion: '1.1.8-hotfix' })
+    const both = makeClient()
+    both.forgeModList = hidden.forgeModList
+    both.forgeModData = { count: 1, mods: { tacz: { displayName: 'TACZ', version: '9.9.9' } } }
+    assert.strictEqual(announcedChannelAttribution(both, { pingModVersions: { tacz: '1.1.7' } }, 'tacz:handshake').ownerVersion, '1.1.7')
+    const listOnly = makeClient()
+    listOnly.forgeModList = hidden.forgeModList
+    assert.strictEqual(announcedChannelAttribution(listOnly, {}, 'tacz:handshake').ownerVersion, null)
+  })
+  it('the ModList forgeMods event carries ModData versions when the ping had none', async function () {
+    const client = makeClient()
+    const seen = []
+    client.on('forgeMods', (m) => seen.push(m))
+    forgeHandshake3(client, {})
+    client.emit('login_plugin_request', { messageId: 1, channel: 'fml:loginwrapper', data: wrap('fml:handshake', Buffer.concat([writeVarInt(5), modData([['tacz', 'TACZ', '1.1.8-hotfix']])])) })
+    const modList = Buffer.concat([writeVarInt(1), writeString('tacz'), writeVarInt(0), writeVarInt(0), writeVarInt(0)])
+    client.emit('login_plugin_request', { messageId: 2, channel: 'fml:loginwrapper', data: wrap('fml:handshake', Buffer.concat([writeVarInt(1), modList])) })
+    await drainDeferredReplies()
+    assert.deepStrictEqual(seen, [[{ modid: 'tacz', version: '1.1.8-hotfix' }]])
+    assert.strictEqual(client.written.length, 1, 'exactly the ModListReply was written')
+  })
+})

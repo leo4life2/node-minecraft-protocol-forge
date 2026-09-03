@@ -142,6 +142,34 @@ function parseModList (buffer, offset) {
   return { mods, channels, registries, dataPackRegistries }
 }
 
+// S2CModData (disc 5, Forge 1.19.x+; HandshakeMessages.S2CModData.encode on
+// the 1.20.1-47.2.0 branch, CFR-read 2026-09-03): a FriendlyByteBuf map of
+// modId (utf ≤256) -> (displayName utf ≤256, version utf ≤256), built from
+// ModList.get().getMods() with IModInfo::getVersion().toString() — the
+// server's own mod VERSIONS on the login wire, sent whether or not the ping
+// carried them. HF23-R1: on a wire whose status ping hides the mod list (a
+// proxy/front stripping forgeData — receipt 7b63c3ed), this message is the
+// ONLY in-protocol source of the announced modid@version the HF23
+// acquisition rung needs; NetworkInitialization registers it BEFORE
+// S2CModList (builder order 5 then 1), so it lands before any mod's own
+// login query. Parsing is best-effort (a truncated body throws; the caller
+// records nothing and the reference client's silence still stands).
+function parseModData (buffer, offset) {
+  const count = readVarInt(buffer, offset)
+  offset += count.size
+  const mods = {}
+  for (let i = 0; i < count.value; i++) {
+    const id = readString(buffer, offset)
+    offset += id.size
+    const displayName = readString(buffer, offset)
+    offset += displayName.size
+    const version = readString(buffer, offset)
+    offset += version.size
+    mods[id.value] = { displayName: displayName.value, version: version.value }
+  }
+  return { mods, count: count.value }
+}
+
 function encodeModListReply (reply) {
   const parts = [writeVarInt(DISCRIMINATOR.MOD_LIST_REPLY)]
   parts.push(writeVarInt(reply.mods.length))
@@ -799,6 +827,15 @@ function announcedChannelAttribution (client, options, channel) {
   if (client && Array.isArray(client.forgePingMods)) {
     for (const m of client.forgePingMods) { if (m) noteMod(m.id, m.version) }
   }
+  // HF23-R1: the server's S2CModData (this login) names modid -> version
+  // even when the ping hid the mod list — the same announced pair the ping
+  // would have carried (both read IModInfo on the server), so it feeds the
+  // corroboration + acquisition rungs with equal standing. The ping keeps
+  // precedence when both exist (noteMod never downgrades a known version).
+  const modData = client && client.forgeModData && client.forgeModData.mods
+  if (modData && typeof modData === 'object') {
+    for (const id of Object.keys(modData)) noteMod(id, modData[id] && modData[id].version)
+  }
   const modList = client && client.forgeModList
   if (modList && Array.isArray(modList.mods)) {
     for (const id of modList.mods) noteMod(id, null)
@@ -1244,9 +1281,15 @@ module.exports = function (client, options) {
         client.forgeModList = modList
 
         const pingVersions = options.pingModVersions || {}
-        client.emit('forgeMods', modList.mods.map((id) =>
-          pingVersions[id] ? { modid: id, version: pingVersions[id] } : id
-        ))
+        // HF23-R1: a hidden ping carries no versions — the S2CModData that
+        // precedes this ModList on the wire does (parsed below into
+        // client.forgeModData), so the embedder's mod census sees
+        // modid@version either way.
+        const modData = (client.forgeModData && client.forgeModData.mods) || {}
+        client.emit('forgeMods', modList.mods.map((id) => {
+          const version = pingVersions[id] || (modData[id] && modData[id].version) || null
+          return version ? { modid: id, version } : id
+        }))
 
         // Mirror the server's own mods, channels and registries back at it so
         // NetworkRegistry.validateClientChannels finds nothing to complain about.
@@ -1272,7 +1315,18 @@ module.exports = function (client, options) {
       // compression-arming boundary, so the reference client's silence is
       // the law — record the receipt, reply with nothing.
       if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.MOD_DATA) {
-        debug(`S2CModData received (${wrapper.data.length} bytes) — no reply, matching the reference client`)
+        // HF23-R1: READ it (never reply): modid -> version from the server's
+        // own ModList.get() — the announced version on a wire whose ping hid
+        // the mod list, consumed by announcedChannelAttribution for the
+        // HF13 corroboration + HF23 acquisition rungs. Best-effort parse.
+        try {
+          const modData = parseModData(wrapper.data, disc.size)
+          client.forgeModData = modData
+          debug(`S2CModData received (${wrapper.data.length} bytes, ${modData.count} mods with versions) — no reply, matching the reference client`)
+          client.emit('forgeModData', modData)
+        } catch (err) {
+          debug(`S2CModData received (${wrapper.data.length} bytes) but could not be parsed (${err.message}) — no reply, matching the reference client`)
+        }
         return
       }
 
@@ -1335,6 +1389,9 @@ module.exports.writeVarInt = writeVarInt
 module.exports.readString = readString
 module.exports.writeString = writeString
 module.exports.readRegistryIdMap = readRegistryIdMap
+// HF23-R1: the S2CModData reader (exported for tests — the announced-version
+// source on hidden-ping wires)
+module.exports.parseModData = parseModData
 module.exports.SNAPSHOT_REGISTRIES = SNAPSHOT_REGISTRIES
 // The hand-verified override table, exported so tests (and E2E rigs proving
 // the derivation path) can inspect or disable individual entries.
