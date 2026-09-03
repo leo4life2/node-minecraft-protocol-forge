@@ -188,3 +188,127 @@ describe('FML2 responder default case', function () {
     assert.deepStrictEqual(params.data, wrap('somemod:channel', writeVarInt(99)))
   })
 })
+
+// HF23 — the announced-mod acquisition rung (design §4p): an 'unknown +
+// announced' channel with a REAL announced version defers its answer behind
+// an embedder-injected accessor; the SAME derivation runs over the obtained
+// jar and the SAME three dispatch shapes ride the wire. Scripted accessors
+// only — this lib never does network I/O.
+describe('HF23 announced-mod acquisition rung', function () {
+  const fs = require('fs')
+  const os = require('os')
+  const path = require('path')
+  const { buildClass, buildJar } = require('./helpers/synthJar')
+  const RL = 'net/minecraft/resources/ResourceLocation'
+  const SC = 'net/minecraftforge/network/simple/SimpleChannel'
+  const MB = 'net/minecraftforge/network/simple/SimpleChannel$MessageBuilder'
+  const AI = 'java/util/concurrent/atomic/AtomicInteger'
+  const NR = 'net/minecraftforge/network/NetworkRegistry'
+  const FBB = 'net/minecraft/network/FriendlyByteBuf'
+  // the tacz shape: counter-seeded channel, empty-encoder Acknowledge first → index 1
+  function derivableJarDir (ns) {
+    const owner = `synth/${ns}/Net`
+    const ack = `synth/${ns}/Ack`
+    const reg = (a, cls) => a
+      .getstatic(owner, 'CHANNEL', `L${SC};`).ldcCls(cls).getstatic(owner, 'COUNT', `L${AI};`)
+      .invokevirtual(AI, 'getAndIncrement', '()I').invokevirtual(SC, 'messageBuilder', `(Ljava/lang/Class;I)L${MB};`)
+      .invokevirtual(MB, 'loginIndex', `(Ljava/util/function/Function;Ljava/util/function/BiConsumer;)L${MB};`).invokevirtual(MB, 'add', '()V')
+    const net = buildClass({
+      name: owner,
+      methods: [
+        { name: '<clinit>', desc: '()V', flags: 0x0008, code: (a) => a.new_(RL).dup().ldcStr(ns).ldcStr('handshake').invokespecial(RL, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V').invokestatic(NR, 'newSimpleChannel', `(L${RL};)L${SC};`).putstatic(owner, 'CHANNEL', `L${SC};`).new_(AI).dup().iconst(1).invokespecial(AI, '<init>', '(I)V').putstatic(owner, 'COUNT', `L${AI};`).ret() },
+        { name: 'init', desc: '()V', code: (a) => reg(a, ack).ret() }
+      ]
+    })
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hf23-${ns}-`))
+    fs.writeFileSync(path.join(dir, `${ns}.jar`), buildJar([
+      { name: `${owner}.class`, data: net },
+      { name: `${ack}.class`, data: buildClass({ name: ack, methods: [{ name: 'encode', desc: `(L${ack};L${FBB};)V`, code: (a) => a.ret() }] }) }
+    ]))
+    return dir
+  }
+  function stub () {
+    const client = makeClient()
+    client.state = 'login'
+    client.version = '1.20.1'
+    client.endedReasons = []
+    client.end = (reason) => { client.endedReasons.push(reason); client.ended = true }
+    return client
+  }
+  function announce (client, id, version) {
+    client.forgeModList = { mods: [id], channels: [{ name: `${id}:handshake`, marker: version }], registries: [] }
+    client.forgePingMods = [{ id, version }]
+  }
+  function query (client, channel) {
+    client.emit('login_plugin_request', { messageId: 42, channel: 'fml:loginwrapper', data: wrap(channel, Buffer.concat([writeVarInt(0), Buffer.from([1])])) })
+  }
+  const until = async (pred) => { const d = Date.now() + 3000; while (!pred()) { if (Date.now() > d) throw new Error('timeout'); await new Promise((resolve) => setTimeout(resolve, 5)) } }
+
+  it('fail-open: with the accessor injected, unannounced channels keep the FML-99 floor byte-for-byte and an ANY-version owner keeps the HF13 decline; the accessor is never called', async () => {
+    let calls = 0
+    const acq = { acquire: async () => { calls++; return { ok: false, outcome: 'registry-miss' } } }
+    const a = stub()
+    forgeHandshake3(a, { announcedModAcquisition: acq })
+    query(a, 'nobodyknows:gate')
+    await drainDeferredReplies()
+    assert.deepStrictEqual(a.written[0].params.data, wrap('nobodyknows:gate', writeVarInt(99)))
+    const b = stub()
+    announce(b, 'anymod', 'ANY')
+    forgeHandshake3(b, { announcedModAcquisition: acq })
+    query(b, 'anymod:handshake')
+    await drainDeferredReplies()
+    assert.strictEqual(b.written.length, 1)
+    assert.strictEqual(b.written[0].params.data, undefined, 'the HF13 decline, synchronously')
+    assert.strictEqual(calls, 0)
+    assert.strictEqual(forgeHandshake3.isAcquirableVersion('SERVER_ONLY'), false)
+  })
+
+  it('acquired → the SAME derivation over the obtained jar answers the mod\'s own ack (index 1) as a deferred "wrapped reply (acquired)"', async () => {
+    const dir = derivableJarDir('acqmod')
+    const client = stub()
+    announce(client, 'acqmod', '1.1.8-hotfix')
+    const seen = []
+    forgeHandshake3(client, { announcedModAcquisition: { budgetMs: 1000, acquire: async (req) => { seen.push(req); await new Promise((resolve) => setTimeout(resolve, 20)); return { ok: true, outcome: 'downloaded-verified', jarPaths: [path.join(dir, 'acqmod.jar')], receipt: { registry: 'modrinth' } } } } })
+    query(client, 'acqmod:handshake')
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 0, 'nothing written while the acquisition is in flight')
+    await until(() => client.written.length === 1)
+    assert.deepStrictEqual(client.written[0].params.data, wrap('acqmod:handshake', Buffer.from([0x01])))
+    assert.deepStrictEqual(seen.map((r) => [r.modId, r.version, r.channel, r.loader, r.mcVersion]), [['acqmod', '1.1.8-hotfix', 'acqmod:handshake', 'forge', '1.20.1']])
+    assert.strictEqual(client.forgeLoginCorroboration[0].via, 'jar-derived-ack (acquired)')
+  })
+
+  it('miss → the HF13 decline with the acquisition outcome on the receipt (the copy names mod@version); accessor throw → decline; exactly one reply each', async () => {
+    const a = stub()
+    announce(a, 'missmod', '4.5.6')
+    forgeHandshake3(a, { announcedModAcquisition: { acquire: async () => ({ ok: false, outcome: 'version-miss', receipt: { registry: 'modrinth' } }) } })
+    query(a, 'missmod:handshake')
+    await until(() => a.written.length === 1)
+    assert.strictEqual(a.written[0].params.data, undefined)
+    assert.strictEqual(a.forgeDeclinedLoginChannels[0].acquisition.outcome, 'version-miss')
+    assert.strictEqual(a.forgeDeclinedLoginChannels[0].ownerVersion, '4.5.6')
+    assert.ok(/no file for exactly that version/.test(forgeHandshake3.acquisitionOutcomeWords('version-miss')))
+    const b = stub()
+    announce(b, 'boom', '1.0')
+    forgeHandshake3(b, { announcedModAcquisition: { acquire: async () => { throw new Error('kaboom') } } })
+    query(b, 'boom:handshake')
+    await until(() => b.written.length === 1)
+    await drainDeferredReplies()
+    assert.strictEqual(b.written.length, 1)
+    assert.strictEqual(b.forgeDeclinedLoginChannels[0].acquisition.outcome, 'acquisition-error')
+  })
+
+  it('deadline law: an in-progress result ends the connection OURSELVES with the typed fact — no login_plugin_response is written', async () => {
+    const client = stub()
+    announce(client, 'bigmod', '9.0')
+    forgeHandshake3(client, { announcedModAcquisition: { acquire: async () => ({ ok: false, outcome: 'in-progress', progress: { bytesDone: 10, bytesTotal: 100, etaMs: 5000 }, background: Promise.resolve({ ok: true }), receipt: {} }) } })
+    query(client, 'bigmod:handshake')
+    await until(() => client.endedReasons.length === 1)
+    await drainDeferredReplies()
+    assert.deepStrictEqual(client.endedReasons, ['announced mod acquisition in progress'])
+    assert.strictEqual(client.written.length, 0)
+    assert.strictEqual(client.minepalAnnouncedModAcquisition.verdict, 'acquisition-in-progress')
+    assert.strictEqual(client.minepalAnnouncedModAcquisition.modId, 'bigmod')
+    assert.ok(client.minepalAnnouncedModAcquisitionBackground.promise instanceof Promise)
+  })
+})

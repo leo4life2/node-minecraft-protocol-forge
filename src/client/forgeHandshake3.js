@@ -872,10 +872,156 @@ function resolveWrappedModLogin (client, channel, disc, body, options) {
   // server's own announced reality before letting it ride the wire.
   const attribution = announcedChannelAttribution(client, options, channel)
   if (attribution) {
+    // HF23 — ANNOUNCED-MOD ACQUISITION (the P2 growth path realized). The
+    // decline below is a deterministic kick whenever the queried message
+    // needsResponse (IndexedMessageCodec.consume marks a null payload
+    // handled ONLY when !HandshakeHandler.packetNeedsResponse; every
+    // needsResponse message sits in sentMessages until answered, and an
+    // unhandled reply makes NetworkHooks.onCustomPayload return false →
+    // ServerLoginPacketListenerImpl disconnects with
+    // unexpected_query_response — or the same close seen as ECONNRESET
+    // when the disconnect packet loses the socket race). The server just
+    // told us WHICH mod at WHICH version owns the channel; when the
+    // embedding app injects an acquisition accessor (this lib stays
+    // local-only by construction — it never does network I/O itself) and
+    // the announced version is real (never ANY / SERVER_ONLY), the answer
+    // is deferred: obtain the jar, run the SAME derivation over it, and
+    // dispatch exactly as the synchronous ladder would. Lazy by design:
+    // the server WAITS for a needsResponse reply (HandshakeHandler.tickServer
+    // keeps sending the remaining login messages and completes only when
+    // sentMessages is empty), and the HF12 boundary guard's "negotiation
+    // over" criterion stays false while we hold — the late reply is legal.
+    // A fire-and-forget query the server completes without is dropped by
+    // the same guard with a receipt (never a stream-corrupting late write).
+    const acq = options && options.announcedModAcquisition
+    if (acq && typeof acq.acquire === 'function' && attribution.ownerMod && isAcquirableVersion(attribution.ownerVersion)) {
+      return { pending: acquireThenResolve(client, channel, options, attribution, acq) }
+    }
     declineUncorroboratedLogin(client, channel, attribution)
     return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution } }
   }
   return null
+}
+
+// HF23: versions the server announces for mods that are not acquirable —
+// Forge's own placeholder markers, never a registry version.
+const NON_ACQUIRABLE_VERSIONS = /^(any|server_only|server-only|client_only|client-only)$/i
+function isAcquirableVersion (version) {
+  if (version == null) return false
+  const s = String(version).trim()
+  return !!s && !NON_ACQUIRABLE_VERSIONS.test(s)
+}
+
+// HF23: plain words for the honest-stop copy (P5) — mirrors the app organ's
+// table; the lib keeps its own so the copy never depends on the embedder.
+function acquisitionOutcomeWords (outcome) {
+  const o = String(outcome == null ? '' : outcome)
+  if (o.startsWith('negative-cached:')) return `a recent lookup already ended "${o.slice('negative-cached:'.length)}", so it was not retried yet`
+  switch (o) {
+    case 'registry-miss': return 'the registry has no project by that id (CurseForge lookup is not available in this build)'
+    case 'version-miss': return 'the registry has the project but no file for exactly that version, loader and Minecraft version (nothing "closest" is ever substituted)'
+    case 'hash-mismatch': return 'the downloaded file did not match the registry\'s own hashes and was discarded'
+    case 'jar-proof-mismatch': return 'the registry\'s file does not declare that mod id and version in its own metadata, so it was discarded'
+    case 'registry-unreachable': return 'the registry could not be reached (no network, or the registry is down)'
+    case 'registry-error': return 'the registry answered with an error'
+    case 'cap-exceeded': return 'its file exceeds the per-file size cap'
+    case 'join-cap-exceeded': return 'this join already reached the acquisition cap'
+    case 'budget-exceeded': return 'the registry lookup did not finish inside the login window'
+    case 'download-failed': return 'the download failed'
+    case 'download-tries-exhausted': return 'the download attempts were used up'
+    case 'acquired-jar-holds-no-channel': return 'the obtained jar does not create that login channel'
+    case 'disabled': return 'automatic acquisition is disabled in this environment'
+    case 'acquisition-error': return 'the acquisition step failed'
+    default: return o || 'unknown outcome'
+  }
+}
+
+// HF23: the deferred half of the resolution ladder — obtain the announced
+// owner's jar through the injected accessor, then assess EXACTLY as the
+// synchronous ladder does (same assessLoginChannel, same dispatch shapes).
+// Resolves to { reply, via } | { declined: true } | { failed: true } |
+// { silent: true } (the deadline law ended the connection) — never null.
+async function acquireThenResolve (client, channel, options, attribution, acq) {
+  const modId = attribution.ownerMod
+  const version = String(attribution.ownerVersion)
+  const budgetMs = Number.isFinite(acq.budgetMs) ? acq.budgetMs : 18000
+  const started = Date.now()
+  console.log(`[forge] the modded login check on channel "${channel}" belongs to server-announced mod "${modId}" (announced version ${version}) and no local jar carries it — obtaining that mod@version from a public registry before answering (budget ${budgetMs}ms; the server waits for this reply)`)
+  try { if (client && typeof client.minepalJoinWatchdogExtend === 'function') client.minepalJoinWatchdogExtend('announced-mod acquisition in flight') } catch { /* never break the reply path */ }
+  let result = null
+  try {
+    result = await acq.acquire({ modId, version, channel, loader: 'forge', mcVersion: (client && client.version) || options.mcVersion || null, budgetMs })
+  } catch (err) {
+    result = { ok: false, outcome: 'acquisition-error', error: err && err.message }
+  }
+  const receipt = result && result.receipt
+  const acquisition = {
+    outcome: (result && result.outcome) || 'acquisition-error',
+    registry: (receipt && receipt.registry) || 'modrinth',
+    projectId: receipt ? receipt.projectId : null,
+    versionId: receipt ? receipt.versionId : null,
+    cached: !!(receipt && receipt.cached),
+    ms: Date.now() - started
+  }
+  if (result && result.ok && Array.isArray(result.jarPaths) && result.jarPaths.length > 0) {
+    const paths = modsPathsFor(options).concat(result.jarPaths)
+    let assessed = { verdict: 'unknown' }
+    try {
+      assessed = assessLoginChannel(channel, paths)
+    } catch (err) {
+      debug(`assessment for ${channel} over the acquired jar failed (${err.message})`)
+    }
+    if (assessed.verdict === 'ack') {
+      if (receipt) receipt.derived = `ack-index-${assessed.index}`
+      try {
+        if (!Array.isArray(client.forgeLoginCorroboration)) client.forgeLoginCorroboration = []
+        client.forgeLoginCorroboration.push({ channel, via: 'jar-derived-ack (acquired)', index: assessed.index, jarEvidence: assessed.evidence, announcedChannel: attribution.announcedChannel, ownerMod: modId, ownerVersion: version, acquisition })
+      } catch { /* receipts never break the reply path */ }
+      console.log(`[forge] answering the modded login check on channel "${channel}" from the ACQUIRED ${modId}@${version} jar: derived ack index ${assessed.index} (${assessed.msgClass}; ${assessed.evidence}; acquisition ${acquisition.outcome} in ${acquisition.ms}ms)`)
+      return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index} (acquired ${modId}@${version})`, acquired: true }
+    }
+    if (assessed.verdict === 'underivable') {
+      if (receipt) receipt.derived = `underivable:${assessed.reason}`
+      if (assessed.reason === 'substantive-reply') {
+        failWrappedLoginHonestly(client, channel, Object.assign({}, assessed, { acquisition }))
+        return { failed: true }
+      }
+      declineWrappedLoginHonestly(client, channel, Object.assign({}, assessed, { acquisition }))
+      return { declined: true, assessed, acquired: true }
+    }
+    if (receipt) receipt.derived = 'no-channel'
+    acquisition.outcome = 'acquired-jar-holds-no-channel'
+  }
+  if (result && result.outcome === 'in-progress') {
+    // THE DEADLINE LAW (HF20's shape): the download outran the login budget
+    // — NO decline is sent (a decline here is the deterministic kick). We
+    // end the connection OURSELVES with a typed retryable fact; the download
+    // continues in this process, the app's exit path waits a bounded window
+    // for it to land, and the reconnect derives from the cache at ping time.
+    const progress = result.progress || {}
+    const fact = {
+      verdict: 'acquisition-in-progress',
+      modId,
+      version,
+      channel,
+      bytesDone: Number(progress.bytesDone) || 0,
+      bytesTotal: Number.isFinite(Number(progress.bytesTotal)) ? Number(progress.bytesTotal) : null,
+      etaMs: Number.isFinite(Number(progress.etaMs)) ? Number(progress.etaMs) : null,
+      budgetMs,
+      elapsedMs: Date.now() - started
+    }
+    client.minepalAnnouncedModAcquisition = fact
+    client.minepalAnnouncedModAcquisitionBackground = {
+      promise: Promise.resolve(result.background).then((fin) => { fact.finished = true; fact.ok = !!(fin && fin.ok); fact.finalOutcome = fin && fin.outcome; return fin }).catch(() => null),
+      waitCapMs: Number.isFinite(result.waitCapMs) ? result.waitCapMs : Math.min(240000, Math.max(15000, (fact.etaMs || 60000) + 5000))
+    }
+    console.warn(`[forge] ${modId}@${version} (for login channel "${channel}") cannot be obtained inside the login window (${fact.bytesDone}/${fact.bytesTotal == null ? '?' : fact.bytesTotal} bytes after ${fact.elapsedMs}ms${fact.etaMs != null ? `, ~${Math.round(fact.etaMs / 1000)}s to go` : ''}) — disconnecting on purpose instead of sending the decline the server would kick; the download continues and MinePal reconnects when it lands`)
+    try { client.emit('forgeAnnouncedModAcquisitionInProgress', fact) } catch { /* receipts never break the path */ }
+    try { if (typeof client.end === 'function') client.end('announced mod acquisition in progress') } catch (err) { debug(`ending the connection failed (${err.message})`) }
+    return { silent: true }
+  }
+  declineUncorroboratedLogin(client, channel, attribution, acquisition)
+  return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution, acquisition }, acquired: true }
 }
 
 // The honest failure: no guessed bytes are ever sent for a channel we KNOW
@@ -890,7 +1036,7 @@ function failWrappedLoginHonestly (client, channel, assessed) {
   const message = `Cannot answer the modded login check on channel "${channel}": ${detail}. ` +
     'Join stopped honestly instead of sending a wrong acknowledgement (the server would kick it as an unexpected query response).'
   console.error(`[forge] ${message}`)
-  client.forgeUnanswerableLoginChannel = { channel, verdict: assessed.verdict, reason: assessed.reason, msgClass: assessed.msgClass, evidence: assessed.evidence }
+  client.forgeUnanswerableLoginChannel = { channel, verdict: assessed.verdict, reason: assessed.reason, msgClass: assessed.msgClass, evidence: assessed.evidence, acquisition: assessed.acquisition || null }
   client.emit('forgeLoginUnanswerable', client.forgeUnanswerableLoginChannel)
   try {
     if (typeof client.end === 'function') client.end(message)
@@ -913,8 +1059,8 @@ function declineWrappedLoginHonestly (client, channel, assessed) {
     'The server now decides — mods that tolerate a vanilla-shaped answer continue the login; mods that require the reply will kick with their own message.'
   console.warn(`[forge] ${message}`)
   if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
-  client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence })
-  client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence })
+  client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null })
+  client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null })
 }
 
 // The HF13 decline: same wire bytes as the HF8 decline (the vanilla
@@ -932,13 +1078,19 @@ function declineWrappedLoginHonestly (client, channel, assessed) {
 // never worse than no instance at all, and join-viable on every server whose
 // message tolerates the vanilla-shaped answer (proven live: tacztweaks
 // accepts it).
-function declineUncorroboratedLogin (client, channel, attribution) {
+function declineUncorroboratedLogin (client, channel, attribution, acquisition) {
   const owner = attribution.ownerMod
     ? `mod "${attribution.ownerMod}"${attribution.ownerVersion ? ` (announced version ${attribution.ownerVersion})` : ''}`
     : 'one of its mods'
-  const evidence = `server-announced channel${attribution.announcedChannel ? ' (in the FML ModList)' : ''} attributed to ${owner}; no local jar carries it`
+  // HF23: the acquisition outcome rides the receipt AND the copy — the
+  // honest stop names the announced mod@version and why it could not be
+  // obtained (P5), so even the RST variant of the kill names the mod.
+  const acquired = acquisition
+    ? ` MinePal tried to obtain ${attribution.ownerMod}@${attribution.ownerVersion} (announced by the server for this channel) from ${acquisition.registry || 'the public registry'}: ${acquisitionOutcomeWords(acquisition.outcome)}; the answer could not be derived, so`
+    : ''
+  const evidence = `server-announced channel${attribution.announcedChannel ? ' (in the FML ModList)' : ''} attributed to ${owner}; no local jar carries it${acquisition ? `; acquisition ${acquisition.outcome}` : ''}`
   const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline: ` +
-    `the server itself announced this channel belongs to ${owner}, and the local mod jars carry no knowledge of it — ` +
+    `the server itself announced this channel belongs to ${owner}, and the local mod jars carry no knowledge of it${acquired ? ` —${acquired}` : ' —'} ` +
     'the legacy FML convention acknowledgement (index 99) would be an uncorroborated claim in that mod\'s own message space ' +
     '(live receipt: the server dispatches it, finds no message registered at 99, logs "Unexpected custom data from client" ' +
     'and kicks with multiplayer.disconnect.unexpected_query_response). A decline is not a claim — it is byte-identical to ' +
@@ -954,9 +1106,10 @@ function declineUncorroboratedLogin (client, channel, attribution) {
     evidence,
     ownerMod: attribution.ownerMod,
     ownerVersion: attribution.ownerVersion,
-    announcedChannel: attribution.announcedChannel
+    announcedChannel: attribution.announcedChannel,
+    acquisition: acquisition || null
   })
-  client.emit('forgeLoginDeclined', { channel, reason: 'uncorroborated-by-local-jars', evidence })
+  client.emit('forgeLoginDeclined', { channel, reason: 'uncorroborated-by-local-jars', evidence, acquisition: acquisition || null })
 }
 
 /**
@@ -1039,24 +1192,48 @@ module.exports = function (client, options) {
       // unanswerable channels), FML acknowledge 99 last — only for channels
       // the local jars know nothing about.
       if (wrapper.channel !== 'fml:handshake') {
-        const resolved = resolveWrappedModLogin(client, wrapper.channel, disc.value, wrapper.data.slice(disc.size), options)
-        if (resolved && resolved.failed) return // honest join stop — no reply was (or could be) written
-        if (resolved && resolved.declined) {
-          // HF8: vanilla "not understood" — messageId with NO data encodes
-          // successful=false (byte-identical to the reference client's
-          // decline, ClientHandshakePacketListenerImpl patch). HF12: written
-          // through the deferred boundary guard — the receipt's killer was
-          // exactly this decline (tacztweaks:handshake), computed for ~650ms
-          // by a cold jar assessment and then written RAW after the server
-          // had already completed negotiation and armed compression.
-          writeLoginReplyDeferred(client, { messageId: packet.messageId }, { channel: wrapper.channel, kind: 'wrapped decline' })
+        const channel = wrapper.channel
+        const messageId = packet.messageId
+        const discValue = disc.value
+        // One dispatch for the synchronous ladder AND the HF23 deferred
+        // (acquired) resolution — the same three shapes, the same writes.
+        const dispatch = (resolved, late) => {
+          if (resolved && (resolved.failed || resolved.silent)) return true // honest join stop / deadline-law self-end — nothing to write
+          if (resolved && resolved.declined) {
+            // HF8: vanilla "not understood" — messageId with NO data encodes
+            // successful=false (byte-identical to the reference client's
+            // decline, ClientHandshakePacketListenerImpl patch). HF12: written
+            // through the deferred boundary guard — the receipt's killer was
+            // exactly this decline (tacztweaks:handshake), computed for ~650ms
+            // by a cold jar assessment and then written RAW after the server
+            // had already completed negotiation and armed compression.
+            writeLoginReplyDeferred(client, { messageId }, { channel, kind: resolved.acquired ? 'wrapped decline (after acquisition)' : 'wrapped decline' })
+            return true
+          }
+          if (resolved && resolved.reply) {
+            debug(`answering ${channel} login message disc=${discValue} in its own index space via ${resolved.via} (${resolved.reply.length} bytes)`)
+            respond(messageId, wrapLoginPayload(channel, resolved.reply), { channel, kind: resolved.acquired ? 'wrapped reply (acquired)' : 'wrapped reply' })
+            return true
+          }
+          if (late) {
+            // by construction the deferred rung never resolves null; belt:
+            // the HF13 decline (never a guessed byte)
+            writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition fallback)' })
+            return true
+          }
+          return false
+        }
+        const resolved = resolveWrappedModLogin(client, channel, discValue, wrapper.data.slice(disc.size), options)
+        if (resolved && resolved.pending) {
+          // HF23: the answer is deferred behind the announced-mod acquisition;
+          // the server waits for a needsResponse reply (see resolveWrappedModLogin)
+          resolved.pending.then((late) => dispatch(late, true)).catch((err) => {
+            console.warn(`[forge] announced-mod acquisition for ${channel} threw (${err && err.message}) — answering with the protocol's not-understood decline`)
+            writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition error)' })
+          })
           return
         }
-        if (resolved && resolved.reply) {
-          debug(`answering ${wrapper.channel} login message disc=${disc.value} in its own index space via ${resolved.via} (${resolved.reply.length} bytes)`)
-          respond(packet.messageId, wrapLoginPayload(wrapper.channel, resolved.reply), { channel: wrapper.channel, kind: 'wrapped reply' })
-          return
-        }
+        if (dispatch(resolved, false)) return
         // null: no local knowledge of this channel — fall through to the FML
         // convention acknowledge (99) below, wrapped on the ORIGINATING channel
       }
@@ -1170,6 +1347,12 @@ module.exports.failWrappedLoginHonestly = failWrappedLoginHonestly
 // HF13: announced-reality attribution (exported for tests — the corroboration
 // gate between the local jars' 'unknown' verdict and the legacy 99 floor).
 module.exports.announcedChannelAttribution = announcedChannelAttribution
+// HF23: the announced-mod acquisition rung (exported for tests — the
+// deferred resolution over an injected accessor, plus the version filter
+// that keeps ANY / SERVER_ONLY markers from ever being queried).
+module.exports.acquireThenResolve = acquireThenResolve
+module.exports.isAcquirableVersion = isAcquirableVersion
+module.exports.acquisitionOutcomeWords = acquisitionOutcomeWords
 module.exports.wrapLoginPayload = wrapLoginPayload
 module.exports.encodeAcknowledgement = encodeAcknowledgement
 module.exports.modsPathsFor = modsPathsFor

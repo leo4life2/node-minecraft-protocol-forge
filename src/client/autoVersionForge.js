@@ -95,7 +95,9 @@ module.exports = function (client, options) {
       const id = mod && (mod.modId ?? mod.modid ?? mod.id)
       if (id != null) fml2PingVersions[id] = mod.modmarker ?? mod.version ?? null
     }
-    forgeHandshake2(client, { forgeMods, modsPaths: fml2ModsPaths, pingModVersions: fml2PingVersions })
+    // HF23: the embedder's announced-mod acquisition accessor (lazy, only
+    // for an 'unknown + announced' login channel) rides both login-phase eras.
+    forgeHandshake2(client, { forgeMods, modsPaths: fml2ModsPaths, pingModVersions: fml2PingVersions, announcedModAcquisition: options.announcedModAcquisition, mcVersion: options.mcVersion })
     // HF12: same off-path warmup as FML3 (see below) — the FML2 wrapped-mod
     // login lane shares the inline assessment and its exposure.
     if (Array.isArray(response.forgeData.channels)) {
@@ -159,7 +161,11 @@ module.exports = function (client, options) {
       // app resolves it (or the MINEPAL_FORGE_MODS_DIR env var applies
       // downstream). Previously dropped here, which orphaned owoModsPaths.
       modsPaths,
-      pingModVersions
+      pingModVersions,
+      // HF23: announced-mod acquisition accessor (embedder-owned network +
+      // cache policy; this lib only awaits it) + the MC version it keys on
+      announcedModAcquisition: options.announcedModAcquisition,
+      mcVersion: options.mcVersion
     })
     // HF12: precompute the jar verdicts for every pinged mod channel while
     // the connection is still being set up — the inline cold assessment used

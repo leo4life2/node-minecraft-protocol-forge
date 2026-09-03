@@ -254,19 +254,39 @@ module.exports = function (client, options) {
           }
           try {
             const disc = readVarInt(loginwrapper.data, 0)
-            const resolved = resolveWrappedModLogin(client, loginwrapper.channel, disc.value, loginwrapper.data.slice(disc.size), options)
-            if (resolved && resolved.failed) break // honest join stop — no guessed bytes
-            if (resolved && resolved.declined) {
-              // HF8: protocol-correct not-understood decline — messageId
-              // with NO data (successful=false), same law as FML3.
-              writeLoginReplyDeferred(client, { messageId: data.messageId }, { channel: loginwrapper.channel, kind: 'wrapped decline' })
+            const channel = loginwrapper.channel
+            const messageId = data.messageId
+            // same dispatch shapes as FML3 (one rule for the class), for both
+            // the synchronous ladder and the HF23 deferred (acquired) rung
+            const dispatch = (resolved, late) => {
+              if (resolved && (resolved.failed || resolved.silent)) return true // honest join stop / deadline-law self-end — no guessed bytes
+              if (resolved && resolved.declined) {
+                // HF8: protocol-correct not-understood decline — messageId
+                // with NO data (successful=false), same law as FML3.
+                writeLoginReplyDeferred(client, { messageId }, { channel, kind: resolved.acquired ? 'wrapped decline (after acquisition)' : 'wrapped decline' })
+                return true
+              }
+              if (resolved && resolved.reply) {
+                debug(`answering ${channel} login message disc=${disc.value} via ${resolved.via} (${resolved.reply.length} bytes)`)
+                writeLoginReplyDeferred(client, { messageId, data: wrapLoginPayload(channel, resolved.reply) }, { channel, kind: resolved.acquired ? 'wrapped reply (acquired)' : 'wrapped reply' })
+                return true
+              }
+              if (late) {
+                writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition fallback)' })
+                return true
+              }
+              return false
+            }
+            const resolved = resolveWrappedModLogin(client, channel, disc.value, loginwrapper.data.slice(disc.size), options)
+            if (resolved && resolved.pending) {
+              // HF23: deferred behind the announced-mod acquisition (see FML3)
+              resolved.pending.then((late) => dispatch(late, true)).catch((err) => {
+                console.warn(`[forge] announced-mod acquisition for ${channel} threw (${err && err.message}) — answering with the protocol's not-understood decline`)
+                writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition error)' })
+              })
               break
             }
-            if (resolved && resolved.reply) {
-              debug(`answering ${loginwrapper.channel} login message disc=${disc.value} via ${resolved.via} (${resolved.reply.length} bytes)`)
-              writeLoginReplyDeferred(client, { messageId: data.messageId, data: wrapLoginPayload(loginwrapper.channel, resolved.reply) }, { channel: loginwrapper.channel, kind: 'wrapped reply' })
-              break
-            }
+            if (dispatch(resolved, false)) break
           } catch (error) {
             debug(`failed to resolve wrapped channel ${loginwrapper.channel} (${error.message}), falling back to the FML convention ack`)
           }
