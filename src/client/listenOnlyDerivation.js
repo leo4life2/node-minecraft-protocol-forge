@@ -656,9 +656,20 @@ function deriveContainerCarriedListenChannels (index, diagnostics, ev) {
     for (const m of info.codes) {
       if (m.method !== '<init>') continue
       const types = argTypesOf(m.desc)
-      const i = types.findIndex((t) => t === `L${MOJMAP_PAYLOAD_TYPE};` || t === `L${MOJMAP_RESLOC};`)
-      if (i < 0) continue
-      walk({ cls: K, name: '<init>', desc: m.desc }, i, 0)
+      // HF15-R rider (verifier near-miss, case 6): a container constructed
+      // as (ResourceLocation nonChannel, Type channel, Object) carries its
+      // channel in the TYPE parameter — the leading ResourceLocation is some
+      // other id (a texture, a registry key). Picking the first Type-or-RL
+      // parameter declared the non-channel id and MISSED the real channel.
+      // Law: the Type-typed parameters are the channel carriers whenever any
+      // exist — EVERY one of them walks (a container with several Types is
+      // several channels; guessing one would silently drop the rest); only a
+      // ctor with NO Type parameter falls back to its first ResourceLocation
+      // parameter (the (RL, …) ctor idiom that builds `new Type(rl)` inside).
+      const typeSlots = types.reduce((acc, t, i) => (t === `L${MOJMAP_PAYLOAD_TYPE};` ? acc.concat(i) : acc), [])
+      const rlSlot = types.findIndex((t) => t === `L${MOJMAP_RESLOC};`)
+      const slots = typeSlots.length > 0 ? typeSlots : (rlSlot < 0 ? [] : [rlSlot])
+      for (const i of slots) walk({ cls: K, name: '<init>', desc: m.desc }, i, 0)
     }
   }
   const out = [...ids].sort()
