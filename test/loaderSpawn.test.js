@@ -299,7 +299,10 @@ describe('Forge loader jar locator', () => {
 
 // --- ground truth over the real loader jars (env-gated) ------------------------------
 
-describe('D3 ground truth on shipped loader jars (MINEPAL_D3_JARS)', function () {
+// PIN-COUNT NOTE: this block's rows exist only when MINEPAL_D3_JARS=<dir of loader universal jars>
+// is set — bare `npm run mochaTest` skips it (one pending), so the runner summary differs by env
+// (147 passing / 7 pending bare; 148 / 6 with the jars dir on the verifier's box).
+describe('D3 ground truth on shipped loader jars (env-gated: MINEPAL_D3_JARS=<dir>; skipped when unset)', function () {
   const dir = process.env.MINEPAL_D3_JARS
   const jars = dir && fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.jar')) : []
   const EXPECT = [
@@ -417,12 +420,15 @@ describe('D3 rider — plausibility gate law (a synthesized entity never comes f
     assert.match(DEC.plausible({ ...p, y: 70 }, registry, null), /uuid is zero/)
     assert.match(DEC.plausible({ ...p, y: 70, objectUUID: '11223344-5566-4788-8efd-fcfbfaf9f8f8' }, registry, null), /velocityX 32767 beyond the loader's ±3.9 blocks\/tick clamp \(±31200\)/)
   })
-  it('y is bound to the CURRENT DIMENSION when the wire stated it (floor = void-death line minY−64)', () => {
+  it('y floor is bound to the CURRENT DIMENSION when the wire stated it (void-death line minY−64); the ceiling is the legal world max, never build height', () => {
     assert.strictEqual(DEC.plausible(pkt({ y: 319 }), registry, overworld), null)
     assert.strictEqual(DEC.plausible(pkt({ y: -100 }), registry, overworld), null, 'below the floor but above the void-death line: an entity can be there')
     assert.match(DEC.plausible(pkt({ y: -129 }), registry, overworld), /y -129 below the dimension floor \(-128\)/)
-    assert.match(DEC.plausible(pkt({ y: 5000 }), registry, overworld), /y 5000 above the dimension ceiling \(320\)/)
-    assert.match(DEC.plausible(pkt({ y: 321 }), registry, overworld), /above the dimension ceiling/)
+    assert.match(DEC.plausible(pkt({ y: 5000 }), registry, overworld), /y 5000 above the legal world ceiling \(2032\)/)
+    // build height is not a clamp: meteor/aircraft/rocket mods spawn above y=320 and MC lets them
+    assert.strictEqual(DEC.plausible(pkt({ y: 321 }), registry, overworld), null, 'just above build height: a real entity can be there')
+    assert.strictEqual(DEC.plausible(pkt({ y: 1000 }), registry, overworld), null, 'far above build height: still a legal world y')
+    assert.match(DEC.plausible(pkt({ y: 2033 }), registry, overworld), /y 2033 above the legal world ceiling \(2032\)/)
   })
   it('unknown dimension → the widest LEGAL world (−2032..2032), never 3.2e7', () => {
     assert.strictEqual(DEC.plausible(pkt({ y: -2096 }), registry, null), null)
@@ -487,9 +493,9 @@ describe('D3 rider — plausibility gate law (a synthesized entity never comes f
     assert.strictEqual(spawns.length, 2)
     assert.deepStrictEqual(spawns.map((p) => [p.entityId, p.type, p.x, p.y, p.z]), [[145, 131, 29.5, 67, 36.5], [146, 130, 35.5, 67, 36.5]])
     assert.strictEqual(st.refused, 0); assert.strictEqual(st.parseErrors, 0); assert.strictEqual(st.loaderPayloads, 0, 'synth namespace is not a loader namespace')
-    // and the same red_merchant body at y = 5000 in the overworld is refused, counted, named
+    // and the same red_merchant body at y = 5000 (above the legal world max, not merely build height) is refused, counted, named
     c.emit('packet', { channel: 'synth:play', data: encodeSpawn(st.spec, { typeId: 131, entityId: 147, x: 29.5, y: 5000, z: 36.5, vel: [0, 0, 0] }) }, { name: 'custom_payload', state: 'play' })
-    assert.strictEqual(spawns.length, 2); assert.strictEqual(st.refused, 1); assert.match(st.lastRefusal, /above the dimension ceiling \(320\)/)
+    assert.strictEqual(spawns.length, 2); assert.strictEqual(st.refused, 1); assert.match(st.lastRefusal, /above the legal world ceiling \(2032\)/)
   })
 })
 

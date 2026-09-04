@@ -183,7 +183,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
  * The gate. Returns null when every field is plausible, else the reason.
  * @param {object} pkt vanilla spawn_entity-shaped packet
  * @param {Map|null} registry synced entity_type registry (id → name) when held
- * @param {{minY:number,height:number}|null} [bounds] the current dimension; null = widest legal world
+ * @param {{minY:number,height:number}|null} [bounds] the current dimension (sets the floor only; the ceiling is always the legal world max); null = widest legal world
  */
 function plausible (pkt, registry, bounds) {
   if (!Number.isInteger(pkt.entityId) || pkt.entityId <= 0 || pkt.entityId > INT32_MAX) return 'entity id not a positive int32'
@@ -200,9 +200,13 @@ function plausible (pkt, registry, bounds) {
   if (Math.abs(pkt.x) > HORIZONTAL_LIMIT) return 'x beyond the world border limit'
   if (Math.abs(pkt.z) > HORIZONTAL_LIMIT) return 'z beyond the world border limit'
   const floor = (bounds ? bounds.minY : LEGAL_MIN_Y) - VOID_MARGIN
-  const ceiling = bounds ? bounds.minY + bounds.height : LEGAL_MAX_Y
+  // Ceiling = the LEGAL world max, never the dimension's build height: Minecraft
+  // clamps nothing above minY+height (meteor / aircraft / rocket mods spawn well
+  // above y=320), so build height would be a real-entity false-refusal class;
+  // doubles landing in [320, 2032] buy ~nothing on the fuzz (rider 2, verify MED).
+  const ceiling = LEGAL_MAX_Y
   if (pkt.y < floor) return `y ${pkt.y} below the ${bounds ? 'dimension' : 'legal world'} floor (${floor})`
-  if (pkt.y > ceiling) return `y ${pkt.y} above the ${bounds ? 'dimension' : 'legal world'} ceiling (${ceiling})`
+  if (pkt.y > ceiling) return `y ${pkt.y} above the legal world ceiling (${ceiling})`
   const u = String(pkt.objectUUID || '')
   if (/^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(u)) return 'uuid is zero'
   if (!UUID_RE.test(u)) return 'uuid not RFC-4122 (version nibble / variant)'
