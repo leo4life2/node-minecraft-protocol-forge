@@ -29,7 +29,9 @@ const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js'
   'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js',
   'loginReplyBoundary.js', 'annotationRegistryDerivation.js', 'listenOnlyDerivation.js',
   // D3: the loader custom-spawn codec derivation + decoder (local loader jar only)
-  'loaderSpawnDerivation.js', 'loaderSpawnDecoder.js', 'neoForgeLoaderLocator.js']
+  'loaderSpawnDerivation.js', 'loaderSpawnDecoder.js', 'neoForgeLoaderLocator.js',
+  // D3 rider: dimension bounds from the wire (login/respawn/registry_data) for the plausibility gate
+  'worldBounds.js']
 const SRC = path.join(__dirname, '..', 'src', 'client')
 
 // build a synthetic mod that DOES derive, so the network-spy test exercises
@@ -312,7 +314,9 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
       const allowed = new Set(['fs', 'path', 'zlib', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation',
         './loginReplyBoundary', './annotationRegistryDerivation', './listenOnlyDerivation', './data/blockShapeTables.json',
         // D3: loader-spawn codec derivation (jar bytes → codec spec) + its decoder + the loader-jar locator (local fs walk)
-        './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator'])
+        './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator',
+        // D3 rider: the gate's dimension-bounds tracker (packet fields only, no requires)
+        './worldBounds'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

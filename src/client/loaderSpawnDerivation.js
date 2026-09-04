@@ -3,7 +3,8 @@
 // NeoForge `neoforge:advanced_add_entity`): the message a Forge-family server
 // ships INSTEAD of vanilla `spawn_entity` for every entity whose
 // getAddEntityPacket goes through NetworkHooks.getEntitySpawningPacket
-// (Moonlight/Supplementaries red_merchant + hat_stand on the D3 receipt rig).
+// (receipt reference: the two loader-spawned entities on the D3 rig,
+// scratchpad/d3-rig lanes/green — no mod name is an input to anything here).
 //
 // P2 (docs/MODDED-JOIN-DESIGN.md): the codec is a FACT OF THE JAR, never a
 // hand-written per-version table. Everything below is read out of the
@@ -60,7 +61,7 @@ const fs = require('fs')
 const debug = require('../../debug')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, cpUtf8, cpClassName, cpRef } = require('./jarAnalysis')
 
-const DERIVATION_SCHEMA = 1
+const DERIVATION_SCHEMA = 2 // 2: opaque tail SHAPE derived (length-prefixed / remainder) for exact byte accounting
 
 // Field-name → role vocabulary (loader-family source names, lowercased).
 const ROLE_NAMES = {
@@ -168,6 +169,22 @@ function classifyRead (ref) {
   }
 }
 
+// The wire SHAPE of an opaque-tail helper (Forge readSpawnDataPacket): a
+// varint length followed by a copy/slice bounded by exactly that many bytes
+// (`writeBytes(ByteBuf, int)` / `readBytes(int)` / `readSlice(int)`, javap
+// 1.19.2–1.21.1 + NeoForge 20.2) is 'length-prefixed' — the decoder can then
+// require the body to end exactly where the derived layout ends. Any other
+// body is 'unknown': no byte accounting is possible, the derivation abstains.
+function tailShapeOf (parsed, ref) {
+  const m = parsed.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
+  if (!m) return 'unknown'
+  const refs = rows(m.code, parsed.cp).filter(isInvoke).map((r) => r.ref)
+  const first = refs.find((r) => isBufferOwner(r.owner) && classifyRead(r))
+  if (!first || classifyRead(first) !== 'varint') return 'unknown'
+  const bounded = refs.some((r) => isBufferOwner(r.owner) && /^(readBytes|readSlice|readRetainedSlice|writeBytes)$/.test(r.name) && paramTypes(r.desc).slice(-1)[0] === 'I')
+  return bounded ? 'length-prefixed' : 'unknown'
+}
+
 // The ordered read sequence of a buffer-reading method plus the canonical
 // ctor it feeds (static decode form) — or direct putfields (ctor form).
 function readSequence (parsed, m) {
@@ -191,8 +208,10 @@ function readSequence (parsed, m) {
       continue
     }
     if (r.ref.owner === parsed.className && r.op === 0xb8 && paramTypes(r.ref.desc).some((t) => isBufferOwner(t.slice(1, -1)))) {
-      // a static helper taking the buffer (Forge readSpawnDataPacket): opaque tail
-      reads.push({ kind: 'opaque', via: r.ref.name })
+      // a static helper taking the buffer (Forge readSpawnDataPacket): opaque
+      // tail — its SHAPE is read out of the helper's own body so the decoder
+      // can account for every byte (D3 rider gate law)
+      reads.push({ kind: 'opaque', via: r.ref.name, tail: tailShapeOf(parsed, r.ref) })
       continue
     }
     const kind = classifyRead(r.ref)
@@ -314,7 +333,7 @@ function analyzeSpawnCandidate (parsed) {
     // reads feed the canonical ctor in order: count + JVM type per slot must agree
     const reads = seq.reads.slice()
     // the remaining buffer object itself handed over as the trailing parameter
-    if (params.length === reads.length + 1 && isBufferOwner(params[params.length - 1].slice(1, -1))) reads.push({ kind: 'opaque', via: 'buffer-tail' })
+    if (params.length === reads.length + 1 && isBufferOwner(params[params.length - 1].slice(1, -1))) reads.push({ kind: 'opaque', via: 'buffer-tail', tail: 'remainder' })
     const consumed = reads.filter((r) => r.kind !== 'opaque')
     if (consumed.length !== params.length && !(reads.length === params.length && reads[reads.length - 1].kind === 'opaque')) {
       return { className: parsed.className, error: `read/ctor arity mismatch (${reads.length} reads vs ${params.length} params)` }
@@ -332,13 +351,13 @@ function analyzeSpawnCandidate (parsed) {
         if (!ok) return { className: parsed.className, error: `read ${r.kind} (${jvm}) feeds ctor param ${p} at slot ${i}` }
       }
       const field = slotFields.get(slot) || null
-      fields.push({ kind: r.kind, field, role: field ? roleOf(field) : null, via: r.via || null })
+      fields.push({ kind: r.kind, field, role: field ? roleOf(field) : null, via: r.via || null, tail: r.tail || null })
       slot += (p === 'J' || p === 'D') ? 2 : 1
     }
   } else {
     fields = seq.reads.map((r, i) => {
       const f = seq.directFields.find((d) => d.at === i + 1)
-      return { kind: r.kind, field: f ? f.field : null, role: f ? roleOf(f.field) : null, via: r.via || null }
+      return { kind: r.kind, field: f ? f.field : null, role: f ? roleOf(f.field) : null, via: r.via || null, tail: r.tail || null }
     })
   }
   return classifyFields({ className: parsed.className, fields, readerMethod: reader.method, readerDesc: reader.desc, canonicalDesc: seq.canonical ? seq.canonical.desc : null })
@@ -354,6 +373,11 @@ function classifyFields (c) {
   // an opaque read anywhere but the tail makes the later fields unreachable
   const opaqueAt = fields.findIndex((f) => f.kind === 'opaque')
   if (opaqueAt !== -1 && opaqueAt !== fields.length - 1) return { className: c.className, error: 'opaque read before the last field' }
+  // D3 rider: an opaque tail whose wire shape cannot be read (neither the
+  // remaining buffer itself nor a varint-length-bounded copy) leaves the
+  // decoder unable to account for the body's bytes — a fact we cannot read
+  // is never guessed, so the class is not a usable spawn codec
+  if (kind === 'spawn' && opaqueAt !== -1 && fields[opaqueAt].tail !== 'remainder' && fields[opaqueAt].tail !== 'length-prefixed') return { className: c.className, error: `opaque tail shape underivable (${fields[opaqueAt].via || 'helper'} reads neither a varint-bounded copy nor the remaining buffer)` }
   return { ...c, kind }
 }
 
@@ -615,7 +639,7 @@ function deriveUncached (jarPath) {
     indexWidth: w.width,
     indexWidthSource: w.where,
     registrar: `${reg.registrar}.${reg.registrarMethod}`,
-    fields: s.fields.map((f) => ({ kind: f.kind, role: f.role, field: f.field })),
+    fields: s.fields.map((f) => (f.kind === 'opaque' ? { kind: f.kind, role: f.role, field: f.field, tail: f.tail } : { kind: f.kind, role: f.role, field: f.field })),
     companion: companions.length ? companions[0].className : null
   }
   debug(`loader spawn codec derived from ${jarPath}: ${spec.channel}#${spec.index} (${spec.indexWidth} index, ${spec.indexDerivation}) fields ${spec.fields.map((f) => `${f.role || f.field || '?'}:${f.kind}`).join(' ')}`)

@@ -36,6 +36,7 @@ module.exports = {
   listenOnlyDerivation: require('./src/client/listenOnlyDerivation'),
   loaderSpawnDerivation: require('./src/client/loaderSpawnDerivation'),
   loaderSpawnDecoder: require('./src/client/loaderSpawnDecoder'),
+  worldBounds: require('./src/client/worldBounds'),
   resolveForgeRegistryName,
   resolveForgeItemName,
   resolveForgeEntityName
