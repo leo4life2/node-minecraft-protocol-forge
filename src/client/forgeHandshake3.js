@@ -4,6 +4,7 @@ const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, javaStringHash } = require('./jarAnalysis')
 const { assessLoginChannel } = require('./loginAckDerivation')
 const { writeLoginReplyNow, writeLoginReplyDeferred } = require('./loginReplyBoundary')
+const { installLoaderSpawnDecoder } = require('./loaderSpawnDecoder')
 
 // FML3 login handshake (Forge for Minecraft 1.18 - 1.20.1, fmlNetworkVersion 3).
 //
@@ -1169,6 +1170,11 @@ module.exports = function (client, options) {
   // client in the set_protocol server address field
   client.tagHost = '\0FML3\0'
   debug('FML3 handshake handler installed')
+  // D3: the loader's own custom-spawn message (fml:play SpawnEntity) is
+  // decoded — codec derived from the local Forge universal jar — and
+  // re-emitted as vanilla spawn_entity so modded entities enter the world
+  // model typed; abstains (receipted) without a derivable jar.
+  installLoaderSpawnDecoder(client, options, { family: 'forge' })
 
   // remove nmp's default login_plugin_request listener, which would answer
   // everything with "not understood" and get us kicked

@@ -93,8 +93,60 @@ function pickNeoForgeLoaderJars (modsPaths, options = {}) {
   return { jars: [found.get(newest)], version: newest, matchedPreferred: false }
 }
 
+// --- Forge (net/minecraftforge/forge) — D3 loader-spawn codec derivation -----
+// Same trees, same walk, same laws. The Forge universal jar lives at
+// libraries/net/minecraftforge/forge/<mc>-<forge>/forge-<mc>-<forge>-universal.jar
+// (vanilla launcher, CurseForge Install/libraries, dedicated servers).
+
+/** Every forge universal jar reachable from the mods folder(s): Map<'<mc>-<forge>', jarPath>. */
+function collectForgeUniversalJars (modsPaths) {
+  const found = new Map()
+  for (const modsDir of modsPaths || []) {
+    let dir = path.resolve(modsDir)
+    for (let depth = 0; depth < 5; depth++) {
+      dir = path.dirname(dir)
+      for (const libRoot of [path.join(dir, 'libraries'), path.join(dir, 'Install', 'libraries')]) {
+        const root = path.join(libRoot, 'net', 'minecraftforge', 'forge')
+        let versions = []
+        try { versions = fs.readdirSync(root) } catch { continue }
+        for (const v of versions) {
+          if (found.has(v)) continue
+          const jar = path.join(root, v, `forge-${v}-universal.jar`)
+          if (fs.existsSync(jar)) found.set(v, jar)
+        }
+      }
+    }
+  }
+  return found
+}
+
+/**
+ * The Forge loader jar the spawn-codec derivation should read (0 or 1).
+ * Selection law: the exact build the server announced (`<mc>-<forge>` from
+ * the FML mod list, wire truth) when present locally; else the numerically
+ * newest local build FOR THE SAME MINECRAFT VERSION (a loader's built-in
+ * channel codec is a fact of the loader line, never borrowed across
+ * Minecraft versions — 1.20.1 fml:play#0/u8 vs 1.20.2+ forge:handshake#7/
+ * varint); else nothing (the caller abstains).
+ * @param {string[]} modsPaths
+ * @param {{mcVersion?: string|null, preferredVersion?: string|null}} options
+ */
+function pickForgeLoaderJars (modsPaths, options = {}) {
+  const preferred = options.preferredVersion || null
+  const mc = options.mcVersion || null
+  const found = collectForgeUniversalJars(modsPaths)
+  if (found.size === 0) return { jars: [], version: null, matchedPreferred: false }
+  if (preferred && found.has(preferred)) return { jars: [found.get(preferred)], version: preferred, matchedPreferred: true }
+  const sameMc = [...found.keys()].filter((v) => !mc || v.startsWith(`${mc}-`))
+  if (sameMc.length === 0) return { jars: [], version: null, matchedPreferred: false, foreignBuilds: [...found.keys()] }
+  const newest = sameMc.sort((a, b) => compareNeoForgeVersions(a.slice(a.indexOf('-') + 1), b.slice(b.indexOf('-') + 1))).pop()
+  return { jars: [found.get(newest)], version: newest, matchedPreferred: false }
+}
+
 module.exports = {
   collectNeoForgeUniversalJars,
   pickNeoForgeLoaderJars,
-  compareNeoForgeVersions
+  compareNeoForgeVersions,
+  collectForgeUniversalJars,
+  pickForgeLoaderJars
 }

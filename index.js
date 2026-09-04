@@ -34,6 +34,8 @@ module.exports = {
   deriveAckContracts: require('./src/client/neoForgePayloadDerivation').deriveAckContracts,
   annotationRegistryDerivation: require('./src/client/annotationRegistryDerivation'),
   listenOnlyDerivation: require('./src/client/listenOnlyDerivation'),
+  loaderSpawnDerivation: require('./src/client/loaderSpawnDerivation'),
+  loaderSpawnDecoder: require('./src/client/loaderSpawnDecoder'),
   resolveForgeRegistryName,
   resolveForgeItemName,
   resolveForgeEntityName

@@ -1,6 +1,7 @@
 const debug = require('debug')('minecraft-protocol-forge')
 const { readVarInt, writeVarInt, readString, writeString, readRegistryIdMap, SNAPSHOT_REGISTRIES } = require('./forgeHandshake3')
 const installTolerantPlayParser = require('./tolerantPlayParser')
+const { installLoaderSpawnDecoder } = require('./loaderSpawnDecoder')
 
 // Forge configuration-phase handshake (Minecraft 1.20.2+, protocol >= 764).
 //
@@ -122,6 +123,11 @@ module.exports = function (client, options) {
   // (no trailing separator, no version digit - unlike the older '\0FML3\0').
   client.tagHost = '\0FORGE'
   debug('Forge config-phase handshake handler installed')
+  // D3: Forge 1.20.2+ ships its SpawnEntity as forge:handshake message #7
+  // (varint index — the PLAY channel is built with HANDSHAKE_NAME, javap
+  // 48.1.0/49.1.0); decoded with the codec derived from the local Forge
+  // universal jar, re-emitted as vanilla spawn_entity; abstains receipted.
+  installLoaderSpawnDecoder(client, options, { family: 'forge' })
 
   function send (data) {
     client.write('custom_payload', { channel: 'forge:handshake', data })

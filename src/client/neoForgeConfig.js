@@ -572,6 +572,11 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
       : null
   }
   client.neoForgeConfig = state
+  // D3: NeoForge 1.20.5+ advanced_add_entity is a COMPANION payload (entityId
+  // + custom bytes next to vanilla add_entity — javap 20.4.237 / 21.1.248);
+  // the decoder derives that from the local universal jar and synthesizes
+  // nothing, receipting the classification (abstain when no jar).
+  try { require('./loaderSpawnDecoder').installLoaderSpawnDecoder(client, { modsPaths: options.modsPaths || options.jarPaths || [] }, { family: 'neoforge' }) } catch (err) { debug(`loader spawn decoder install failed: ${err.message}`) }
   if (state.modSync && state.modSync.unfinishableTasks.length > 0) {
     // Requirement-5 honesty: the jars prove the mod registers configuration
     // tasks this client cannot finish — the join may wedge on them, and the
