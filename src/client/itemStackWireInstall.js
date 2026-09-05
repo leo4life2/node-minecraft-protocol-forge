@@ -41,8 +41,65 @@ function compileFor (version, ext) {
     nbt.addTypesToCompiler('big', compiler)
     return compiler.compileProtoDefSync()
   }
-  const out = { toServer: build('toServer'), toClient: build('toClient'), slotName }
+  const out = {
+    toServer: build('toServer'),
+    toClient: build('toClient'),
+    slotName,
+    // the packet names (per direction) whose type tree reaches the slot type:
+    // the ONLY packets the fill/reconcile walks ever look at
+    slotPackets: { toServer: slotBearingPackets(protocol, 'toServer', slotName), toClient: slotBearingPackets(protocol, 'toClient', slotName) }
+  }
   compiled.set(key, out)
+  return out
+}
+
+// Derive, from the (extended) protocol JSON, the set of play packet names in
+// `direction` whose type tree transitively contains `slotName`. A protodef
+// type expression is either a bare string (a type reference) or
+// [typeName, args]; inside args only the `type`/`countType`/`default` values,
+// the values of a switch's `fields`, and an `option`'s bare argument are type
+// references - field NAMES (a `slot` varint field is not a `slot` item) and
+// compareTo/mappings strings are not, so the walk is structural, not textual.
+function slotBearingPackets (protocol, direction, slotName) {
+  const local = protocol.play[direction].types
+  const named = (n) => (Object.prototype.hasOwnProperty.call(local, n) ? local[n] : protocol.types[n])
+  const reach = new Map() // type name -> boolean (reaches slotName)
+  const TYPE_KEYS = new Set(['type', 'countType', 'default'])
+  const refs = (node, acc, isType) => {
+    if (typeof node === 'string') { if (isType) acc.add(node); return acc }
+    if (Array.isArray(node)) {
+      if (node.length === 2 && typeof node[0] === 'string') { acc.add(node[0]); return refs(node[1], acc, true) }
+      for (const v of node) refs(v, acc, false)
+      return acc
+    }
+    if (node && typeof node === 'object') {
+      for (const [k, v] of Object.entries(node)) {
+        if (TYPE_KEYS.has(k)) refs(v, acc, true)
+        else if (k === 'fields' && v && typeof v === 'object' && !Array.isArray(v)) for (const t of Object.values(v)) refs(t, acc, true)
+        else refs(v, acc, false)
+      }
+    }
+    return acc
+  }
+  const reaches = (name, seen) => {
+    if (name === slotName) return true
+    if (reach.has(name)) return reach.get(name)
+    if (seen.has(name)) return false
+    seen.add(name)
+    const def = named(name)
+    let hit = false
+    if (def !== undefined && def !== 'native') {
+      for (const r of refs(def, new Set(), true)) if (reaches(r, seen)) { hit = true; break }
+    }
+    reach.set(name, hit)
+    return hit
+  }
+  const out = new Set()
+  const mapper = local.packet && local.packet[1] && local.packet[1].find((f) => f.name === 'params')
+  const cases = mapper && mapper.type && mapper.type[1] && mapper.type[1].fields
+  for (const [packetName, typeName] of Object.entries(cases || {})) {
+    if (reaches(typeName, new Set())) out.add(packetName)
+  }
   return out
 }
 
@@ -73,7 +130,7 @@ function reconcileIncoming (value, fields, depth = 0) {
 function installItemStackWireExtension (client, ext, { log = debug } = {}) {
   if (!client || !ext) return { installed: false, reason: 'no-extension' }
   if (client.minepalItemStackWire) return client.minepalItemStackWire
-  const receipt = { installed: false, ext, version: client.version, swaps: 0 }
+  const receipt = { installed: false, ext, version: client.version, swaps: 0, walks: { outgoing: 0, incoming: 0 } }
   client.minepalItemStackWire = receipt
   let protos
   try { protos = compileFor(client.version, ext) } catch (err) {
@@ -98,10 +155,19 @@ function installItemStackWireExtension (client, ext, { log = debug } = {}) {
   }
   client.on('state', swap)
   swap()
+  // Only slot-bearing packets (derived at compile time from the protocol) are
+  // walked; keep_alive / position / chat ... pass through untouched.
+  const { toServer: slotOut, toClient: slotIn } = protos.slotPackets
+  receipt.slotPackets = { toServer: slotOut.size, toClient: slotIn.size }
   const write = client.write.bind(client)
-  client.write = (name, params) => write(name, client.state === 'play' ? fillOutgoing(params, ext.fields) : params)
-  client.on('packet', (data, meta) => { if (meta && meta.state === 'play') reconcileIncoming(data, ext.fields) })
+  client.write = (name, params) => {
+    if (client.state === 'play' && slotOut.has(name)) { receipt.walks.outgoing += 1; params = fillOutgoing(params, ext.fields) }
+    return write(name, params)
+  }
+  client.on('packet', (data, meta) => {
+    if (meta && meta.state === 'play' && slotIn.has(meta.name)) { receipt.walks.incoming += 1; reconcileIncoming(data, ext.fields) }
+  })
   return receipt
 }
 
-module.exports = { installItemStackWireExtension, compileFor, fillOutgoing, reconcileIncoming }
+module.exports = { installItemStackWireExtension, compileFor, fillOutgoing, reconcileIncoming, slotBearingPackets }

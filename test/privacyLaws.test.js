@@ -36,7 +36,9 @@ const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js'
   // + its FriendlyByteBuf primitives, shared by the Forge and Fabric lanes
   'owoHandshake.js', 'loginBytes.js',
   // HF35 r2: ItemStack wire-shape derivation (mixin annotations + bytecode walk, local jars only)
-  'itemStackWireDerivation.js']
+  'itemStackWireDerivation.js',
+  // HF35 rider: the derived slot extension installed into the compiled play protocol (protodef compile only; no fs/net)
+  'itemStackWireInstall.js']
 const SRC = path.join(__dirname, '..', 'src', 'client')
 
 // build a synthetic mod that DOES derive, so the network-spy test exercises
@@ -323,7 +325,10 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // D3 rider: the gate's dimension-bounds tracker (packet fields only, no requires)
         './worldBounds',
         // HF35: owo handshake derivation + login byte primitives (local jar parse only)
-        './owoHandshake', './loginBytes'])
+        './owoHandshake', './loginBytes',
+        // HF35 rider: itemStackWireInstall compiles the extended slot into nmp's play protocol - protocol data +
+        // the protodef compiler + nmp's datatype table + prismarine-nbt are local, pure-parsing dependencies
+        './itemStackWireDerivation', 'minecraft-data', 'protodef', 'prismarine-nbt', 'minecraft-protocol/src/datatypes/compiler-minecraft'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

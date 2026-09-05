@@ -36,8 +36,10 @@ const { writeVarInt, writeString } = require('./loginBytes')
 //   server's own and every value must equal the server's hash, else the login
 //   is rejected ("client is missing channels/controllers: ..." / "channels
 //   with mismatched hashes: ..."). The third map only feeds
-//   filterOptionalServices, which never rejects - so the server's advertised
-//   optional map is echoed back verbatim and matches by construction.
+//   filterOptionalServices, which never rejects. syncClient (javap ~:101-109)
+//   ALWAYS writes the client's OWN OwoNetChannel.OPTIONAL_CHANNELS there - it
+//   never echoes the request bytes - so the reply carries our optional
+//   fingerprints (the server intersects them with its own; no kick either way).
 //
 // The required hashes are content fingerprints of the owning mod's registered
 // packet records and particle systems:
@@ -405,21 +407,22 @@ function owoFingerprintsFor (options) {
 // vanilla not-understood response - which is correct for non-gating queries
 // like fabric_networking_api_v1:early_registration.
 const RAW_LOGIN_PROTOCOLS = {
-  // owo:handshake reply (layout above): required-channel hashes and controller
-  // hashes derived from the modpack jars, then the request payload - the
-  // server's own optional-channel hash map - echoed back verbatim (it is the
-  // one map the server does advertise, and echoing it always matches).
-  'owo:handshake': (data, options) => buildReply(owoFingerprintsFor(options), data)
+  // owo:handshake reply (layout above): required-channel hashes, controller
+  // hashes and optional-channel hashes, ALL derived from the modpack jars. The
+  // request payload (the server's optional map) is not part of the reply -
+  // syncClient writes the client's own OPTIONAL_CHANNELS, never an echo.
+  'owo:handshake': (data, options) => buildReply(owoFingerprintsFor(options))
 }
 
 // The ONE reply layout (both entries above build through it): required-channel
-// hash map, controller hash map, then the request payload echoed verbatim
-// (falls back to our own optional map only when the server sent none).
-function buildReply (fingerprints, data) {
+// hash map, controller hash map, then OUR optional-channel hash map - exactly
+// the three writeHashes calls of OwoHandshake#syncClient. Takes only the
+// fingerprints: the request bytes never influence the reply.
+function buildReply (fingerprints) {
   return Buffer.concat([
     encodeIdHashMap(fingerprints.channels),
     encodeIdHashMap(fingerprints.controllers),
-    data && data.length > 0 ? data : encodeIdHashMap(fingerprints.optional)
+    encodeIdHashMap(fingerprints.optional)
   ])
 }
 
@@ -444,7 +447,7 @@ function assess (data, options) {
   }
   const counts = (m) => Object.keys(m || {}).length
   return {
-    data: buildReply(fingerprints, data),
+    data: buildReply(fingerprints),
     sources,
     derived: { channels: counts(fingerprints.channels), controllers: counts(fingerprints.controllers), optional: counts(fingerprints.optional), channelIds: Object.keys(fingerprints.channels), controllerIds: Object.keys(fingerprints.controllers) }
   }

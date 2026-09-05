@@ -75,4 +75,50 @@ describe('HF35 r2 - ItemStack wire-shape derivation', function () {
     assert.ok(logs.some((l) => /DesyncFixin/.test(l)))
     assert.strictEqual(installItemStackWireExtension(client, ext), receipt, 'idempotent')
   })
+
+  // HF35 rider (verify-r2 MED-2): the fill/reconcile walks are gated on the
+  // slot-bearing packet set derived from the protocol at compile time
+  it('derives the slot-bearing packet set structurally (type refs only; a `slot` FIELD NAME is not a slot item)', () => {
+    const { ext } = scanItemStackWireExtensions([STACC])
+    const p = compileFor('1.20.1', ext)
+    assert.deepStrictEqual([...p.slotPackets.toServer].sort(), ['set_creative_slot', 'window_click'])
+    assert.deepStrictEqual([...p.slotPackets.toClient].sort(), ['advancements', 'declare_recipes', 'entity_equipment', 'entity_metadata', 'set_slot', 'trade_list', 'window_items', 'world_particles'])
+    for (const n of ['pick_item', 'held_item_slot', 'keep_alive', 'position', 'chat_message']) {
+      assert.ok(!p.slotPackets.toServer.has(n) && !p.slotPackets.toClient.has(n), `${n} must not be walked`)
+    }
+  })
+  it('walks ONLY slot-bearing packets in both directions (keep_alive/position/chat never enter the walk)', () => {
+    const { ext } = scanItemStackWireExtensions([STACC])
+    const EventEmitter = require('events')
+    const mc = require('minecraft-protocol')
+    const client = new EventEmitter()
+    client.version = '1.20.1'; client.state = 'play'
+    client.serializer = mc.createSerializer({ state: 'play', isServer: false, version: '1.20.1' })
+    client.deserializer = mc.createDeserializer({ state: 'play', isServer: false, version: '1.20.1' })
+    const seen = []
+    client.write = (name, params) => seen.push({ name, params })
+    const receipt = installItemStackWireExtension(client, ext, { log: () => {} })
+    assert.strictEqual(receipt.installed, true)
+    assert.deepStrictEqual(receipt.slotPackets, { toServer: 2, toClient: 8 })
+    const ka = { keepAliveId: 42 }
+    client.write('keep_alive', ka)
+    client.write('position', { x: 1, y: 2, z: 3, onGround: true })
+    client.write('chat_message', { message: 'hi', timestamp: 0n, salt: 0n, offset: 0, acknowledged: Buffer.alloc(3) })
+    assert.deepStrictEqual(receipt.walks, { outgoing: 0, incoming: 0 })
+    assert.strictEqual(seen[0].params, ka, 'slot-free params pass through by identity')
+    client.write('set_creative_slot', { slot: 36, item: { present: true, itemId: 1, itemCount: 3 } })
+    assert.strictEqual(receipt.walks.outgoing, 1)
+    assert.strictEqual(seen[3].params.item.itemStackWire0, 3)
+    client.emit('packet', { keepAliveId: 42 }, { state: 'play', name: 'keep_alive' })
+    client.emit('packet', { x: 0, y: 0, z: 0 }, { state: 'play', name: 'position' })
+    assert.strictEqual(receipt.walks.incoming, 0)
+    const wi = { windowId: 0, stateId: 1, items: [{ present: true, itemId: 5, itemCount: -56, itemStackWire0: 200 }], carriedItem: { present: false } }
+    client.emit('packet', wi, { state: 'play', name: 'window_items' })
+    assert.strictEqual(receipt.walks.incoming, 1)
+    assert.strictEqual(wi.items[0].itemCount, 200)
+    // login-state traffic is never walked either
+    client.state = 'login'
+    client.write('set_creative_slot', { slot: 1, item: { present: true, itemId: 1, itemCount: 1 } })
+    assert.strictEqual(receipt.walks.outgoing, 1)
+  })
 })
