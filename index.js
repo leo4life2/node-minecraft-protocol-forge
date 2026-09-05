@@ -24,6 +24,10 @@ module.exports = {
   forgeHandshake: require('./src/client/forgeHandshake'),
   forgeHandshake2: require('./src/client/forgeHandshake2'),
   forgeHandshake3: require('./src/client/forgeHandshake3'),
+  owoHandshake: require('./src/client/owoHandshake'),
+  loginBytes: require('./src/client/loginBytes'),
+  // HF35 r2: jar-derived ItemStack wire-shape extensions (derivation + installer)
+  itemStackWire: { ...require('./src/client/itemStackWireDerivation'), ...require('./src/client/itemStackWireInstall') },
   forgeHandshakeConfig: require('./src/client/forgeHandshakeConfig'),
   autoVersionForge: require('./src/client/autoVersionForge'),
   decodeOptimized: require('./src/client/decodeOptimized'),

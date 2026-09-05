@@ -31,7 +31,12 @@ const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js'
   // D3: the loader custom-spawn codec derivation + decoder (local loader jar only)
   'loaderSpawnDerivation.js', 'loaderSpawnDecoder.js', 'neoForgeLoaderLocator.js',
   // D3 rider: dimension bounds from the wire (login/respawn/registry_data) for the plausibility gate
-  'worldBounds.js']
+  'worldBounds.js',
+  // HF35: the owo-lib login handshake derivation (jar bytes -> channel/controller fingerprints)
+  // + its FriendlyByteBuf primitives, shared by the Forge and Fabric lanes
+  'owoHandshake.js', 'loginBytes.js',
+  // HF35 r2: ItemStack wire-shape derivation (mixin annotations + bytecode walk, local jars only)
+  'itemStackWireDerivation.js']
 const SRC = path.join(__dirname, '..', 'src', 'client')
 
 // build a synthetic mod that DOES derive, so the network-spy test exercises
@@ -316,7 +321,9 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // D3: loader-spawn codec derivation (jar bytes → codec spec) + its decoder + the loader-jar locator (local fs walk)
         './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator',
         // D3 rider: the gate's dimension-bounds tracker (packet fields only, no requires)
-        './worldBounds'])
+        './worldBounds',
+        // HF35: owo handshake derivation + login byte primitives (local jar parse only)
+        './owoHandshake', './loginBytes'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

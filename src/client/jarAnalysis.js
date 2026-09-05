@@ -113,7 +113,12 @@ function parseClassFile (b) {
   // written against an interface/abstract ancestor DECLARING the target.
   const methods = []
   for (const m of readMembers()) {
-    methods.push({ name: m.name, desc: m.desc, flags: m.flags })
+    // HF35: the offset of the member's RuntimeVisibleAnnotations table (data
+    // start), so a mixin-injection walk can read @Inject/@ModifyArg lazily via
+    // readAnnotationsAttr(b, annotationsAt, cp, { rich: true }).
+    const ann = m.attrs.find((a) => a.name === 'RuntimeVisibleAnnotations')
+    const inv = m.attrs.find((a) => a.name === 'RuntimeInvisibleAnnotations')
+    methods.push({ name: m.name, desc: m.desc, flags: m.flags, annotationsAt: ann ? ann.start : null, invisibleAnnotationsAt: inv ? inv.start : null })
     const code = m.attrs.find((a) => a.name === 'Code')
     if (!code) continue
     const codeLen = b.readUInt32BE(code.start + 4)
@@ -126,6 +131,8 @@ function parseClassFile (b) {
   // annotation data is class-file DATA, nothing is reflected or executed).
   let bootstrapMethods = null
   let annotations = null
+  let classAnnotationsAt = null
+  let classInvisibleAnnotationsAt = null
   if (o + 2 <= b.length) {
     const attrCount = b.readUInt16BE(o); o += 2
     for (let a = 0; a < attrCount; a++) {
@@ -146,12 +153,16 @@ function parseClassFile (b) {
           p += 4 + argc * 2
         }
       } else if (name === 'RuntimeVisibleAnnotations') {
+        classAnnotationsAt = o + 6
         try { annotations = readAnnotationsAttr(b, o + 6, cp) } catch { annotations = null }
+      } else if (name === 'RuntimeInvisibleAnnotations') {
+        // CLASS-retention annotations (e.g. @Mixin) live here, not in the visible table
+        classInvisibleAnnotationsAt = o + 6
       }
       o += 6 + len
     }
   }
-  return { className, superName, interfaces, cp, codes, methods, fields, bootstrapMethods, annotations }
+  return { className, superName, interfaces, cp, codes, methods, fields, bootstrapMethods, annotations, classAnnotationsAt, classInvisibleAnnotationsAt, bytes: b }
 }
 
 // --- RuntimeVisibleAnnotations reader (JVMS 4.7.16) ------------------------
@@ -160,7 +171,10 @@ function parseClassFile (b) {
 //   a string for 's', an array for '[', and null for tags we do not model
 //   (numeric consts, class refs, nested annotations — skipped structurally,
 //   never mis-read). Defensive: any structural surprise aborts to null.
-function readAnnotationsAttr (b, start, cp) {
+// `rich` (HF35): model class refs ('c' -> the descriptor string) and nested
+// annotations ('@' -> {type, elements}) instead of null — the mixin-target walk
+// (itemStackWireDerivation) reads @Mixin(value=[...]) and @Inject(at=[@At(...)]).
+function readAnnotationsAttr (b, start, cp, { rich = false } = {}) {
   const n = b.readUInt16BE(start)
   let p = start + 2
   const out = []
@@ -177,7 +191,12 @@ function readAnnotationsAttr (b, start, cp) {
         const v = cpUtf8(cp, b.readUInt16BE(p)); p += 2
         return v
       }
-      case 'B': case 'C': case 'D': case 'F': case 'I': case 'J': case 'S': case 'Z': case 'c':
+      case 'c': {
+        const v = rich ? cpUtf8(cp, b.readUInt16BE(p)) : null
+        p += 2
+        return v
+      }
+      case 'B': case 'C': case 'D': case 'F': case 'I': case 'J': case 'S': case 'Z':
         p += 2
         return null
       case '[': {
@@ -187,8 +206,8 @@ function readAnnotationsAttr (b, start, cp) {
         return arr
       }
       case '@': {
-        readAnnotation() // nested: structurally consumed, value not modeled
-        return null
+        const nested = readAnnotation() // nested: structurally consumed; modeled only when rich
+        return rich ? nested : null
       }
       default:
         throw new Error(`element_value tag ${tag}`)
@@ -325,6 +344,7 @@ function javaStringHash (s) {
 }
 
 module.exports = {
+  readAnnotationsAttr,
   zipCentralEntries,
   zipEntryData,
   parseClassFile,
