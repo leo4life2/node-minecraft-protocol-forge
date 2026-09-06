@@ -320,8 +320,19 @@ function resolveFieldDeclarer (index, owner, name, desc, seen = new Set()) {
   return resolveFieldDeclarer(index, info.superName, name, desc, seen)
 }
 
+// HF16-R rider — the ONE key both sides of a static use: javac qualifies an
+// inherited static written from a subclass body by the SUBCLASS (JLS 13.1),
+// so a putstatic keyed by its constant-pool owner never met a getstatic that
+// resolved to the declarer. Unknown classes fall back to the use-site owner.
+function staticFieldDeclarer (index, ref) {
+  return resolveFieldDeclarer(index, ref.owner, ref.name, ref.desc) || ref.owner
+}
+function staticFieldKey (index, ref) {
+  return `${staticFieldDeclarer(index, ref)}.${ref.name}`
+}
+
 function lookupStaticField (index, val, state) {
-  const declarer = resolveFieldDeclarer(index, val.owner, val.name, val.desc) || val.owner
+  const declarer = staticFieldDeclarer(index, val)
   const key = `${declarer}.${val.name}`
   if (!(key in state.fieldValues)) resolveClassTypeFields(index, declarer, state)
   return state.fieldValues[key]
@@ -440,11 +451,11 @@ function simulate (index, classInfo, method, state, opts = {}) {
         else push({ k: 'field', owner: ref.owner, name: ref.name, desc: ref.desc })
         break
       }
-      case 0xb3: { // putstatic
+      case 0xb3: { // putstatic — keyed by the DECLARER, symmetric with getstatic (HF16-R rider)
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         const val = stack.pop()
         if (ref && val && opts.recordPutstatic) {
-          state.fieldValues[`${ref.owner}.${ref.name}`] = val
+          state.fieldValues[staticFieldKey(index, ref)] = val
         }
         break
       }
@@ -1468,10 +1479,10 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
         else push({ k: 'field', owner: ref.owner, name: ref.name, desc: ref.desc })
         break
       }
-      case 0xb3: { // putstatic
+      case 0xb3: { // putstatic — keyed by the DECLARER, symmetric with getstatic (HF16-R rider)
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         const val = stack.pop()
-        if (ref && val && opts.recordPutstatic) state.fieldValues[`${ref.owner}.${ref.name}`] = val
+        if (ref && val && opts.recordPutstatic) state.fieldValues[staticFieldKey(index, ref)] = val
         break
       }
       case 0xb4: { // getfield — construction-bound objects read real values
@@ -1726,7 +1737,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
           if (op2 === 0xb3) {
             const fref = cpRef(cp2, code2.readUInt16BE(pc2 + 1))
             if (fref && fref.owner === ref.owner && fref.desc === `L${ref.owner};`) {
-              const v = state.fieldValues[`${fref.owner}.${fref.name}`]
+              const v = state.fieldValues[staticFieldKey(index, fref)]
               items.push(v ?? UNKNOWN)
             }
           }
