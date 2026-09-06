@@ -1,6 +1,6 @@
 const debug = require('debug')('minecraft-protocol-forge')
 const { assessLoginChannel } = require('./loginAckDerivation')
-const { writeLoginReplyNow, writeLoginReplyDeferred } = require('./loginReplyBoundary')
+const { writeLoginReplyNow, writeLoginReplyDeferred, registerLoginQuery } = require('./loginReplyBoundary')
 const { installLoaderSpawnDecoder } = require('./loaderSpawnDecoder')
 
 // FML3 login handshake (Forge for Minecraft 1.18 - 1.20.1, fmlNetworkVersion 3).
@@ -399,7 +399,53 @@ function announcedChannelAttribution (client, options, channel) {
   if (!announcedChannel && ownerMod == null) return null
   return { channel, announcedChannel, ownerMod, ownerVersion: ownerMod != null ? (mods.get(ownerMod) ?? null) : null }
 }
-function resolveWrappedModLogin (client, channel, disc, body, options) {
+// HF36 — era-aware honest answer for a channel whose ack cannot be proven.
+// FML3+ (1.18+): the vanilla not-understood decline (HF8/HF13) — the server
+// tolerates it for messages registered without needsResponse. FML2 (Forge
+// 1.13-1.16, fml:loginwrapper with fmlNetworkVersion 2): the decline is a
+// DETERMINISTIC kick — FMLLoginWrapper.wrapperReceived routes a null payload
+// to fml:handshake, IndexedMessageCodec.consume(null) logs "Received empty
+// payload" and never marks the packet handled, NetworkHooks.onCustomPayload
+// returns false, ServerLoginNetHandler disconnects with
+// multiplayer.disconnect.unexpected_query_response (rig receipt, HF36); and
+// tickServer adds EVERY login message to sentMessages (no needsResponse
+// tolerance on this era). The only join-viable shape there is the FML
+// convention acknowledgement (index 99) on the originating channel: a
+// guess the server judges (a message registered at 99 continues the login;
+// otherwise "Received invalid discriminator byte 99" kicks) — never worse
+// than the certain kick, and receipted as the guess it is.
+function conventionAckOnFml2 (client, channel, assessed, attribution, acquisition) {
+  const owner = attribution && attribution.ownerMod
+    ? ` (the server announced this channel belongs to mod "${attribution.ownerMod}"${attribution.ownerVersion ? ` @ ${attribution.ownerVersion}` : ''})`
+    : ''
+  const message = `Answering the modded login check on channel "${channel}"${owner} with the FML convention acknowledgement (index 99) — a guess: ` +
+    'no provable acknowledgement reply exists in the local mod jars, and this Forge 1.13-1.16 (FML2) server cannot accept the ' +
+    'protocol\'s not-understood decline (its login wrapper routes an empty reply to fml:handshake and kicks it as unexpected_query_response), ' +
+    'so the decline would be a certain kick. The server now decides: a mod whose login message is registered at index 99 continues the login; ' +
+    'otherwise it kicks with its own message. Pointing MinePal at the server\'s own modpack instance (its mods folder) gives the derivation the jars it needs for a real answer.'
+  console.warn(`[forge] ${message}`)
+  const receipt = {
+    channel,
+    era: 'fml2',
+    verdict: assessed ? assessed.verdict : 'unknown',
+    reason: assessed ? assessed.reason : 'uncorroborated-by-local-jars',
+    evidence: assessed ? assessed.evidence : null,
+    ownerMod: attribution ? attribution.ownerMod : null,
+    ownerVersion: attribution ? attribution.ownerVersion : null,
+    announcedChannel: attribution ? attribution.announcedChannel : null,
+    acquisition: acquisition || null
+  }
+  if (client) {
+    if (!Array.isArray(client.forgeGuessedLoginAcks)) client.forgeGuessedLoginAcks = []
+    client.forgeGuessedLoginAcks.push(receipt)
+    try { client.emit('forgeLoginGuessed', receipt) } catch { /* receipts never break the path */ }
+  }
+  return { conventionAck: true, era: 'fml2', assessed: assessed || { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution, acquisition } }
+}
+
+function isFml2Era (era) { return era === 'fml2' || era === 2 }
+
+function resolveWrappedModLogin (client, channel, disc, body, options, era) {
   if (WRAPPED_LOGIN_PROTOCOLS[channel]) {
     try {
       const reply = WRAPPED_LOGIN_PROTOCOLS[channel](disc, body)
@@ -452,6 +498,7 @@ function resolveWrappedModLogin (client, channel, disc, body, options) {
     // protocol's own "not understood" decline and let the server decide
     // (HF8; primary sources in the header above). The caller writes the
     // empty login_plugin_response; this records the receipt.
+    if (isFml2Era(era)) return conventionAckOnFml2(client, channel, assessed, announcedChannelAttribution(client, options, channel), null)
     declineWrappedLoginHonestly(client, channel, assessed)
     return { declined: true, assessed }
   }
@@ -483,8 +530,9 @@ function resolveWrappedModLogin (client, channel, disc, body, options) {
     // the same guard with a receipt (never a stream-corrupting late write).
     const acq = options && options.announcedModAcquisition
     if (acq && typeof acq.acquire === 'function' && attribution.ownerMod && isAcquirableVersion(attribution.ownerVersion)) {
-      return { pending: acquireThenResolve(client, channel, options, attribution, acq) }
+      return { pending: acquireThenResolve(client, channel, options, attribution, acq, era) }
     }
+    if (isFml2Era(era)) return conventionAckOnFml2(client, channel, null, attribution, null)
     declineUncorroboratedLogin(client, channel, attribution)
     return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution } }
   }
@@ -529,7 +577,7 @@ function acquisitionOutcomeWords (outcome) {
 // synchronous ladder does (same assessLoginChannel, same dispatch shapes).
 // Resolves to { reply, via } | { declined: true } | { failed: true } |
 // { silent: true } (the deadline law ended the connection) — never null.
-async function acquireThenResolve (client, channel, options, attribution, acq) {
+async function acquireThenResolve (client, channel, options, attribution, acq, era) {
   const modId = attribution.ownerMod
   const version = String(attribution.ownerVersion)
   const budgetMs = Number.isFinite(acq.budgetMs) ? acq.budgetMs : 18000
@@ -574,6 +622,7 @@ async function acquireThenResolve (client, channel, options, attribution, acq) {
         failWrappedLoginHonestly(client, channel, Object.assign({}, assessed, { acquisition }))
         return { failed: true }
       }
+      if (isFml2Era(era)) return Object.assign(conventionAckOnFml2(client, channel, Object.assign({}, assessed, { acquisition }), attribution, acquisition), { acquired: true })
       declineWrappedLoginHonestly(client, channel, Object.assign({}, assessed, { acquisition }))
       return { declined: true, assessed, acquired: true }
     }
@@ -608,6 +657,7 @@ async function acquireThenResolve (client, channel, options, attribution, acq) {
     try { if (typeof client.end === 'function') client.end('announced mod acquisition in progress') } catch (err) { debug(`ending the connection failed (${err.message})`) }
     return { silent: true }
   }
+  if (isFml2Era(era)) return Object.assign(conventionAckOnFml2(client, channel, null, attribution, acquisition), { acquired: true })
   declineUncorroboratedLogin(client, channel, attribution, acquisition)
   return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution, acquisition }, acquired: true }
 }
@@ -750,6 +800,9 @@ module.exports = function (client, options) {
   }
 
   client.on('login_plugin_request', (packet) => {
+    // HF36: every query is owed exactly one reply — register it before any
+    // organ computes an answer (the boundary drops strays and duplicates)
+    registerLoginQuery(client, packet.messageId, { channel: packet.channel })
     if (packet.channel !== 'fml:loginwrapper') {
       // a mod talking on its own raw login channel (Fabric login networking,
       // possibly through Connector): answer it if we speak its protocol
@@ -792,6 +845,12 @@ module.exports = function (client, options) {
         // (acquired) resolution — the same three shapes, the same writes.
         const dispatch = (resolved, late) => {
           if (resolved && (resolved.failed || resolved.silent)) return true // honest join stop / deadline-law self-end — nothing to write
+          if (resolved && resolved.conventionAck) {
+            // HF36: the FML2-only shape (never produced for this era's
+            // ladder; kept symmetric so one rule covers both responders)
+            respond(messageId, wrapLoginPayload(channel, encodeAcknowledgement()), { channel, kind: 'convention ack (FML2 decline unacceptable)' })
+            return true
+          }
           if (resolved && resolved.declined) {
             // HF8: vanilla "not understood" — messageId with NO data encodes
             // successful=false (byte-identical to the reference client's

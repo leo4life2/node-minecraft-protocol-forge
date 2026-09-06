@@ -8,7 +8,7 @@ const { resolveWrappedModLogin, wrapLoginPayload, encodeAcknowledgement, readVar
 // lockstep replies write synchronously through the guard; wrapped-mod-channel
 // replies (the fire-and-forget-capable class) defer one event-loop turn and
 // are dropped with a receipt when the negotiation is observably over.
-const { writeLoginReplyNow, writeLoginReplyDeferred } = require('./loginReplyBoundary')
+const { writeLoginReplyNow, writeLoginReplyDeferred, registerLoginQuery } = require('./loginReplyBoundary')
 
 // Channels
 const FML_CHANNELS = {
@@ -99,6 +99,9 @@ module.exports = function (client, options) {
   client.removeListener('login_plugin_request', nmplistener)
 
   client.on('login_plugin_request', (data) => {
+    // HF36: every query is owed exactly one reply — register it before any
+    // organ computes an answer (the boundary drops strays and duplicates)
+    registerLoginQuery(client, data.messageId, { channel: data.channel })
     if (data.channel === 'fml:loginwrapper') {
       // parse buffer
       const { data: loginwrapper } = proto.parsePacketBuffer(
@@ -258,8 +261,22 @@ module.exports = function (client, options) {
             const messageId = data.messageId
             // same dispatch shapes as FML3 (one rule for the class), for both
             // the synchronous ladder and the HF23 deferred (acquired) rung
+            const conventionAck = (kind) => writeLoginReplyDeferred(client, { messageId, data: wrapLoginPayload(channel, encodeAcknowledgement()) }, { channel, kind })
             const dispatch = (resolved, late) => {
               if (resolved && (resolved.failed || resolved.silent)) return true // honest join stop / deadline-law self-end — no guessed bytes
+              if (resolved && resolved.conventionAck) {
+                // HF36: FML2 (Forge 1.13-1.16) cannot accept the vanilla
+                // decline — FMLLoginWrapper routes a null payload to
+                // fml:handshake, IndexedMessageCodec.consume(null) never
+                // marks it handled, the server kicks
+                // unexpected_query_response deterministically. The ladder
+                // therefore never returns {declined} for this era: the
+                // convention acknowledgement (index 99) on the originating
+                // channel is the only join-viable shape, receipted as the
+                // guess it is (resolveWrappedModLogin, era 'fml2').
+                conventionAck(resolved.acquired ? 'convention ack (FML2 decline unacceptable, after acquisition)' : 'convention ack (FML2 decline unacceptable)')
+                return true
+              }
               if (resolved && resolved.declined) {
                 // HF8: protocol-correct not-understood decline — messageId
                 // with NO data (successful=false), same law as FML3.
@@ -272,17 +289,19 @@ module.exports = function (client, options) {
                 return true
               }
               if (late) {
-                writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition fallback)' })
+                // by construction the deferred rung never resolves null;
+                // belt: the FML2-legal shape (never a decline on this era)
+                conventionAck('convention ack (acquisition fallback)')
                 return true
               }
               return false
             }
-            const resolved = resolveWrappedModLogin(client, channel, disc.value, loginwrapper.data.slice(disc.size), options)
+            const resolved = resolveWrappedModLogin(client, channel, disc.value, loginwrapper.data.slice(disc.size), options, 'fml2')
             if (resolved && resolved.pending) {
               // HF23: deferred behind the announced-mod acquisition (see FML3)
               resolved.pending.then((late) => dispatch(late, true)).catch((err) => {
-                console.warn(`[forge] announced-mod acquisition for ${channel} threw (${err && err.message}) — answering with the protocol's not-understood decline`)
-                writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition error)' })
+                console.warn(`[forge] announced-mod acquisition for ${channel} threw (${err && err.message}) — answering with the FML convention acknowledgement (FML2 cannot accept a decline)`)
+                conventionAck('convention ack (acquisition error)')
               })
               break
             }

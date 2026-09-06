@@ -107,8 +107,66 @@ function writeLoginReplyNow (client, params, context) {
     dropWithReceipt(client, params, context, why)
     return false
   }
+  const ledgerWhy = ledgerVerdict(client, params, context)
+  if (ledgerWhy) {
+    dropWithLedgerReceipt(client, params, context, ledgerWhy)
+    return false
+  }
   client.write('login_plugin_response', params)
   return true
+}
+
+// HF36 — THE PENDING-TRANSACTION LEDGER (P4: a login_plugin_response carries
+// exactly the transaction id of the query it answers, once).
+//
+// Every login query the rails receive is registered here BEFORE any organ
+// (lockstep round, table reply, jar-derived ack, HF8/HF13 decline, HF23
+// acquisition rung, convention ack, raw-channel reply) computes an answer,
+// and every reply passes this single write site. The ledger is the one
+// place that knows which ids are still owed: a reply for an id nobody
+// asked (unknown transaction), or for an id already answered (a second
+// organ, a late acquisition rung racing the synchronous ladder, a retry
+// after an exception), is dropped with a receipt instead of reaching the
+// wire — vanilla and every FML era kick a stray answer as
+// multiplayer.disconnect.unexpected_query_response, so the ONLY safe
+// number of replies per id is one. Fail-open by construction: a client no
+// rail registered queries on (an embedder writing through this boundary
+// on its own) has no ledger and keeps the pre-HF36 behavior.
+function registerLoginQuery (client, messageId, context) {
+  if (!client || !Number.isInteger(messageId)) return null
+  if (!(client.forgeLoginQueryLedger instanceof Map)) client.forgeLoginQueryLedger = new Map()
+  const ledger = client.forgeLoginQueryLedger
+  const prior = ledger.get(messageId)
+  if (prior && !prior.answered) {
+    // the server re-asked an id we still owe — same transaction, keep the
+    // first registration (one reply is still exactly one)
+    return prior
+  }
+  const entry = { messageId, channel: context && context.channel, at: Date.now(), answered: false, answeredBy: null, reissued: !!prior }
+  ledger.set(messageId, entry)
+  return entry
+}
+
+function ledgerVerdict (client, params, context) {
+  if (!client || !(client.forgeLoginQueryLedger instanceof Map)) return null
+  const messageId = params && params.messageId
+  const entry = client.forgeLoginQueryLedger.get(messageId)
+  if (!entry) return 'unknown-transaction'
+  if (entry.answered) return `duplicate-reply (first answered by ${entry.answeredBy || 'an earlier organ'})`
+  entry.answered = true
+  entry.answeredBy = (context && context.kind) || 'login reply'
+  entry.answeredAt = Date.now()
+  return null
+}
+
+function dropWithLedgerReceipt (client, params, context, why) {
+  const label = context && context.channel ? `${context.channel} (${context.kind || 'reply'})` : (context && context.kind) || 'login reply'
+  console.warn(`[forge] dropped login reply for ${label} (messageId ${params && params.messageId}): ${why}. ` +
+    'A login_plugin_response must carry the id of a query still awaiting its answer, exactly once — every server ' +
+    '(vanilla and every FML era) kicks a stray or repeated answer as multiplayer.disconnect.unexpected_query_response.')
+  if (!Array.isArray(client.forgeDroppedLoginReplies)) client.forgeDroppedLoginReplies = []
+  client.forgeDroppedLoginReplies.push({ messageId: params ? params.messageId : undefined, channel: context && context.channel, kind: context && context.kind, why })
+  try { client.emit('forgeLoginReplyDropped', client.forgeDroppedLoginReplies[client.forgeDroppedLoginReplies.length - 1]) } catch { /* receipts never break the path */ }
 }
 
 /**
@@ -122,4 +180,4 @@ function writeLoginReplyDeferred (client, params, context) {
   setImmediate(() => setImmediate(() => { writeLoginReplyNow(client, params, context) }))
 }
 
-module.exports = { writeLoginReplyNow, writeLoginReplyDeferred, boundaryObserved }
+module.exports = { writeLoginReplyNow, writeLoginReplyDeferred, boundaryObserved, registerLoginQuery }
