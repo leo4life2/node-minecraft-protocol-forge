@@ -701,6 +701,9 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           }
           const reply = encodeNetworkQuery(components)
           debug(`neoforge config: query received, claiming ${components.configuration.length} configuration + ${components.play.length} play components`)
+          // HF16-R receipt: the claim BY ID (the server's setup_failed names
+          // components by id — a dual-side reading needs ours next to theirs).
+          debug(`neoforge config: claim ids: configuration=[${components.configuration.map((c) => `${c.id}@${c.version}`).join(',')}] play=[${components.play.map((c) => `${c.id}@${c.version}`).join(',')}]`)
           // HF8 receipt: the answer's true wire size + claim counts, so a
           // silent post-answer close is classifiable (sub-shape A: the
           // server closed without EITHER neoforge:network or

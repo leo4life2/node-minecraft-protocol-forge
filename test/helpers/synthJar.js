@@ -152,6 +152,9 @@ class Asm {
   invokevirtual (o, n, d) { this.bytes.push(0xb6); this._u16(this.cp.methodRef(o, n, d)); return this }
   invokespecial (o, n, d) { this.bytes.push(0xb7); this._u16(this.cp.methodRef(o, n, d)); return this }
   invokestatic (o, n, d) { this.bytes.push(0xb8); this._u16(this.cp.methodRef(o, n, d)); return this }
+  // static INTERFACE method call: javac emits invokestatic through an
+  // InterfaceMethodref (tag 11) — the Epic Fight registerPayloadType shape.
+  invokestaticItf (o, n, d) { this.bytes.push(0xb8); this._u16(this.cp.iMethodRef(o, n, d)); return this }
   invokedynamic (bsmIndex, name, desc) { this.bytes.push(0xba); this._u16(this.cp.invokeDynamic(bsmIndex, name, desc)); this.bytes.push(0, 0); return this }
   // HF11 additions: the aggregator-shape fixtures need instance state +
   // interface dispatch
