@@ -144,15 +144,19 @@ function receipt (client, params, context, why) {
   try { client.emit('forgeLoginReplyDropped', client.forgeDroppedLoginReplies[client.forgeDroppedLoginReplies.length - 1]) } catch { /* receipts never break the path */ }
 }
 
-// A reply the negotiation's end made dead (HF12): the query it answered is
-// settled `dropped` in the ledger — it was owed and never reached the wire.
+// A reply the negotiation's end made dead (HF12 / HF38 rider): the query it
+// answered is settled `dropped` in the ledger — it was owed and never
+// reached the wire. Two ways in: the ledger already closed the window and
+// filed the query unanswered-at-close before this reply was ready (the
+// late-reply path: the entry is re-settled to dropped, still ONE verdict),
+// or — with no ledger installed (bare embedder) — the wire evidence alone.
 function dropWithReceipt (client, params, context, why) {
   console.warn(`[forge] dropped late login reply for ${labelOf(params, context)} (messageId ${params && params.messageId}): ` +
-    `the login negotiation is already over (${why}). Writing it would corrupt the stream — after the server arms ` +
-    'compression every serverbound frame must be compression-framed, and a raw login_plugin_response\'s packet id ' +
-    'byte (0x02) reads as a bogus compressed-frame data length ("Badly compressed packet - size of 2").')
+    `the login negotiation is already over (${why}) — the reply was ready after the server closed the login window. ` +
+    'Writing it now would put a login_plugin_response (0x02) on the wire outside login, where the server reads that id ' +
+    'as a different packet (a bogus PLAY frame, or on an armed decoder a bogus compressed-frame length: "Badly compressed packet - size of 2").')
   receipt(client, params, context, why)
-  loginWindow.noteReply(client, params, context, 'dropped', why)
+  if (!loginWindow.noteLateReply(client, params, context, why)) loginWindow.noteReply(client, params, context, 'dropped', why)
 }
 
 // A reply the LEDGER refuses (HF36 P4): no query is owed for this id — the
@@ -190,6 +194,15 @@ function writeLoginReplyNow (client, params, context) {
     // this id is the one being answered; none open = nothing is owed.
     if (!loginWindow.openEntry(client, messageId, context)) {
       const prior = loginWindow.priorVerdict(client, messageId)
+      // HF38 rider (verify MED): the window closed (success / state / end)
+      // before this reply was ready — the ledger filed the query
+      // unanswered-at-close. No first reply ever existed, so this is a LATE
+      // reply, never a duplicate: dropped with a receipt naming what ended
+      // the window, and the query's verdict becomes `dropped` (one verdict).
+      if (prior && prior.outcome === 'unanswered-at-close') {
+        dropWithReceipt(client, params, context, `late-reply: window closed (endedBy=${loginWindow.windowEndedBy(client) || boundaryObserved(client) || 'unknown'})`)
+        return false
+      }
       const why = prior
         ? `duplicate-reply: already-closed-${prior.outcome}${prior.kind ? ` (first answered by ${prior.kind})` : ''}`
         : 'unknown-transaction'
@@ -197,6 +210,9 @@ function writeLoginReplyNow (client, params, context) {
       return false
     }
   }
+  // With a ledger installed the window closes on the same success / state /
+  // end events this reads, so an OPEN entry here implies no boundary yet;
+  // this drop is the fail-open guard for a client without a ledger.
   const why = boundaryObserved(client)
   if (why) {
     dropWithReceipt(client, params, context, why)

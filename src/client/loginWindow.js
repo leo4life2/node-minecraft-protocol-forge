@@ -202,7 +202,8 @@ function settle (e, w, outcome, extra) {
  * Filed by the reply boundary: `written` (answered / declined by the shape
  * of params — data present or not) or `dropped` (with why) — the verdict of
  * the most recent OPEN entry with the reply's id. A reply with no open
- * entry never reaches here (the boundary refuses it: noteRefused).
+ * entry never reaches here (the boundary refuses it — noteRefused — or,
+ * when the window closed on the query first, files it late: noteLateReply).
  */
 function noteReply (client, params, context, disposition, why) {
   const w = ledgerOf(client)
@@ -213,6 +214,34 @@ function noteReply (client, params, context, disposition, why) {
   if (disposition === 'dropped') { settle(e, w, 'dropped', { kind, why: why || null }); return }
   if (context && context.budget) { settle(e, w, 'budget-declined', { kind }); return }
   settle(e, w, params.data == null ? 'declined' : 'answered', { kind })
+}
+
+/**
+ * HF38 rider: a reply that became ready AFTER closeWindow filed its query
+ * unanswered-at-close (success / state / end raced the deferred write). The
+ * entry's verdict becomes `dropped` — it stays ONE verdict per query, the
+ * close-time placeholder replaced by the truth that a reply existed and
+ * never reached the wire; latency is the reply's real lateness. False when
+ * the latest entry for this id is not an unanswered-at-close one.
+ */
+function noteLateReply (client, params, context, why) {
+  const w = ledgerOf(client)
+  if (!w || !params) return false
+  const e = latestEntry(client, params.messageId)
+  if (!e || e.outcome !== 'unanswered-at-close') return false
+  e.closedAs = e.outcome
+  e.outcome = 'dropped'
+  e.kind = context && context.kind
+  e.why = why || null
+  e.answeredAt = w.now()
+  e.latencyMs = e.arrivedAt != null ? e.answeredAt - e.arrivedAt : null
+  return true
+}
+
+/** What closed the window (`login-success` / `state-<s>` / `connection-ended`), or null while open. */
+function windowEndedBy (client) {
+  const w = ledgerOf(client)
+  return w ? w.endedBy || null : null
 }
 
 /**
@@ -318,6 +347,10 @@ function expire (client, e) {
   if (!e.wrapped) {
     console.warn(`[forge] login-window budget: the login query on ${channel} (messageId ${e.messageId}) has waited ${waitedMs} ms of its ${e.budgetMs} ms budget (${derivation}); ` +
       `the server's ${w.ticks}-tick login window closes in ${remainingMs} ms — answering the protocol's not-understood decline now rather than leaving it pending for the server's slow_login clock.`)
+    // Required lazily on purpose: loginReplyBoundary requires this module at
+    // load (the ledger is its guard), so a top-level require here would be a
+    // CommonJS cycle and hand one side a half-initialised exports object.
+    // By the time expire() runs both modules are fully loaded.
     const { writeLoginReplyNow } = require('./loginReplyBoundary')
     writeLoginReplyNow(client, { messageId: e.messageId }, { channel, kind: 'budget decline (login-window)', budget: true, entry: e })
   } else {
@@ -410,6 +443,8 @@ module.exports = {
   latestEntry,
   noteInnerChannel,
   noteReply,
+  noteLateReply,
+  windowEndedBy,
   noteRefused,
   noteStop,
   priorVerdict,
