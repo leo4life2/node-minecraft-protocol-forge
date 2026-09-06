@@ -117,10 +117,20 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel) {
     return
   }
   let modVersion = null
+  const modIds = [] // HF37: the jar's declared mod ids (a version lookup key — ModList.getModContainerById("id") / event.registrar("id"))
   for (const e of entries) {
     if (e.name === 'META-INF/neoforge.mods.toml' || e.name === 'META-INF/mods.toml') {
       try {
         const toml = zipEntryData(buf, e).toString('utf8')
+        // only the [[mods]] tables declare this jar's ids — a
+        // [[dependencies.x]] table's modId names ANOTHER mod
+        let table = null
+        for (const line of toml.split(/\r?\n/)) {
+          const th = line.match(/^\s*\[\[?\s*([A-Za-z0-9_.-]+)\s*\]?\]/)
+          if (th) { table = th[1]; continue }
+          const mm = table === 'mods' && line.match(/^\s*modId\s*=\s*"([^"]+)"/)
+          if (mm) modIds.push(mm[1])
+        }
         const m = toml.match(/^\s*version\s*=\s*"([^"]+)"/m)
         if (m && !m[1].includes('${')) modVersion = m[1]
         if (m && m[1].includes('${')) {
@@ -134,7 +144,7 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel) {
       } catch { /* tolerated */ }
     }
   }
-  const jarInfo = { label: jarLabel, modVersion }
+  const jarInfo = { label: jarLabel, modVersion, modIds }
   diagnostics.jars.push(jarInfo)
   for (const e of entries) {
     if (e.name.endsWith('.class') && !e.name.includes('module-info')) {
@@ -574,7 +584,32 @@ function handleInvoke (index, classInfo, state, opts, call) {
     // version for an explicit per-channel constant fails the negotiation
     // (rig-proven: create_connected 1.3.2-mc1.21.1 vs "2.0.0").
     const fromParam = version === null && !!argVals[0] && argVals[0].k === 'param'
-    push({ k: 'registrar', version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam })
+    // HF37: the registrar's NAMESPACE names the mod whose version a runtime
+    // `.versioned(modVersion)` means — kept for the mods.toml fallback, which
+    // must read THAT mod's jar, not the jar hosting the registration site
+    // (a library-hosted site — ldtteam blockui — carries the library's version).
+    push({ k: 'registrar', version, namespace: version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam })
+    return
+  }
+  // HF37: the FML mod-list version idiom, resolved from the jar index —
+  // ModList.get().getModContainerById("id").get().getModInfo().getVersion().toString()
+  // is the mod's own mods.toml version (javap: minecolonies, structurize).
+  if (call.kind === 'static' && ref.owner === 'net/neoforged/fml/ModList' && ref.name === 'get' && ref.desc === '()Lnet/neoforged/fml/ModList;') {
+    push({ k: 'modlist' })
+    return
+  }
+  if (recv && recv.k === 'modlist') {
+    const id = ref.name === 'getModContainerById' ? asStr(argVals[0]) : null
+    if (id !== null) push({ k: 'modref', id })
+    else if (!retVoid) push(UNKNOWN)
+    return
+  }
+  if (recv && recv.k === 'modref') {
+    if (ref.name === 'toString' || ref.name === 'getQualifier') {
+      const v = state.versionByModId ? state.versionByModId[recv.id] : null
+      push(v ? vStr(v) : UNKNOWN)
+    } else if (ref.name === 'getModId') push(vStr(recv.id))
+    else if (!retVoid) push(recv)
     return
   }
   if (recv && recv.k === 'registrar') {
@@ -1181,7 +1216,7 @@ function discoverFlowMarkers (index, entryMethods) {
 
 const CLASS_TYPE = 'java/lang/Class'
 const AGG_MAX_DEPTH = 3
-const AGG_MAX_CONTEXTS = 24
+const AGG_MAX_CONTEXTS = 512 // HF37: bounded by the step budgets below; 24 truncated a 160-holder pack (minecolonies) to nothing
 const AGG_MAX_STEPS_PER_EVAL = 30000
 const AGG_TOTAL_STEP_BUDGET = 2400000
 
@@ -1197,7 +1232,7 @@ function seedProvenanceLocals (desc, isStatic, cls) {
 
 function isConcreteish (v) {
   return !!v && (v.k === 'str' || v.k === 'int' || v.k === 'resloc' || v.k === 'type' ||
-    v.k === 'cls' || v.k === 'obj' || v.k === 'enumconst')
+    v.k === 'cls' || v.k === 'obj' || v.k === 'enumconst' || v.k === 'lambda') // HF37: a registration lambda is a populated element
 }
 
 // Method lookup through the hierarchy (superclasses, then interfaces — the
@@ -1351,6 +1386,96 @@ function armThrowsImmediately (code, startPc, cp) {
 // avoided. Bounded by per-pc revisit counts, a per-evaluation step cap and a
 // shared total budget — exhaustion is a loud abstain upstream, never a spin.
 function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {}) {
+  const prevClassInfo = state.evalClassInfo
+  state.evalClassInfo = classInfo
+  try {
+    return evaluateMethodInner(index, classInfo, method, state, opts, hooks)
+  } finally {
+    state.evalClassInfo = prevClassInfo
+  }
+}
+
+// HF37: run a lambda value. captured + call arguments seed the implementation
+// method's locals (a bound instance method reference takes its receiver from
+// the first captured value, an unbound one from the first call argument; a
+// constructor reference builds the object). Implementations outside the
+// scanned jars route through the ordinary invoke path so a registrar method
+// reference registers exactly like a direct registrar call.
+function invokeLambda (index, state, opts, lam, args, push, hooks = {}) {
+  const { impl, captured } = lam
+  const all = [...captured, ...args]
+  const isStatic = impl.refKind === 6
+  const retVoid = returnsVoid(impl.desc)
+  if (impl.name === '<init>') {
+    const obj = { k: 'obj', cls: impl.owner, ctorArgs: all, ctorDesc: impl.desc, fields: {} }
+    push(obj)
+    return true
+  }
+  const recvVal = isStatic ? null : all[0]
+  const callArgs = isStatic ? all : all.slice(1)
+  const dispatchCls = (!isStatic && recvVal && recvVal.k === 'obj' && index.get(recvVal.cls)) ? recvVal.cls : impl.owner
+  const target = index.get(dispatchCls) ? findVirtualMethod(index, dispatchCls, impl.name, impl.desc) : null
+  if (target) {
+    state.aggInlineStack = state.aggInlineStack || new Set()
+    const key = `l:${target.info.className}.${impl.name}${impl.desc}`
+    if (state.aggInlineStack.has(key) || state.aggInlineStack.size > 24) { if (!retVoid) push(UNKNOWN); return true }
+    state.aggInlineStack.add(key)
+    let returned
+    try {
+      evaluateMethod(index, target.info, target.m, state, {
+        locals: isStatic ? seedArgLocals(impl.desc, callArgs) : seedArgLocals(impl.desc, callArgs, recvVal ?? UNKNOWN),
+        recordPutstatic: false,
+        onReturn: (v) => { returned = v },
+        onRegistration: opts.onRegistration
+      }, hooks)
+    } finally {
+      state.aggInlineStack.delete(key)
+    }
+    if (!retVoid) push(returned ?? UNKNOWN)
+    return true
+  }
+  const ref = { owner: impl.owner, name: impl.name, desc: impl.desc }
+  const kind = isStatic ? 'static' : 'instance'
+  if (hooks.onCall) hooks.onCall(ref, kind, recvVal, callArgs)
+  if (evaluatorPreInvoke(index, state, opts, ref, recvVal, callArgs, push, hooks)) return true
+  const classInfo = state.evalClassInfo || { className: impl.owner, jar: null }
+  handleInvoke(index, classInfo, state, opts, { kind, ref, recv: recvVal, argVals: callArgs, push, pc: -1 })
+  return true
+}
+
+// HF37: javac's invokedynamic string concatenation — the bootstrap recipe
+// (\u0001 = next dynamic operand, \u0002 = next bootstrap constant) folds to a
+// string only when every operand is concrete; anything else stays UNKNOWN.
+function concatWithConstants (classInfo, bsmIndex, captured) {
+  const bsm = classInfo.bootstrapMethods && classInfo.bootstrapMethods[bsmIndex]
+  if (!bsm) return UNKNOWN
+  const cp = classInfo.cp
+  const consts = []
+  let recipe = null
+  for (const argIdx of bsm.args) {
+    const c = cp[argIdx]
+    if (!c) return UNKNOWN
+    if (c.tag === 8) { const str = cpUtf8(cp, c.strIndex); if (recipe === null) recipe = str; else consts.push(str) } else if (c.tag === 3) consts.push(String(c.int)); else return UNKNOWN
+  }
+  if (recipe === null) return UNKNOWN
+  let out = ''
+  let di = 0; let ci = 0
+  for (const ch of recipe) {
+    if (ch === '\u0001') {
+      const v = captured[di++]
+      if (v && v.k === 'str') out += v.v
+      else if (v && v.k === 'int') out += String(v.v)
+      else if (v && v.k === 'resloc') out += v.v
+      else return UNKNOWN
+    } else if (ch === '\u0002') {
+      if (ci >= consts.length) return UNKNOWN
+      out += consts[ci++]
+    } else out += ch
+  }
+  return vStr(out)
+}
+
+function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks = {}) {
   state.aggCache = state.aggCache || new Map()
   opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags } }
   const cp = classInfo.cp
@@ -1395,7 +1520,7 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
     }
 
     switch (op) {
-      case 0x01: push(UNKNOWN); break
+      case 0x01: push({ k: 'null' }); break // aconst_null is a KNOWN null (HF37: decides ifnull/ifnonnull on ctor-bound fields)
       case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
         push(vInt(op - 0x03)); break
       case 0x09: case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f: push(UNKNOWN); break
@@ -1469,7 +1594,10 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
         }
         if (ref.desc === `L${ref.owner};`) {
           const ownerInfo = index.get(ref.owner)
-          if (ownerInfo && ownerInfo.superName === 'java/lang/Enum') {
+          // HF37: a self-typed static of a class OUTSIDE the scanned jars
+          // (PacketFlow.CLIENTBOUND, a loader enum) is an identity — decided
+          // by name in if_acmp / $SwitchMap, never by a guessed ordinal.
+          if ((ownerInfo && ownerInfo.superName === 'java/lang/Enum') || !ownerInfo) {
             push({ k: 'enumconst', cls: ref.owner, name: ref.name })
             break
           }
@@ -1525,6 +1653,11 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
         // focus-pass hook: an aggregator instance just finished constructing
         if (ref.name === '<init>' && recv && recv.k === 'obj' && state.aggFocus &&
             recv.cls === state.aggFocus && state.aggConstructed && !state.aggConstructed.includes(recv)) {
+          // HF37: a focus instance's constructor runs AT construction (as the
+          // JVM does), so its population side effects — `ALL_NETWORKS.add(this)`
+          // into the focus class's static registry — happen for every instance,
+          // not only for those some later read happened to bind lazily.
+          bindCtorFields(index, state, recv)
           state.aggConstructed.push(recv)
         }
         break
@@ -1547,11 +1680,20 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
         const nArgs = argSlots(desc).length
         const captured = []
         for (let i = nArgs - 1; i >= 0; i--) captured[i] = stack.pop()
-        if (hooks.onIndy && c && classInfo.bootstrapMethods) {
-          const impl = resolveLambdaImpl(classInfo, c.bsmIndex)
-          if (impl) hooks.onIndy(impl, captured)
+        const impl = (c && classInfo.bootstrapMethods) ? resolveLambdaImpl(classInfo, c.bsmIndex) : null
+        if (hooks.onIndy && impl) hooks.onIndy(impl, captured)
+        if (!returnsVoid(desc)) {
+          // HF37: a lambda / method reference is a VALUE — its implementation
+          // handle plus the captured arguments — invoked when the functional
+          // interface method is called on it (evaluatorPreInvoke); javac's
+          // StringConcatFactory recipe folds when every operand is concrete.
+          const samName = nat ? cpUtf8(cp, nat.nameIndex) : null
+          if (impl && impl.refKind >= 5 && impl.refKind <= 9) {
+            push({ k: 'lambda', impl, captured, sam: samName })
+          } else if (samName === 'makeConcatWithConstants' && c) {
+            push(concatWithConstants(classInfo, c.bsmIndex, captured))
+          } else push(UNKNOWN)
         }
-        if (!returnsVoid(desc)) push(UNKNOWN)
         break
       }
       case 0xb0: {
@@ -1595,15 +1737,19 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
         condBranch(pc + code.readInt16BE(pc + 1), known, take)
         break
       }
-      case 0xa5: case 0xa6: { // if_acmpeq/ne — undecidable here
-        pop(2)
-        condBranch(pc + code.readInt16BE(pc + 1), false, false)
+      case 0xa5: case 0xa6: { // if_acmpeq/ne — decidable for two enum identities or two construction-bound objects (HF37)
+        const b = stack.pop(); const a = stack.pop()
+        const bothEnum = !!(a && b && a.k === 'enumconst' && b.k === 'enumconst')
+        const bothObj = !!(a && b && a.k === 'obj' && b.k === 'obj')
+        const eq = bothEnum ? (a.cls === b.cls && a.name === b.name) : a === b
+        condBranch(pc + code.readInt16BE(pc + 1), bothEnum || bothObj, op === 0xa5 ? eq : !eq)
         break
       }
       case 0xc6: case 0xc7: { // ifnull / ifnonnull
         const v = stack.pop()
-        const knownNonnull = !!v && (v.k === 'str' || v.k === 'int' || v.k === 'resloc' || v.k === 'type' || v.k === 'cls' || v.k === 'obj' || v.k === 'new' || v.k === 'enumconst' || v.k === 'registrar')
-        condBranch(pc + code.readInt16BE(pc + 1), knownNonnull, knownNonnull && op === 0xc7)
+        const knownNonnull = !!v && (v.k === 'str' || v.k === 'int' || v.k === 'resloc' || v.k === 'type' || v.k === 'cls' || v.k === 'obj' || v.k === 'new' || v.k === 'enumconst' || v.k === 'registrar' || v.k === 'lambda')
+        const knownNull = !!v && v.k === 'null'
+        condBranch(pc + code.readInt16BE(pc + 1), knownNonnull || knownNull, (knownNonnull && op === 0xc7) || (knownNull && op === 0xc6))
         break
       }
       case 0xaa: { // tableswitch
@@ -1640,6 +1786,29 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
 // for the reflection/enum/RL calls the aggregator shapes route ids through.
 // Returns true when the call was fully handled (value pushed as needed).
 function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}) {
+  // HF37 LAMBDA invocation: the functional-interface call on a lambda value
+  // runs its implementation with captured + call arguments (a method
+  // reference onto a loader API such as PayloadRegistrar::playToClient
+  // routes through the ordinary registrar recognition).
+  if (recv && recv.k === 'lambda' && (!recv.sam || ref.name === recv.sam)) {
+    return invokeLambda(index, state, opts, recv, argVals, push, hooks)
+  }
+  // HF37 collection walk: forEach over a jar-populated collection applies
+  // the consumer lambda to every populated element (bounded by the
+  // population cap and the step budgets).
+  if (recv && (recv.k === 'obj' || recv.k === 'collection' || recv.k === 'varr') && ref.name === 'forEach' &&
+      argVals.length === 1 && argVals[0] && argVals[0].k === 'lambda') {
+    for (const item of (recv.items || []).slice(0, 192)) invokeLambda(index, state, opts, argVals[0], [item], () => {}, hooks)
+    return true
+  }
+  if (!recv && ref.owner === 'java/util/Objects' && ref.name === 'requireNonNull' && argVals.length >= 1) {
+    push(argVals[0]) // identity pass-through (javac's null-check idiom around method references)
+    return true
+  }
+  if (!recv && ref.owner === 'java/lang/Integer' && ref.name === 'toString' && ref.desc === '(I)Ljava/lang/String;') {
+    push(argVals[0] && argVals[0].k === 'int' ? vStr(String(argVals[0].v)) : UNKNOWN)
+    return true
+  }
   // collection modeling by OBJECT IDENTITY: `add` on any abstract object
   // gathers concrete elements onto that object; `iterator` replays exactly
   // them. This is what keeps multi-instance aggregators separate (each
@@ -1673,7 +1842,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // Enum.ordinal() on a known constant
   if (ref.name === 'ordinal' && ref.desc === '()I' && recv && recv.k === 'enumconst') {
     const ord = enumOrdinal(index, state, recv.cls, recv.name)
-    push(ord === null ? UNKNOWN : vInt(ord))
+    push(ord === null ? recv : vInt(ord)) // HF37: an enum outside the scanned jars keeps its identity — the $SwitchMap read resolves by constant NAME
     return true
   }
   // Enum name()/ordinal() on a construction-bound constant: javac passes
@@ -2054,7 +2223,17 @@ function collectFocusInstances (index, state, focusCls) {
   state.aggStaticScope = scope
   state.aggFocus = focusCls
   state.aggConstructed = constructed
+  const prevInlineAll = state.aggInlineAll
   try {
+    // HF37: the focus class's own static registries (`ALL_NETWORKS = new
+    // HashSet<>()` in its <clinit>) must exist before population sites add
+    // to them; population chains run through builders/service helpers in
+    // OTHER classes, so static calls inline through any scanned class here
+    // (still bounded by the inline depth + the step budgets).
+    const focusInfo = index.get(focusCls)
+    const focusClinit = focusInfo && focusInfo.codes.find((c) => c.method === '<clinit>')
+    if (focusClinit) evaluateMethod(index, focusInfo, focusClinit, state, { locals: [], recordPutstatic: true }, {})
+    state.aggInlineAll = true
     const referencing = []
     for (const cls of state.allClassNames) {
       if (scope.has(cls)) continue
@@ -2081,6 +2260,7 @@ function collectFocusInstances (index, state, focusCls) {
       }
     }
   } finally {
+    state.aggInlineAll = prevInlineAll
     state.aggStaticScope = prevScope
     state.aggFocus = prevFocus
     state.aggConstructed = prevConstructed
@@ -2109,19 +2289,41 @@ function resolveAggregatedRegistrations (index, state, pending) {
     if (!m) continue
     // Constructor-context or call-context binding for the site method itself
     const isStatic = (m.flags & 0x0008) !== 0
-    let bindings = []
+    const bindings = []
     let partial = false
+    let instances = []
     if (!isStatic && reg.methodCtx.name !== '<init>') {
       // instance site: candidates are the aggregator instances the jars
       // themselves construct AND populate (the focus pass — per-instance
       // versions and per-instance collection contents by object identity)
-      const instances = collectFocusInstances(index, state, reg.methodCtx.cls)
-      for (const inst of instances.slice(0, AGG_MAX_CONTEXTS)) bindings.push({ recv: inst, args: null })
-      if (instances.length === 0 || instances.truncated || instances.length > AGG_MAX_CONTEXTS) partial = true
+      instances = collectFocusInstances(index, state, reg.methodCtx.cls)
+      if (instances.length === 0 || instances.truncated) partial = true
     }
     const callCtx = resolveCallContexts(index, state, { cls: reg.methodCtx.cls, name: reg.methodCtx.name, desc: reg.methodCtx.desc }, 0)
     partial = partial || callCtx.partial
-    for (const c of callCtx.contexts) bindings.push({ recv: c.recv, args: c.args })
+    // HF37 HOLDER shape (ldtteam PlayMessageType, javap-verified): the
+    // registration object is built by a static FACTORY (modId, name) into a
+    // static HOLDER field of the payload class (`TYPE = forServer("ns",
+    // "name", ..)`), and the entry registers it through the holder
+    // (`getstatic X.TYPE; invokevirtual register(registrar)`). The instance's
+    // ctor-bound facts (its Type) live on the focus-pass object the holder
+    // now holds; the registrar (its version) lives at the call site. A call
+    // context whose receiver is that static holder binds to the held object,
+    // so both facts meet in ONE evaluation. Fully-bound contexts go first;
+    // an instance no context reached still gets an instance-only binding
+    // (registrar unbound — its version then rides mods.toml or abstains).
+    const boundRecvs = new Set()
+    for (const c of callCtx.contexts) {
+      let recv = c.recv
+      if (recv && recv.k === 'field') {
+        const held = state.fieldValues[staticFieldKey(index, recv)] ?? state.fieldValues[`${recv.owner}.${recv.name}`]
+        if (held && held.k === 'obj') recv = held
+      }
+      if (recv && recv.k === 'obj') boundRecvs.add(recv)
+      bindings.push({ recv, args: c.args })
+    }
+    for (const inst of instances) if (!boundRecvs.has(inst)) bindings.push({ recv: inst, args: null })
+    if (bindings.length > AGG_MAX_CONTEXTS) partial = true
     if (bindings.length === 0) {
       if (partial) partialSites.add(sk)
       continue
@@ -2150,6 +2352,7 @@ function resolveAggregatedRegistrations (index, state, pending) {
             version: r.registrar ? r.registrar.version : null,
             versionSource: 'aggregated',
             versionFromParam: r.registrar ? !!r.registrar.versionFromParam : false,
+            namespace: r.registrar ? r.registrar.namespace : null,
             optional: r.registrar ? r.registrar.optional : false,
             flow: spec.flow,
             protocols: spec.protocols,
@@ -2295,7 +2498,13 @@ function deriveNeoForgeComponents (jarPaths) {
   const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0 }
   for (const p of jarPaths) collectJarClasses(p, index, diagnostics, path.basename(p))
 
+  const versionByModId = Object.create(null)
+  for (const j of diagnostics.jars) for (const id of j.modIds || []) if (j.modVersion && !versionByModId[id]) versionByModId[id] = j.modVersion
+  // HF37: a runtime-versioned registrar falls back to the mods.toml version of
+  // the mod the registrar NAMESPACE names (its own jar), then the site's jar.
+  const metaVersionFor = (namespace, jar) => (namespace && versionByModId[namespace]) || (jar && jar.modVersion) || null
   const state = {
+    versionByModId,
     fieldValues: Object.create(null),
     typeFieldsResolved: new Set(),
     helperCache: new Map(),
@@ -2318,8 +2527,10 @@ function deriveNeoForgeComponents (jarPaths) {
   }
 
   const registrations = []
+  const silentEntries = []
   const record = (reg) => {
     const spec = REGISTRATION_METHODS[reg.method]
+    if (process.env.MINEPAL_AGG_DEBUG) debug(`record ${reg.method} id=${reg.id} site=${reg.site} version=${reg.registrar && reg.registrar.version}`)
     if (!spec) return
     registrations.push({ ...reg, ...spec })
   }
@@ -2332,7 +2543,46 @@ function deriveNeoForgeComponents (jarPaths) {
     // values are still produced by the interpreter when registrar() is
     // invoked on the event argument.
     const locals = seedProvenanceLocals(method.desc, (method.flags & 0x0008) !== 0, info.className)
-    simulate(index, info, method, state, { onRegistration: record, recordPutstatic: false, locals })
+    let reached = 0
+    simulate(index, info, method, state, { onRegistration: (r) => { reached++; record(r) }, recordPutstatic: false, locals })
+    if (reached === 0) silentEntries.push({ info, method })
+  }
+  // HF37 SILENT-ENTRY deep pass (mechanism, javap-verified on framework
+  // 0.13.11 + createcolonies 2.0.6): an entry whose registrar never reaches
+  // a registrar call under the linear walk (registrations mediated by a
+  // static registry of network objects, lambdas, forEach, method references)
+  // is walked again under the branch-following evaluator: every static
+  // registry the entry reads is first POPULATED from its jar-wide
+  // population sites (the focus pass), then lambdas run, collections walk
+  // and method references onto the registrar register. An entry that still
+  // yields nothing is reported — never a silent zero.
+  for (const { info, method } of silentEntries) {
+    if (method.method.startsWith('lambda$')) continue // a lambda body's enclosing entry reports for it
+    const before = registrations.length
+    const registries = new Set()
+    walkLinear(method.code, info.cp, (op, pc, cp, code) => {
+      if (op !== 0xb2) return
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (ref && index.get(ref.owner) && ref.owner !== info.className && ref.desc.startsWith('Ljava/util/')) registries.add(ref.owner)
+    })
+    state.aggCache = state.aggCache || new Map()
+    for (const owner of registries) {
+      if (state.aggBudgetBlown) break
+      collectFocusInstances(index, state, owner)
+    }
+    const prevInlineAll = state.aggInlineAll
+    state.aggInlineAll = true
+    try {
+      const locals = seedProvenanceLocals(method.desc, (method.flags & 0x0008) !== 0, info.className)
+      evaluateMethod(index, info, method, state, { locals, recordPutstatic: false, onRegistration: (r) => record({ ...r, site: `${r.site} (deep walk from ${info.className}.${method.method})` }) }, {})
+    } catch (err) {
+      diagnostics.errors.push(`deep walk of ${info.className}.${method.method} failed (${err.message})`)
+    } finally {
+      state.aggInlineAll = prevInlineAll
+    }
+    if (registrations.length === before) {
+      diagnostics.abstains.push(`${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size} static registr${registries.size === 1 ? 'y' : 'ies'}) — this entry's channels unclaimed`)
+    }
   }
 
   const markers = discoverFlowMarkers(index, entryMethods)
@@ -2392,7 +2642,7 @@ function deriveNeoForgeComponents (jarPaths) {
       continue
     }
     if (version === null) {
-      const metaVersion = reg.jar && reg.jar.modVersion
+      const metaVersion = metaVersionFor(reg.registrar && reg.registrar.namespace, reg.jar)
       if (optional) {
         diagnostics.abstains.push(`${reg.id}: optional channel with unresolved version — safely unclaimed`)
         listenOnlyNamed.push(reg.id)
@@ -2432,7 +2682,7 @@ function deriveNeoForgeComponents (jarPaths) {
     let version = row.version
     let versionSource = row.versionSource
     if (version === null) {
-      const metaVersion = row.jar && row.jar.modVersion
+      const metaVersion = metaVersionFor(row.namespace, row.jar)
       if (row.optional) {
         diagnostics.abstains.push(`${row.id}: aggregated optional channel with unresolved version — safely unclaimed`)
         listenOnlyNamed.push(row.id)

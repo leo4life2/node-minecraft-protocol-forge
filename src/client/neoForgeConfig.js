@@ -480,6 +480,11 @@ function encodeKnownDataMapsReply (maps) {
  *     // state.acked + the neoForgeConfigAck event.
  * }} options
  */
+// HF37: how long the configuration pong may wait for the negotiation verdict
+// before the fallback release (the vanilla login window is 30 s; a 40 KB
+// verdict on a slow uplink is well inside this).
+const PONG_HOLD_MS = 2500
+
 function installNeoForgeConfigNegotiation (client, options = {}) {
   const rawComponents = options.components || { configuration: [], play: [] }
   const declareListening = options.declareListening !== false
@@ -561,6 +566,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     listenOnlyDeclared: null, // HF15: how many jar-derived listen-only ids rode the declaration
     queryAnswer: null, // HF8: {configuration, play, bytes} once answered
     setupFailed: null, // HF8: the server's per-channel failure reasons
+    pongHold: null, // HF37: {id, heldMs, outcome} — the configuration pong held until the negotiation verdict
     acked: [], // HF11: {trigger, ack} rows actually answered this phase
     unclaimedBuiltins,
     unhandled: [],
@@ -587,6 +593,57 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   const send = (channel, data) => {
     debug(`neoforge config: sending ${channel} (${data.length} bytes)`)
     client.write('custom_payload', { channel, data })
+  }
+  // HF37 — the configuration pong is HELD until the negotiation verdict.
+  // The server sends `neoforge:register` + ping(0) back to back; we answer
+  // the query and the vanilla auto-pong lands in the same tick. When the
+  // claim fails, the server's netty thread is inside the negotiation
+  // handler when our pong arrives: it sends the named verdict
+  // (modded_network_setup_failed + the disconnect packet) and closes the
+  // socket with our pong still UNREAD in its receive buffer, so the kernel
+  // answers with TCP RST instead of FIN (RFC 2525 §2.17). Windows discards
+  // the not-yet-read receive buffer on RST, so the verdict and the kick
+  // vanish and the client sees a bare close (field: 20/20 silent rows win32,
+  // rig: ECONNRESET with a trailing frame, FIN without). Holding the pong
+  // keeps the server's receive buffer EMPTY at close: FIN, and the named
+  // kick reaches every platform. On success the pong is released the moment
+  // `neoforge:network` arrives (the server's pong handler starts the
+  // configuration tasks, and the verdict always precedes that need); on a
+  // failure verdict it is dropped for good (the socket is closing — a late
+  // pong would re-arm the very reset this avoids); a bounded fallback
+  // releases it when no verdict comes, well inside the login window.
+  const pongHoldMs = Number.isFinite(options.pongHoldMs) ? options.pongHoldMs : PONG_HOLD_MS
+  const held = { packet: null, timer: null, write: null }
+  const finishHold = (outcome, deliver) => {
+    if (held.timer) { clearTimeout(held.timer); held.timer = null }
+    const p = held.packet
+    if (!p) return
+    held.packet = null
+    const heldMs = Date.now() - p.at
+    state.pongHold = { id: p.params && p.params.id, heldMs, outcome }
+    debug(`neoforge config: held pong(${state.pongHold.id}) ${deliver ? 'released' : 'dropped'} after ${heldMs} ms (${outcome})`)
+    if (!deliver) return
+    try { held.write.call(client, 'pong', p.params) } catch (err) { debug(`neoforge config: held pong write failed (${err.message})`) }
+  }
+  const releasePong = (outcome) => finishHold(outcome, true)
+  const dropPong = (outcome) => finishHold(outcome, false)
+  if (typeof client.write === 'function' && !client.__neoForgePongHold) {
+    held.write = client.write
+    client.__neoForgePongHold = true
+    client.write = function (name, params) {
+      if (name === 'pong' && client.state === 'configuration' && state.queryAnswer &&
+          !state.negotiated && !state.setupFailed && !held.packet) {
+        held.packet = { params, at: Date.now() }
+        debug(`neoforge config: holding pong(${params && params.id}) until the negotiation verdict (fallback ${pongHoldMs} ms)`)
+        held.timer = setTimeout(() => releasePong('fallback timeout'), pongHoldMs)
+        if (held.timer.unref) held.timer.unref()
+        return
+      }
+      return held.write.apply(this, arguments)
+    }
+    client.on('state', (newState) => { if (held.packet && newState !== 'configuration') releasePong(`state ${newState}`) })
+    client.on('end', () => dropPong('socket end'))
+    client.on('error', () => dropPong('socket error'))
   }
 
   // HF9: fresh task queue per configuration entry -> fresh ack ledger.
@@ -720,6 +777,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
         case 'neoforge:network': {
           state.setup = decodeNetworkSetup(data)
           state.negotiated = true
+          releasePong('verdict neoforge:network')
           const cfg = Object.keys(state.setup.configuration || {}).length
           const play = Object.keys(state.setup.play || {}).length
           debug(`neoforge config: negotiation SUCCEEDED (${cfg} configuration / ${play} play channels)`)
@@ -731,6 +789,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           try { reasons = decodeSetupFailed(data) } catch (err) { reasons = { parse_error: err.message } }
           debug(`neoforge config: negotiation FAILED: ${JSON.stringify(reasons)}`)
           state.setupFailed = reasons // HF8 receipt: the answer got a verdict
+          dropPong('verdict modded_network_setup_failed') // the socket is closing; a late pong would re-arm the reset
           client.emit('neoForgeNegotiationFailed', reasons)
           break
         }
