@@ -50,7 +50,8 @@ const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, cpUtf8, cpRef } = require('./jarAnalysis')
 
 const RL_CLASSES = new Set([
-  'net/minecraft/resources/ResourceLocation', // mojmap/srg (Forge mods)
+  'net/minecraft/resources/ResourceLocation', // mojmap/srg (Forge 1.17+ mods)
+  'net/minecraft/util/ResourceLocation', // MCP/srg (Forge 1.13-1.16 = FML2-era mods)
   'net/minecraft/class_2960', // intermediary (shipped Fabric jars)
   'net/minecraft/util/Identifier' // yarn (dev jars)
 ])
