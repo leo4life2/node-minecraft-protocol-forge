@@ -2,6 +2,7 @@ const debug = require('debug')('minecraft-protocol-forge')
 const { assessLoginChannel } = require('./loginAckDerivation')
 const { writeLoginReplyNow, writeLoginReplyDeferred, registerLoginQuery } = require('./loginReplyBoundary')
 const { installLoaderSpawnDecoder } = require('./loaderSpawnDecoder')
+const loginWindow = require('./loginWindow')
 
 // FML3 login handshake (Forge for Minecraft 1.18 - 1.20.1, fmlNetworkVersion 3).
 //
@@ -580,7 +581,12 @@ function acquisitionOutcomeWords (outcome) {
 async function acquireThenResolve (client, channel, options, attribution, acq, era) {
   const modId = attribution.ownerMod
   const version = String(attribution.ownerVersion)
-  const budgetMs = Number.isFinite(acq.budgetMs) ? acq.budgetMs : 18000
+  // HF38: the acquisition budget is bounded by THIS query's login-window
+  // deadline (its own deadline law then fires first, with its retryable
+  // fact, and the window's budget stop never has to).
+  const windowLeft = loginWindow.replyBudgetMsForChannel(client, channel)
+  const configured = Number.isFinite(acq.budgetMs) ? acq.budgetMs : 18000
+  const budgetMs = windowLeft != null ? Math.max(1000, Math.min(configured, windowLeft - 500)) : configured
   const started = Date.now()
   console.log(`[forge] the modded login check on channel "${channel}" belongs to server-announced mod "${modId}" (announced version ${version}) and no local jar carries it — obtaining that mod@version from a public registry before answering (budget ${budgetMs}ms; the server waits for this reply)`)
   try { if (client && typeof client.minepalJoinWatchdogExtend === 'function') client.minepalJoinWatchdogExtend('announced-mod acquisition in flight') } catch { /* never break the reply path */ }
@@ -781,6 +787,12 @@ module.exports = function (client, options) {
   const nmpListener = client.listeners('login_plugin_request').find((fn) => fn.name === 'onLoginPluginRequest')
   if (nmpListener) client.removeListener('login_plugin_request', nmpListener)
 
+  // HF38: the login window is the server's clock — every query is ledgered
+  // on arrival with a reply deadline derived from the 600-tick window, and
+  // closed by exactly one honest verdict (loginWindow.js). Installed BEFORE
+  // our own listener so the entry exists when a reply is written.
+  loginWindow.installLoginWindow(client, options)
+
   // HF12 boundary law (loginReplyBoundary.js): fml:handshake lockstep rounds
   // are awaited by the server (its HandshakeHandler blocks on them — live-log
   // receipt: "Sending ticking packet info ... sequence N" strictly alternates
@@ -809,7 +821,7 @@ module.exports = function (client, options) {
       let reply = null
       if (RAW_LOGIN_PROTOCOLS[packet.channel]) {
         try {
-          reply = RAW_LOGIN_PROTOCOLS[packet.channel](packet.data, options)
+          reply = loginWindow.timeDerivation(client, packet.messageId, `raw login protocol ${packet.channel}`, () => RAW_LOGIN_PROTOCOLS[packet.channel](packet.data, options))
         } catch (err) {
           debug(`failed to build ${packet.channel} reply (${err.message}), replying not-understood`)
         }
@@ -841,10 +853,11 @@ module.exports = function (client, options) {
         const channel = wrapper.channel
         const messageId = packet.messageId
         const discValue = disc.value
+        loginWindow.noteInnerChannel(client, messageId, channel)
         // One dispatch for the synchronous ladder AND the HF23 deferred
         // (acquired) resolution — the same three shapes, the same writes.
         const dispatch = (resolved, late) => {
-          if (resolved && (resolved.failed || resolved.silent)) return true // honest join stop / deadline-law self-end — nothing to write
+          if (resolved && (resolved.failed || resolved.silent)) { loginWindow.noteStop(client, messageId, resolved.failed ? 'honest-stop' : 'deadline-law', channel); return true } // honest join stop / deadline-law self-end — nothing to write
           if (resolved && resolved.conventionAck) {
             // HF36: the FML2-only shape (never produced for this era's
             // ladder; kept symmetric so one rule covers both responders)
@@ -875,10 +888,11 @@ module.exports = function (client, options) {
           }
           return false
         }
-        const resolved = resolveWrappedModLogin(client, channel, discValue, wrapper.data.slice(disc.size), options)
+        const resolved = loginWindow.timeDerivation(client, messageId, `wrapped login resolution ${channel}`, () => resolveWrappedModLogin(client, channel, discValue, wrapper.data.slice(disc.size), options))
         if (resolved && resolved.pending) {
           // HF23: the answer is deferred behind the announced-mod acquisition;
           // the server waits for a needsResponse reply (see resolveWrappedModLogin)
+          loginWindow.noteAsyncDerivation(client, messageId, `announced-mod acquisition for ${channel}`)
           resolved.pending.then((late) => dispatch(late, true)).catch((err) => {
             console.warn(`[forge] announced-mod acquisition for ${channel} threw (${err && err.message}) — answering with the protocol's not-understood decline`)
             writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition error)' })
@@ -930,6 +944,8 @@ module.exports = function (client, options) {
       // compression-arming boundary, so the reference client's silence is
       // the law — record the receipt, reply with nothing.
       if (wrapper.channel === 'fml:handshake' && disc.value === DISCRIMINATOR.MOD_DATA) {
+        // HF38: closed in the ledger as no-reply-expected — never a pending query, never a budget stop
+        loginWindow.noteStop(client, packet.messageId, 'no-reply-expected', 'S2CModData: the reference client sends nothing')
         // HF23-R1: READ it (never reply): modid -> version from the server's
         // own ModList.get() — the announced version on a wire whose ping hid
         // the mod list, consumed by announcedChannelAttribution for the

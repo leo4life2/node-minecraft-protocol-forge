@@ -1,5 +1,9 @@
 'use strict'
 
+// HF38 — the login-window ledger files every verdict written or dropped here
+// (loginWindow.js: the server's 600-tick clock is the deadline of every query).
+const loginWindow = require('./loginWindow')
+
 // HF12 — the login-reply / compression-arming boundary law.
 //
 // THE RECEIPT (2026-08-30 rig, Forge 1.20.1-47.2.0 + TACZ + tacztweaks,
@@ -39,7 +43,8 @@
 // THE LAW, two mechanisms:
 //   1. writeLoginReplyNow — every login reply passes a boundary guard at
 //      write time: once the client has OBSERVED the end of negotiation
-//      (compressor armed, state left login, or connection ended) the reply
+//      (state left login, or connection ended — NOT a mere armed compressor,
+//      see boundaryObserved / HF38) the reply
 //      is dead — the server provably completed without it — and is dropped
 //      with a receipt instead of corrupting the stream. Used directly for
 //      the fml:handshake lockstep rounds (ModListReply, registry/config
@@ -72,8 +77,21 @@ function boundaryObserved (client) {
   // state, and sets `compressor` non-null exactly when it has processed
   // set_compression. Absent fields on an embedder's client are no evidence.
   if (client.ended === true) return 'connection-ended'
-  if (client.compressor) return 'compression-armed'
   if (typeof client.state === 'string' && client.state !== 'login') return `state-is-${client.state}`
+  // HF38: an ARMED compressor is NOT end-of-negotiation evidence. Once the
+  // client has processed set_compression, nmp routes the login serializer
+  // through the compressor (client.js setCompressionThreshold), so a reply
+  // written now is compression-framed — exactly what the server's armed
+  // decoder expects — and the server may still be inside login AWAITING it:
+  // Fabric API's login queries (fabric-networking-api-v1:early_registration,
+  // fabric:custom_ingredient_sync — a Fabric host under Kilt/Connector, or
+  // FFAPI on Forge) are sent from handleAcceptedLogin AFTER set_compression
+  // and hold the accept until answered. Dropping the reply there left the
+  // query unanswered and the server kicked slow_login at its 600-tick clock
+  // (join_diagnostics aa3a19f3, Kilt 20.1.14 rig 2026-09-06: 2/2 reproduced,
+  // 0/2 after this change). The HF12 kill-shot (a RAW frame onto an armed
+  // decoder) is a write made BEFORE the client observed set_compression —
+  // that is what the deferred write cures — never a write made after.
   return null
 }
 
@@ -92,6 +110,7 @@ function dropWithReceipt (client, params, context, why) {
       why
     })
     try { client.emit('forgeLoginReplyDropped', client.forgeDroppedLoginReplies[client.forgeDroppedLoginReplies.length - 1]) } catch { /* receipts never break the path */ }
+    loginWindow.noteReply(client, params, context, 'dropped', why)
   }
 }
 
@@ -102,6 +121,15 @@ function dropWithReceipt (client, params, context, why) {
  * and dropped with a receipt.
  */
 function writeLoginReplyNow (client, params, context) {
+  // HF38: one verdict per query. A reply for a query the login-window ledger
+  // already closed (budget-declined at its deadline, answered earlier, ...)
+  // is refused here — the vanilla server kicks unexpected_query_response on
+  // an id it no longer awaits.
+  const prior = loginWindow.priorVerdict(client, params && params.messageId)
+  if (prior) {
+    dropWithReceipt(client, params, context, `already-closed-${prior}`)
+    return false
+  }
   const why = boundaryObserved(client)
   if (why) {
     dropWithReceipt(client, params, context, why)
@@ -113,6 +141,7 @@ function writeLoginReplyNow (client, params, context) {
     return false
   }
   client.write('login_plugin_response', params)
+  loginWindow.noteReply(client, params, context, 'written')
   return true
 }
 

@@ -9,7 +9,60 @@ const forgeHandshakeConfig = require('./forgeHandshakeConfig')
 const decodeOptimized = require('./decodeOptimized')
 const { deriveNeoForgeComponents } = require('./neoForgePayloadDerivation')
 const { installNeoForgeConfigNegotiation } = require('./neoForgeConfig')
-const { warmLoginAssessments } = require('./loginAckDerivation')
+const { warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments } = require('./loginAckDerivation')
+
+// HF38: THE PRE-LOGIN DERIVATION. The inputs of every jar-derived login
+// verdict — the ping's channel census + the local instance jars — are known
+// before login_start, so the verdicts are computed here, off the login path
+// (HF12's warm-up), and made persistent through the embedder's store
+// (options.loginAssessmentStore: { load() -> entries, save(entries) }, keyed
+// by the embedder on its jar census so any pack change invalidates it). The
+// timeline is filed on the client (forgePreloginDerivation) for the
+// login-window summary and the join receipts. Never on the reply path:
+// an unwarmed channel still assesses inline (timed by the ledger).
+const DEFAULT_PRELOGIN_SYNC_BUDGET_MS = 8000
+
+function preloginDerivation (client, options, channelNames, modsPaths) {
+  const store = options && options.loginAssessmentStore
+  let imported = 0
+  if (store && typeof store.load === 'function') {
+    try { imported = importLoginAssessments(store.load()) } catch (err) { debug(`login-assessment store load failed (${err.message})`) }
+  }
+  // Phase 1 — SYNCHRONOUS, on the ping hook's own turn: nmp emits
+  // connect_allowed only after every hook returns, so everything assessed
+  // here is provably before set_protocol (the server's clock does not exist
+  // yet). Bounded (options.preloginSyncBudgetMs, default 8 s); with the
+  // persistent store it is ~0 ms on every run after the first.
+  const syncBudget = Number.isFinite(options && options.preloginSyncBudgetMs) ? options.preloginSyncBudgetMs : DEFAULT_PRELOGIN_SYNC_BUDGET_MS
+  const sync = warmLoginAssessmentsSync(channelNames, modsPaths, syncBudget)
+  const startedAt = Date.now() - sync.ms
+  const pre = { assessed: sync.assessed, fromCache: sync.fromCache, ms: sync.ms, syncMs: sync.ms, imported, channels: (channelNames || []).length, startedAt, finishedAt: Date.now(), finishedBeforeLoginStart: true, remaining: sync.remaining.length }
+  client.forgePreloginDerivation = pre
+  const report = () => {
+    if (pre.assessed > 0 || pre.channels > 0) {
+      console.log(`[forge] pre-login derivation: ${pre.assessed} login-channel verdict(s) ready in ${pre.ms} ms (${pre.syncMs} ms before the connection was allowed; ${pre.fromCache} already cached, ${imported} imported from the persistent store)${pre.finishedBeforeLoginStart ? ' — before login_start' : ` — ${pre.remaining} finished AFTER login_start`}`)
+    }
+    if (store && typeof store.save === 'function' && pre.assessed > pre.fromCache) {
+      try { store.save(exportLoginAssessments()) } catch (err) { debug(`login-assessment store save failed (${err.message})`) }
+    }
+  }
+  if (sync.remaining.length === 0) { report(); return Promise.resolve(pre) }
+  // Phase 2 — the rest, chunked one channel per turn (HF12's shape); the
+  // login path's inline assessment (timed by the ledger) covers a channel
+  // the server asks about before its verdict is ready.
+  return warmLoginAssessmentsDetailed(sync.remaining, modsPaths)
+    .then((facts) => {
+      const startAt = client.forgeLoginWindow && client.forgeLoginWindow.startAt
+      pre.assessed += facts.assessed
+      pre.fromCache += facts.fromCache
+      pre.finishedAt = facts.finishedAt
+      pre.ms = pre.finishedAt - startedAt
+      pre.finishedBeforeLoginStart = startAt == null || facts.finishedAt <= startAt
+      report()
+      return pre
+    })
+    .catch(() => null) // inline assessment still covers every channel
+}
 
 // top-level jars in the resolved local mods folder(s)
 function listModJars (modsPaths) {
@@ -101,8 +154,7 @@ module.exports = function (client, options) {
     // HF12: same off-path warmup as FML3 (see below) — the FML2 wrapped-mod
     // login lane shares the inline assessment and its exposure.
     if (Array.isArray(response.forgeData.channels)) {
-      warmLoginAssessments(response.forgeData.channels.map((ch) => ch.res), fml2ModsPaths)
-        .catch(() => { /* inline assessment still covers every channel */ })
+      preloginDerivation(client, options, response.forgeData.channels.map((ch) => ch.res), fml2ModsPaths)
     }
   })
 
@@ -173,10 +225,14 @@ module.exports = function (client, options) {
     // TACZ pack), long enough for the server to complete negotiation and arm
     // compression while our reply was still being computed. Chunked one
     // channel per turn; failures leave the inline path as the fallback.
+    // HF38: the warm-up is the PRE-LOGIN derivation — its inputs (the ping's
+    // channel census + the local instance jars) are known before login_start,
+    // so the verdicts are computed here and, through the embedder's
+    // persistent store (options.loginAssessmentStore: { load(), save(entries) },
+    // keyed on the jar census), survive the process. Its timeline is filed on
+    // the client for the login-window summary and the join receipts.
     if (ping && Array.isArray(ping.channels)) {
-      warmLoginAssessments(ping.channels.map((ch) => ch.name), modsPaths)
-        .then((n) => { if (n > 0) debug(`warmed ${n} login-channel assessments off the login path`) })
-        .catch(() => { /* inline assessment still covers every channel */ })
+      preloginDerivation(client, options, ping.channels.map((ch) => ch.name), modsPaths)
     }
   })
 

@@ -28,6 +28,8 @@ const { buildClass, buildJar } = require('./helpers/synthJar')
 const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js',
   'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js',
   'loginReplyBoundary.js', 'annotationRegistryDerivation.js', 'listenOnlyDerivation.js',
+  // HF38: the login-window ledger/budget (requires only debug + the reply boundary, lazily)
+  'loginWindow.js',
   // D3: the loader custom-spawn codec derivation + decoder (local loader jar only)
   'loaderSpawnDerivation.js', 'loaderSpawnDecoder.js', 'neoForgeLoaderLocator.js',
   // D3 rider: dimension bounds from the wire (login/respawn/registry_data) for the plausibility gate
@@ -326,6 +328,8 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         './worldBounds',
         // HF35: owo handshake derivation + login byte primitives (local jar parse only)
         './owoHandshake', './loginBytes',
+        // HF38: the login-window ledger (a clock + a ledger; no I/O)
+        './loginWindow',
         // HF35 rider: itemStackWireInstall compiles the extended slot into nmp's play protocol - protocol data +
         // the protodef compiler + nmp's datatype table + prismarine-nbt are local, pure-parsing dependencies
         './itemStackWireDerivation', 'minecraft-data', 'protodef', 'prismarine-nbt', 'minecraft-protocol/src/datatypes/compiler-minecraft'])

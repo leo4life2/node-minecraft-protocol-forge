@@ -9,6 +9,10 @@ const { resolveWrappedModLogin, wrapLoginPayload, encodeAcknowledgement, readVar
 // replies (the fire-and-forget-capable class) defer one event-loop turn and
 // are dropped with a receipt when the negotiation is observably over.
 const { writeLoginReplyNow, writeLoginReplyDeferred, registerLoginQuery } = require('./loginReplyBoundary')
+const { RAW_LOGIN_PROTOCOLS } = require('./owoHandshake')
+// HF38: the login window is the server's clock (loginWindow.js) — every
+// query ledgered with a deadline, every derivation timed, one verdict each.
+const loginWindow = require('./loginWindow')
 
 // Channels
 const FML_CHANNELS = {
@@ -97,6 +101,9 @@ module.exports = function (client, options) {
   // and make the server disconnect us
   const nmplistener = client.listeners('login_plugin_request').find((fn) => fn.name === 'onLoginPluginRequest')
   client.removeListener('login_plugin_request', nmplistener)
+
+  // HF38: ledger + deadline per query (installed before our own listener)
+  loginWindow.installLoginWindow(client, options)
 
   client.on('login_plugin_request', (data) => {
     // HF36: every query is owed exactly one reply — register it before any
@@ -261,9 +268,10 @@ module.exports = function (client, options) {
             const messageId = data.messageId
             // same dispatch shapes as FML3 (one rule for the class), for both
             // the synchronous ladder and the HF23 deferred (acquired) rung
+            loginWindow.noteInnerChannel(client, messageId, channel)
             const conventionAck = (kind) => writeLoginReplyDeferred(client, { messageId, data: wrapLoginPayload(channel, encodeAcknowledgement()) }, { channel, kind })
             const dispatch = (resolved, late) => {
-              if (resolved && (resolved.failed || resolved.silent)) return true // honest join stop / deadline-law self-end — no guessed bytes
+              if (resolved && (resolved.failed || resolved.silent)) { loginWindow.noteStop(client, messageId, resolved.failed ? 'honest-stop' : 'deadline-law', channel); return true } // honest join stop / deadline-law self-end — no guessed bytes
               if (resolved && resolved.conventionAck) {
                 // HF36: FML2 (Forge 1.13-1.16) cannot accept the vanilla
                 // decline — FMLLoginWrapper routes a null payload to
@@ -296,9 +304,10 @@ module.exports = function (client, options) {
               }
               return false
             }
-            const resolved = resolveWrappedModLogin(client, channel, disc.value, loginwrapper.data.slice(disc.size), options, 'fml2')
+            const resolved = loginWindow.timeDerivation(client, messageId, `wrapped login resolution ${channel}`, () => resolveWrappedModLogin(client, channel, disc.value, loginwrapper.data.slice(disc.size), options, 'fml2'))
             if (resolved && resolved.pending) {
               // HF23: deferred behind the announced-mod acquisition (see FML3)
+              loginWindow.noteAsyncDerivation(client, messageId, `announced-mod acquisition for ${channel}`)
               resolved.pending.then((late) => dispatch(late, true)).catch((err) => {
                 console.warn(`[forge] announced-mod acquisition for ${channel} threw (${err && err.message}) — answering with the FML convention acknowledgement (FML2 cannot accept a decline)`)
                 conventionAck('convention ack (acquisition error)')
@@ -317,7 +326,24 @@ module.exports = function (client, options) {
         }
       }
     } else {
-      console.log('other channel', data.channel, 'received')
+      // HF38: a mod's own RAW login channel on an FML2 wire — every query is
+      // answered (the login window is the server's clock; a pending query is
+      // the slow_login kick). Same ladder as FML3: speak it when we can,
+      // else the protocol's not-understood decline.
+      let reply = null
+      if (RAW_LOGIN_PROTOCOLS[data.channel]) {
+        try {
+          reply = loginWindow.timeDerivation(client, data.messageId, `raw login protocol ${data.channel}`, () => RAW_LOGIN_PROTOCOLS[data.channel](data.data, options))
+        } catch (err) {
+          debug(`failed to build ${data.channel} reply (${err.message}), replying not-understood`)
+        }
+      }
+      if (reply) {
+        writeLoginReplyDeferred(client, { messageId: data.messageId, data: reply }, { channel: data.channel, kind: 'raw-channel reply' })
+      } else {
+        console.log(`[forge] unknown raw login channel ${data.channel} received — answering the protocol's not-understood decline`)
+        writeLoginReplyDeferred(client, { messageId: data.messageId }, { channel: data.channel, kind: 'raw-channel not-understood' })
+      }
     }
   })
 }

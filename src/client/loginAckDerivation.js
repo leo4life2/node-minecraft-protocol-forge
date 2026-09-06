@@ -860,21 +860,116 @@ function assessLoginChannel (channelId, modsPaths) {
  * @returns {Promise<number>} resolves with the number of channels assessed
  */
 function warmLoginAssessments (channelIds, modsPaths) {
+  return warmLoginAssessmentsDetailed(channelIds, modsPaths).then((facts) => facts.assessed)
+}
+
+/**
+ * HF38: the same warm-up with its timeline — { assessed, fromCache, ms,
+ * startedAt, finishedAt, channels } — so the embedder can log "pre-login
+ * derivation N channels in M ms" and file it next to the login window.
+ * `fromCache` counts channels whose verdict was already in the assessment
+ * cache (a persistent store imported before the warm-up, or an earlier
+ * connection in this process).
+ */
+function warmLoginAssessmentsDetailed (channelIds, modsPaths) {
   const paths = (modsPaths || []).filter(Boolean)
   const queue = (channelIds || []).filter((ch) =>
     typeof ch === 'string' && ch.includes(':') &&
     !/^(fml|forge|minecraft):/.test(ch))
-  if (paths.length === 0 || queue.length === 0) return Promise.resolve(0)
+  const startedAt = Date.now()
+  const facts = { assessed: 0, fromCache: 0, ms: 0, startedAt, finishedAt: startedAt, channels: queue.length }
+  if (paths.length === 0 || queue.length === 0) return Promise.resolve(facts)
+  const pathsKey = paths.join('|')
   return new Promise((resolve) => {
-    let done = 0
     const step = () => {
       const ch = queue.shift()
-      if (!ch) return resolve(done)
-      try { assessLoginChannel(ch, paths); done++ } catch { /* inline path still covers it */ }
+      if (!ch) { facts.finishedAt = Date.now(); facts.ms = facts.finishedAt - startedAt; return resolve(facts) }
+      try {
+        if (assessCache.has(`${pathsKey}::${ch}`)) facts.fromCache++
+        assessLoginChannel(ch, paths)
+        facts.assessed++
+      } catch { /* inline path still covers it */ }
       setImmediate(step)
     }
     setImmediate(step)
   })
+}
+
+/**
+ * HF38: the SYNCHRONOUS half of the pre-login derivation — assesses as many
+ * channels as fit inside `budgetMs` on the caller's turn (the ping hook
+ * runs BEFORE nmp allows the connection, so work done here is provably
+ * before set_protocol — before the server's login clock exists). Returns
+ * { assessed, fromCache, ms, remaining } — `remaining` is handed to the
+ * chunked async warm-up. A persistent cache (importLoginAssessments) makes
+ * this ~0 ms on every run after the first for an unchanged pack.
+ */
+function warmLoginAssessmentsSync (channelIds, modsPaths, budgetMs) {
+  const paths = (modsPaths || []).filter(Boolean)
+  const queue = (channelIds || []).filter((ch) =>
+    typeof ch === 'string' && ch.includes(':') &&
+    !/^(fml|forge|minecraft):/.test(ch))
+  const startedAt = Date.now()
+  const facts = { assessed: 0, fromCache: 0, ms: 0, remaining: [] }
+  if (paths.length === 0) return facts
+  const pathsKey = paths.join('|')
+  const budget = Number.isFinite(budgetMs) ? Math.max(0, budgetMs) : 0
+  while (queue.length > 0) {
+    const ch = queue[0]
+    const cached = assessCache.has(`${pathsKey}::${ch}`)
+    if (!cached && Date.now() - startedAt >= budget) break
+    queue.shift()
+    try {
+      if (cached) facts.fromCache++
+      assessLoginChannel(ch, paths)
+      facts.assessed++
+    } catch { /* inline path still covers it */ }
+  }
+  facts.remaining = queue
+  facts.ms = Date.now() - startedAt
+  return facts
+}
+
+// HF38: the assessment cache made PERSISTENT by the embedder — a JSON-safe
+// export (Buffers as base64) keyed exactly as the in-memory cache is
+// (mods paths + channel), imported back before the pre-login warm-up. The
+// embedder keys its file on the jar census (names + sizes + mtimes) so any
+// pack change invalidates it; this module never touches the disk.
+function serializeAssessment (result) {
+  const out = {}
+  for (const [k, v] of Object.entries(result || {})) {
+    if (Buffer.isBuffer(v)) out[k] = { $buffer: v.toString('base64') }
+    else if (v !== undefined) out[k] = v
+  }
+  return out
+}
+
+function reviveAssessment (obj) {
+  const out = {}
+  for (const [k, v] of Object.entries(obj || {})) {
+    if (v && typeof v === 'object' && typeof v.$buffer === 'string') out[k] = Buffer.from(v.$buffer, 'base64')
+    else out[k] = v
+  }
+  return out
+}
+
+/** @returns {Array.<{key: string, result: object}>} every cached verdict (JSON-safe) */
+function exportLoginAssessments () {
+  const entries = []
+  for (const [key, result] of assessCache) entries.push({ key, result: serializeAssessment(result) })
+  return entries
+}
+
+/** Seeds the cache from an export; existing in-memory verdicts win. @returns {number} entries imported */
+function importLoginAssessments (entries) {
+  let n = 0
+  for (const e of Array.isArray(entries) ? entries : []) {
+    if (!e || typeof e.key !== 'string' || !e.result || typeof e.result.verdict !== 'string') continue
+    if (assessCache.has(e.key)) continue
+    assessCache.set(e.key, reviveAssessment(e.result))
+    n++
+  }
+  return n
 }
 
 /**
@@ -970,4 +1065,4 @@ function assessUncached (channelId, paths) {
   }
 }
 
-module.exports = { deriveLoginAck, assessLoginChannel, warmLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
+module.exports = { deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
