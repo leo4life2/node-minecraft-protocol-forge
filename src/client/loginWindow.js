@@ -22,9 +22,16 @@ const debug = require('debug')('minecraft-protocol-forge')
 //      (answered / declined / dropped / budget-declined / budget-ended /
 //      honest-stop / deadline-law / unanswered-at-close) with its reply
 //      latency and the derivation that produced it (name + ms). The reply
-//      boundary (loginReplyBoundary.js) files the verdicts; a SECOND reply
-//      for an already-closed query is refused there (the vanilla server
-//      kicks unexpected_query_response on an unknown/duplicate id).
+//      boundary (loginReplyBoundary.js) files the verdicts; a reply for an
+//      id with no OPEN entry (already closed, or never asked) is REFUSED
+//      there (HF36 P4: the vanilla server kicks unexpected_query_response
+//      on an unknown/duplicate id) and filed under `refused` — never as a
+//      second verdict. Entries are keyed by id AND open-order: a Kilt host
+//      restarts Fabric's query counter at 0 after the Forge handshake, so
+//      one id names two distinct queries in one login (ledger-v1cold: ids
+//      0/1 = S2CModData/ModList early, then fabric-networking-api-v1:
+//      early_registration/fabric:custom_ingredient_sync at 1.2 s); a reply
+//      settles the most recent open entry with its id.
 //   2. THE BUDGET — each query gets a bounded reply deadline derived from
 //      the window: min(arrival + queryBudgetMs, login_start + windowMs −
 //      safetyMs). A query still open at its deadline is closed HONESTLY:
@@ -87,7 +94,7 @@ function installLoginWindow (client, options) {
     endedAt: null,
     endedBy: null,
     queries: [],
-    byId: new Map(),
+    refused: [],
     budgetStops: [],
     derivationMs: 0
   }
@@ -134,13 +141,42 @@ function noteQuery (client, packet) {
   entry.timer = setTimeout(() => expire(client, entry), deadlineAt - now)
   if (entry.timer.unref) entry.timer.unref()
   w.queries.push(entry)
-  w.byId.set(entry.messageId, entry)
   return entry
 }
 
-function entryOf (client, messageId) {
+/** True when a ledger is installed on the client (the boundary fails open without one). */
+function installed (client) { return !!ledgerOf(client) }
+
+/**
+ * The most recent OPEN (no verdict yet) entry with this id, or null. A
+ * writer that knows its entry (the budget stop) names it in context.entry —
+ * under a duplicated id it is that entry, never a newer one, that closes.
+ */
+function openEntry (client, messageId, context) {
   const w = ledgerOf(client)
-  return w && messageId != null ? (w.byId.get(messageId) || null) : null
+  if (!w || messageId == null) return null
+  if (context && context.entry && !context.entry.outcome && w.queries.includes(context.entry)) return context.entry
+  for (let i = w.queries.length - 1; i >= 0; i--) {
+    const e = w.queries[i]
+    if (e.messageId === messageId && !e.outcome) return e
+  }
+  return null
+}
+
+/** The most recent entry with this id, open or closed, or null. */
+function latestEntry (client, messageId) {
+  const w = ledgerOf(client)
+  if (!w || messageId == null) return null
+  for (let i = w.queries.length - 1; i >= 0; i--) {
+    if (w.queries[i].messageId === messageId) return w.queries[i]
+  }
+  return null
+}
+
+// The entry an organ means by an id: the one still owed a verdict, else the
+// last one filed under that id (a verdict already stands; settle() keeps it).
+function entryOf (client, messageId) {
+  return openEntry(client, messageId) || latestEntry(client, messageId)
 }
 
 /** The inner (wrapped) channel once the handler has parsed the wrapper. */
@@ -164,23 +200,31 @@ function settle (e, w, outcome, extra) {
 
 /**
  * Filed by the reply boundary: `written` (answered / declined by the shape
- * of params — data present or not) or `dropped` (with why). Unknown ids
- * (a reply the ledger never saw arrive) get a synthetic entry so the
- * timeline stays complete.
+ * of params — data present or not) or `dropped` (with why) — the verdict of
+ * the most recent OPEN entry with the reply's id. A reply with no open
+ * entry never reaches here (the boundary refuses it: noteRefused).
  */
 function noteReply (client, params, context, disposition, why) {
   const w = ledgerOf(client)
   if (!w || !params) return
-  let e = w.byId.get(params.messageId)
-  if (!e) {
-    e = { messageId: params.messageId, channel: context && context.channel, innerChannel: null, wrapped: false, arrivedAt: null, sinceLoginStartMs: null, deadlineAt: null, budgetMs: null, answeredAt: null, latencyMs: null, outcome: null, kind: null, why: null, derivation: null, timer: null, unsolicited: true }
-    w.queries.push(e)
-    w.byId.set(e.messageId, e)
-  }
+  const e = openEntry(client, params.messageId, context)
+  if (!e) return
   const kind = context && context.kind
   if (disposition === 'dropped') { settle(e, w, 'dropped', { kind, why: why || null }); return }
   if (context && context.budget) { settle(e, w, 'budget-declined', { kind }); return }
   settle(e, w, params.data == null ? 'declined' : 'answered', { kind })
+}
+
+/**
+ * A reply the boundary REFUSED (no open entry for its id: a duplicate organ
+ * answer, a late rung after the budget closed the query, a stray id). The
+ * query's own verdict stands; the refusal is filed for the timeline.
+ */
+function noteRefused (client, params, context, why) {
+  const w = ledgerOf(client)
+  if (!w) return
+  const prior = latestEntry(client, params && params.messageId)
+  w.refused.push({ messageId: params ? params.messageId : undefined, channel: (context && context.channel) || (prior && (prior.innerChannel || prior.channel)) || null, kind: context && context.kind, why, at: w.now(), priorOutcome: prior ? prior.outcome : null })
 }
 
 /** A typed stop the handler took instead of a reply (honest-stop / deadline-law). */
@@ -190,10 +234,14 @@ function noteStop (client, messageId, outcome, why) {
   if (w && e) settle(e, w, outcome, { why: why || null })
 }
 
-/** The verdict already filed for a message id, or null while it is open. */
+/**
+ * The verdict already filed for a message id ({ outcome, kind, channel }),
+ * or null while an entry with that id is still open (or none was filed).
+ */
 function priorVerdict (client, messageId) {
-  const e = entryOf(client, messageId)
-  return e && e.outcome && TERMINAL.has(e.outcome) ? e.outcome : null
+  if (openEntry(client, messageId)) return null
+  const e = latestEntry(client, messageId)
+  return e && e.outcome && TERMINAL.has(e.outcome) ? { outcome: e.outcome, kind: e.kind, channel: e.innerChannel || e.channel } : null
 }
 
 /** Times a SYNCHRONOUS derivation for a query and files name + ms on its entry. */
@@ -271,7 +319,7 @@ function expire (client, e) {
     console.warn(`[forge] login-window budget: the login query on ${channel} (messageId ${e.messageId}) has waited ${waitedMs} ms of its ${e.budgetMs} ms budget (${derivation}); ` +
       `the server's ${w.ticks}-tick login window closes in ${remainingMs} ms — answering the protocol's not-understood decline now rather than leaving it pending for the server's slow_login clock.`)
     const { writeLoginReplyNow } = require('./loginReplyBoundary')
-    writeLoginReplyNow(client, { messageId: e.messageId }, { channel, kind: 'budget decline (login-window)', budget: true })
+    writeLoginReplyNow(client, { messageId: e.messageId }, { channel, kind: 'budget decline (login-window)', budget: true, entry: e })
   } else {
     const message = `Cannot answer the modded login check on channel "${channel}" inside the server's login window: ${derivation}; ` +
       `the query has waited ${waitedMs} ms of its ${e.budgetMs} ms budget and the server's ${w.ticks}-tick window closes in ${remainingMs} ms. ` +
@@ -299,7 +347,7 @@ function closeWindow (client, by) {
   const pre = s.prelogin ? `; pre-login derivation ${s.prelogin.assessed} channel(s) in ${s.prelogin.ms} ms (${s.prelogin.fromCache} from the persistent cache)` : ''
   const open = s.unansweredAtClose.length > 0 ? `; UNANSWERED at close: ${s.unansweredAtClose.join(', ')}` : ''
   console.log(`[forge] login window (${by}): ${s.queries.length} login quer${s.queries.length === 1 ? 'y' : 'ies'} in ${s.elapsedMs} ms of the ${w.windowMs} ms window; ` +
-    `${s.counts.answered} answered, ${s.counts.declined} declined, ${s.counts.dropped} dropped, ${s.counts.budget} budget-stopped;${slow}; derivation ${w.derivationMs} ms on the login path${pre}${open}`)
+    `${s.counts.answered} answered, ${s.counts.declined} declined, ${s.counts.dropped} dropped, ${s.counts.budget} budget-stopped, ${s.counts.refused} refused;${slow}; derivation ${w.derivationMs} ms on the login path${pre}${open}`)
 }
 
 /** JSON-safe snapshot: names, counts, timings — never a body. */
@@ -307,7 +355,7 @@ function loginWindowSummary (client) {
   const w = ledgerOf(client)
   if (!w) return null
   const now = w.endedAt != null ? w.endedAt : w.now()
-  const counts = { answered: 0, declined: 0, dropped: 0, budget: 0, stopped: 0, unanswered: 0, noReply: 0, open: 0 }
+  const counts = { answered: 0, declined: 0, dropped: 0, budget: 0, stopped: 0, unanswered: 0, noReply: 0, open: 0, refused: w.refused.length }
   let slowest = null
   const queries = w.queries.map((e) => {
     if (e.outcome === 'answered') counts.answered++
@@ -349,15 +397,20 @@ function loginWindowSummary (client) {
     derivationMs: w.derivationMs,
     unansweredAtClose: queries.filter((q) => q.outcome === 'unanswered-at-close' || q.outcome == null).map((q) => q.channel),
     budgetStops: w.budgetStops.map((f) => ({ channel: f.channel, action: f.action, waitedMs: f.waitedMs, budgetMs: f.budgetMs, derivation: f.derivation })),
+    refused: w.refused.map((r) => ({ messageId: r.messageId, channel: r.channel, kind: r.kind, why: r.why, priorOutcome: r.priorOutcome })),
     prelogin: pre ? { assessed: pre.assessed, ms: pre.ms, fromCache: pre.fromCache, finishedBeforeLoginStart: pre.finishedBeforeLoginStart } : null
   }
 }
 
 module.exports = {
   installLoginWindow,
+  installed,
   noteQuery,
+  openEntry,
+  latestEntry,
   noteInnerChannel,
   noteReply,
+  noteRefused,
   noteStop,
   priorVerdict,
   timeDerivation,

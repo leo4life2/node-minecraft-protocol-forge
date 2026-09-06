@@ -49,6 +49,17 @@ const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, cpUtf8, cpRef } = require('./jarAnalysis')
 
+// HF38 MED-3 — THE DERIVATION VERSION. Every embedder that persists this
+// module's verdicts (exportLoginAssessments -> a cache keyed on the jar
+// census) must fold this number into its key: the jars can be byte-identical
+// while the DERIVATION changed (HF16-R: static-field declarer resolution;
+// HF36: the FML2-era ResourceLocation class below), and a stale verdict then
+// serves the old ack until someone hand-bumps an app number. Bump on every
+// change to what this module derives from the same jars.
+//   1 — HF13 base derivation
+//   2 — HF16-R getstatic/putstatic declarer walk + HF36 net/minecraft/util/ResourceLocation
+const LOGIN_ACK_DERIVATION_VERSION = 2
+
 const RL_CLASSES = new Set([
   'net/minecraft/resources/ResourceLocation', // mojmap/srg (Forge 1.17+ mods)
   'net/minecraft/util/ResourceLocation', // MCP/srg (Forge 1.13-1.16 = FML2-era mods)
@@ -1065,4 +1076,4 @@ function assessUncached (channelId, paths) {
   }
 }
 
-module.exports = { deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
+module.exports = { LOGIN_ACK_DERIVATION_VERSION, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }

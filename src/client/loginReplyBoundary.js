@@ -1,7 +1,35 @@
 'use strict'
 
-// HF38 — the login-window ledger files every verdict written or dropped here
-// (loginWindow.js: the server's 600-tick clock is the deadline of every query).
+// HF36 + HF38 — ONE login-reply boundary (unified 2026-09-06).
+//
+// Every login query the rails receive is filed in the login-window ledger
+// (loginWindow.js) on arrival, and every reply — lockstep round, table
+// reply, jar-derived ack, HF8/HF13 decline, HF23 acquisition rung, HF36
+// convention ack, raw-channel reply, HF38 budget decline — passes THIS
+// write site. The ledger is the one place that knows which queries are
+// still owed, so three laws are enforced here and nowhere else:
+//   P4 (HF36) — exactly one login_plugin_response per PENDING query, in
+//     order: a reply for an id nobody asked (unknown transaction), for an
+//     id already closed (a second organ, a late acquisition rung racing the
+//     synchronous ladder, a budget decline that already went out), or after
+//     the negotiation observably ended, is refused with a receipt. Vanilla
+//     and every FML era kick a stray or repeated answer as
+//     multiplayer.disconnect.unexpected_query_response. Entries are keyed
+//     by id AND open-order (a Kilt host restarts Fabric's query counter at
+//     0 after the Forge handshake, so the same id names two distinct
+//     queries in one login): a reply settles the most recent OPEN entry
+//     with its id and is refused only when none is open.
+//   THE WINDOW (HF38) — every query carries a deadline derived from the
+//     server's 600-tick login clock; the ledger closes a still-open query
+//     at its deadline (loginWindow.expire) through this same site.
+//   THE ARMING BOUNDARY (HF12, bounded by HF38) — a fire-and-forget-capable
+//     reply is deferred so already-arrived end-of-login evidence is read
+//     first; after set_compression it is held until the next inbound packet
+//     or a short bound (see writeLoginReplyDeferred) so it can never land in
+//     PLAY.
+// Fail-open by construction: a client no rail installed the ledger on (an
+// embedder writing through this boundary on its own) keeps the pre-ledger
+// behavior — only the arming boundary guards it.
 const loginWindow = require('./loginWindow')
 
 // HF12 — the login-reply / compression-arming boundary law.
@@ -95,49 +123,83 @@ function boundaryObserved (client) {
   return null
 }
 
+function compressionArmed (client) {
+  // nmp: `compressor` is non-null exactly when set_compression was processed
+  return !!(client && client.compressor)
+}
+
+function labelOf (params, context) {
+  return context && context.channel ? `${context.channel} (${context.kind || 'reply'})` : (context && context.kind) || 'login reply'
+}
+
+function receipt (client, params, context, why) {
+  if (!client) return
+  if (!Array.isArray(client.forgeDroppedLoginReplies)) client.forgeDroppedLoginReplies = []
+  client.forgeDroppedLoginReplies.push({
+    messageId: params ? params.messageId : undefined,
+    channel: context && context.channel,
+    kind: context && context.kind,
+    why
+  })
+  try { client.emit('forgeLoginReplyDropped', client.forgeDroppedLoginReplies[client.forgeDroppedLoginReplies.length - 1]) } catch { /* receipts never break the path */ }
+}
+
+// A reply the negotiation's end made dead (HF12): the query it answered is
+// settled `dropped` in the ledger — it was owed and never reached the wire.
 function dropWithReceipt (client, params, context, why) {
-  const label = context && context.channel ? `${context.channel} (${context.kind || 'reply'})` : (context && context.kind) || 'login reply'
-  console.warn(`[forge] dropped late login reply for ${label} (messageId ${params && params.messageId}): ` +
+  console.warn(`[forge] dropped late login reply for ${labelOf(params, context)} (messageId ${params && params.messageId}): ` +
     `the login negotiation is already over (${why}). Writing it would corrupt the stream — after the server arms ` +
     'compression every serverbound frame must be compression-framed, and a raw login_plugin_response\'s packet id ' +
     'byte (0x02) reads as a bogus compressed-frame data length ("Badly compressed packet - size of 2").')
-  if (client) {
-    if (!Array.isArray(client.forgeDroppedLoginReplies)) client.forgeDroppedLoginReplies = []
-    client.forgeDroppedLoginReplies.push({
-      messageId: params ? params.messageId : undefined,
-      channel: context && context.channel,
-      kind: context && context.kind,
-      why
-    })
-    try { client.emit('forgeLoginReplyDropped', client.forgeDroppedLoginReplies[client.forgeDroppedLoginReplies.length - 1]) } catch { /* receipts never break the path */ }
-    loginWindow.noteReply(client, params, context, 'dropped', why)
-  }
+  receipt(client, params, context, why)
+  loginWindow.noteReply(client, params, context, 'dropped', why)
+}
+
+// A reply the LEDGER refuses (HF36 P4): no query is owed for this id — the
+// entry's own verdict stands; this write is filed as refused, never as a
+// second verdict.
+function refuseWithReceipt (client, params, context, why) {
+  console.warn(`[forge] refused login reply for ${labelOf(params, context)} (messageId ${params && params.messageId}): ${why}. ` +
+    'A login_plugin_response must carry the id of a query still awaiting its answer, exactly once — every server ' +
+    '(vanilla and every FML era) kicks a stray or repeated answer as multiplayer.disconnect.unexpected_query_response.')
+  receipt(client, params, context, why)
+  loginWindow.noteRefused(client, params, context, why)
+}
+
+/**
+ * HF36 — registers a login query the rails received (idempotent against the
+ * ledger's own arrival listener: returns the OPEN entry for this id when one
+ * exists, files a new one otherwise). Null when no ledger is installed on
+ * the client (fail-open: the boundary then guards only the arming law).
+ */
+function registerLoginQuery (client, messageId, context) {
+  if (!client || !Number.isInteger(messageId)) return null
+  if (!loginWindow.installed(client)) return null
+  return loginWindow.openEntry(client, messageId) || loginWindow.noteQuery(client, { messageId, channel: context && context.channel })
 }
 
 /**
  * Boundary-guarded synchronous login reply. For replies the server provably
- * awaits (fml:handshake lockstep rounds): written immediately unless the end
- * of negotiation has already been observed, in which case the reply is dead
- * and dropped with a receipt.
+ * awaits (fml:handshake lockstep rounds): written immediately unless the
+ * ledger refuses it or the end of negotiation has already been observed.
  */
 function writeLoginReplyNow (client, params, context) {
-  // HF38: one verdict per query. A reply for a query the login-window ledger
-  // already closed (budget-declined at its deadline, answered earlier, ...)
-  // is refused here — the vanilla server kicks unexpected_query_response on
-  // an id it no longer awaits.
-  const prior = loginWindow.priorVerdict(client, params && params.messageId)
-  if (prior) {
-    dropWithReceipt(client, params, context, `already-closed-${prior}`)
-    return false
+  const messageId = params && params.messageId
+  if (loginWindow.installed(client)) {
+    // P4: one reply per PENDING query id. The most recent open entry with
+    // this id is the one being answered; none open = nothing is owed.
+    if (!loginWindow.openEntry(client, messageId, context)) {
+      const prior = loginWindow.priorVerdict(client, messageId)
+      const why = prior
+        ? `duplicate-reply: already-closed-${prior.outcome}${prior.kind ? ` (first answered by ${prior.kind})` : ''}`
+        : 'unknown-transaction'
+      refuseWithReceipt(client, params, context, why)
+      return false
+    }
   }
   const why = boundaryObserved(client)
   if (why) {
     dropWithReceipt(client, params, context, why)
-    return false
-  }
-  const ledgerWhy = ledgerVerdict(client, params, context)
-  if (ledgerWhy) {
-    dropWithLedgerReceipt(client, params, context, ledgerWhy)
     return false
   }
   client.write('login_plugin_response', params)
@@ -145,68 +207,48 @@ function writeLoginReplyNow (client, params, context) {
   return true
 }
 
-// HF36 — THE PENDING-TRANSACTION LEDGER (P4: a login_plugin_response carries
-// exactly the transaction id of the query it answers, once).
-//
-// Every login query the rails receive is registered here BEFORE any organ
-// (lockstep round, table reply, jar-derived ack, HF8/HF13 decline, HF23
-// acquisition rung, convention ack, raw-channel reply) computes an answer,
-// and every reply passes this single write site. The ledger is the one
-// place that knows which ids are still owed: a reply for an id nobody
-// asked (unknown transaction), or for an id already answered (a second
-// organ, a late acquisition rung racing the synchronous ladder, a retry
-// after an exception), is dropped with a receipt instead of reaching the
-// wire — vanilla and every FML era kick a stray answer as
-// multiplayer.disconnect.unexpected_query_response, so the ONLY safe
-// number of replies per id is one. Fail-open by construction: a client no
-// rail registered queries on (an embedder writing through this boundary
-// on its own) has no ledger and keeps the pre-HF36 behavior.
-function registerLoginQuery (client, messageId, context) {
-  if (!client || !Number.isInteger(messageId)) return null
-  if (!(client.forgeLoginQueryLedger instanceof Map)) client.forgeLoginQueryLedger = new Map()
-  const ledger = client.forgeLoginQueryLedger
-  const prior = ledger.get(messageId)
-  if (prior && !prior.answered) {
-    // the server re-asked an id we still owe — same transaction, keep the
-    // first registration (one reply is still exactly one)
-    return prior
+// HF38 MED-4: after set_compression a deferred reply is held until the next
+// inbound packet has been processed (login success flips the state and the
+// guard drops the reply; a further login query proves the server is still
+// inside login) or this bound elapses (the server is blocked on us: an
+// awaited post-compression query — Fabric API on Kilt — receives its reply
+// at most this late). Two event-loop hops were not a bound: a success packet
+// already in the kernel buffer could be parsed AFTER the hops, and a reply
+// to a non-awaited wrapped message then landed in PLAY as packet 0x02.
+const POST_COMPRESSION_HOLD_MS = 100
+
+function afterNextInboundOrBound (client, ms, fn) {
+  let done = false
+  let timer = null
+  const fire = () => {
+    if (done) return
+    done = true
+    if (timer) clearTimeout(timer)
+    if (typeof client.removeListener === 'function') client.removeListener('packet', onPacket)
+    // the named packet handler (success -> state play) runs in the same
+    // synchronous emit frame as 'packet'; write only after it has
+    setImmediate(fn)
   }
-  const entry = { messageId, channel: context && context.channel, at: Date.now(), answered: false, answeredBy: null, reissued: !!prior }
-  ledger.set(messageId, entry)
-  return entry
-}
-
-function ledgerVerdict (client, params, context) {
-  if (!client || !(client.forgeLoginQueryLedger instanceof Map)) return null
-  const messageId = params && params.messageId
-  const entry = client.forgeLoginQueryLedger.get(messageId)
-  if (!entry) return 'unknown-transaction'
-  if (entry.answered) return `duplicate-reply (first answered by ${entry.answeredBy || 'an earlier organ'})`
-  entry.answered = true
-  entry.answeredBy = (context && context.kind) || 'login reply'
-  entry.answeredAt = Date.now()
-  return null
-}
-
-function dropWithLedgerReceipt (client, params, context, why) {
-  const label = context && context.channel ? `${context.channel} (${context.kind || 'reply'})` : (context && context.kind) || 'login reply'
-  console.warn(`[forge] dropped login reply for ${label} (messageId ${params && params.messageId}): ${why}. ` +
-    'A login_plugin_response must carry the id of a query still awaiting its answer, exactly once — every server ' +
-    '(vanilla and every FML era) kicks a stray or repeated answer as multiplayer.disconnect.unexpected_query_response.')
-  if (!Array.isArray(client.forgeDroppedLoginReplies)) client.forgeDroppedLoginReplies = []
-  client.forgeDroppedLoginReplies.push({ messageId: params ? params.messageId : undefined, channel: context && context.channel, kind: context && context.kind, why })
-  try { client.emit('forgeLoginReplyDropped', client.forgeDroppedLoginReplies[client.forgeDroppedLoginReplies.length - 1]) } catch { /* receipts never break the path */ }
+  function onPacket () { fire() }
+  if (typeof client.once === 'function') client.once('packet', onPacket)
+  timer = setTimeout(fire, ms)
 }
 
 /**
  * Boundary-guarded deferred login reply, for wrapped-mod-channel and raw
  * mod-channel messages (the class the server may dispatch fire-and-forget).
  * Defers one full event-loop turn so any already-arrived end-of-negotiation
- * evidence (set_compression, login success) is processed first, then applies
- * the same guard.
+ * evidence (set_compression, login success) is processed first; once
+ * compression is armed, holds until the next inbound packet or a short
+ * bound; then applies the same guard as writeLoginReplyNow.
  */
 function writeLoginReplyDeferred (client, params, context) {
-  setImmediate(() => setImmediate(() => { writeLoginReplyNow(client, params, context) }))
+  setImmediate(() => setImmediate(() => {
+    // hold only while the outcome is still undecided: an already-observed
+    // end of login (success / end processed during the hops) drops now
+    if (compressionArmed(client) && !boundaryObserved(client)) afterNextInboundOrBound(client, POST_COMPRESSION_HOLD_MS, () => writeLoginReplyNow(client, params, context))
+    else writeLoginReplyNow(client, params, context)
+  }))
 }
 
-module.exports = { writeLoginReplyNow, writeLoginReplyDeferred, boundaryObserved, registerLoginQuery }
+module.exports = { writeLoginReplyNow, writeLoginReplyDeferred, boundaryObserved, registerLoginQuery, POST_COMPRESSION_HOLD_MS }
