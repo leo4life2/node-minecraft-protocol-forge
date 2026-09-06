@@ -293,6 +293,40 @@ function walkLinear (code, cp, visit) {
 
 // ---------- Type-field resolution via <clinit>/method scan ----------
 
+// HF16-R — JVMS §5.4.3.2 field resolution. The constant-pool owner of a
+// getstatic is the class named at the USE site, not necessarily the class
+// that DECLARES the field: `SPSetRemotePlayerSkill.CLIENT_BOUND_SET_REMOTE_PLAYER_SKILL`
+// (Epic Fight 21.17.3.1) names a static Type declared on the superinterface
+// ManagedCustomPacketPayload, whose <clinit> is the only initializer that ever
+// putstatics it. Keying the lookup by the use-site owner simulated the
+// record's own <clinit> (STREAM_CODEC only), found nothing, and abstained the
+// registration — a REQUIRED server channel then went unclaimed and NeoForge's
+// negotiator kicked the join (missing.server.client, field receipt 2026-09-05).
+// The JVM resolves such a reference class-first, then superinterfaces
+// (recursively), then the superclass chain — do exactly that here so every
+// static-field resolver (Type / String / ResourceLocation) keys by the true
+// declarer and simulates the true initializer. Unknown classes fall back to
+// the use-site owner (never a wider claim than before).
+function resolveFieldDeclarer (index, owner, name, desc, seen = new Set()) {
+  if (!owner || seen.has(owner)) return null
+  seen.add(owner)
+  const info = index.get(owner)
+  if (!info) return null
+  if ((info.fields || []).some((f) => f.name === name && f.desc === desc)) return owner
+  for (const itf of info.interfaces || []) {
+    const hit = resolveFieldDeclarer(index, itf, name, desc, seen)
+    if (hit) return hit
+  }
+  return resolveFieldDeclarer(index, info.superName, name, desc, seen)
+}
+
+function lookupStaticField (index, val, state) {
+  const declarer = resolveFieldDeclarer(index, val.owner, val.name, val.desc) || val.owner
+  const key = `${declarer}.${val.name}`
+  if (!(key in state.fieldValues)) resolveClassTypeFields(index, declarer, state)
+  return state.fieldValues[key]
+}
+
 function resolveClassTypeFields (index, className, state) {
   if (state.typeFieldsResolved.has(className)) return
   state.typeFieldsResolved.add(className)
@@ -307,9 +341,7 @@ function resolveTypeValue (index, val, state) {
   if (!val) return null
   if (val.k === 'type') return val.v
   if (val.k === 'field' && val.desc === `L${PAYLOAD_TYPE_CLASS};`) {
-    const key = `${val.owner}.${val.name}`
-    if (!(key in state.fieldValues)) resolveClassTypeFields(index, val.owner, state)
-    const resolved = state.fieldValues[key]
+    const resolved = lookupStaticField(index, val, state)
     if (resolved && resolved.k === 'type') return resolved.v
     return null
   }
@@ -321,9 +353,7 @@ function resolveStringValue (index, val, state) {
   if (val.k === 'str') return val.v
   if (val.k === 'int') return String(val.v)
   if (val.k === 'field' && val.desc === 'Ljava/lang/String;') {
-    const key = `${val.owner}.${val.name}`
-    if (!(key in state.fieldValues)) resolveClassTypeFields(index, val.owner, state)
-    const resolved = state.fieldValues[key]
+    const resolved = lookupStaticField(index, val, state)
     if (resolved && resolved.k === 'str') return resolved.v
   }
   return null
@@ -341,9 +371,7 @@ function resolveReslocValue (index, val, state) {
   if (!val) return null
   if (val.k === 'resloc') return val.v
   if (val.k === 'field' && val.desc === `L${RESLOC_TYPE};`) {
-    const key = `${val.owner}.${val.name}`
-    if (!(key in state.fieldValues)) resolveClassTypeFields(index, val.owner, state)
-    const resolved = state.fieldValues[key]
+    const resolved = lookupStaticField(index, val, state)
     if (resolved && resolved.k === 'resloc') return resolved.v
   }
   return null
