@@ -772,6 +772,30 @@ function handleInvoke (index, classInfo, state, opts, call) {
 // the same >12-override abstain) the wrapper dispatch uses.
 const HELPER_FRAME_BUDGET = 20000
 
+// Does override `cls`'s implementation of `ref` carry the registrar? Its own
+// bytes name the registrar type (checkcast / typed parameter), OR — one hop —
+// its body passes an Object-typed argument into a method declared on ANOTHER
+// scanned class whose bytes name the registrar (Kotlin `invoke(Object)`
+// bridges forwarding straight into `Helper.register(Object)`). Bounded to
+// one hop by construction: the callee's bytes are inspected, never walked.
+function overrideCarriesRegistrar (index, cls, ref) {
+  const own = index.rawBytes(cls)
+  if (!own) return false
+  if (own.includes(REGISTRAR_SIMPLE)) return true
+  const info = index.get(cls)
+  const m = info && info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
+  if (!m) return false
+  let carries = false
+  walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+    if (carries || op < 0xb6 || op > 0xb9) return // invokevirtual/special/static/interface
+    const callee = cpRef(cp, code.readUInt16BE(pc + 1))
+    if (!callee || callee.owner === cls || !callee.desc.includes('Ljava/lang/Object;')) return
+    const callBytes = index.rawBytes(callee.owner)
+    if (callBytes && callBytes.includes(REGISTRAR_SIMPLE)) carries = true
+  })
+  return carries
+}
+
 function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) {
   state.helperStack = state.helperStack || new Set()
   state.helperFrames = state.helperFrames || 0
@@ -803,12 +827,25 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
       // which can CARRY the registrar — an override that does names the
       // registrar type (its checkcast / typed parameter). Count only those
       // before the bound; the rest are provably not registration bodies.
-      const carrying = targets.filter((t) => { const b = index.rawBytes(t); return !!b && b.includes(REGISTRAR_SIMPLE) })
+      //
+      // HF16-R2 rider: "names the registrar" is widened ONE hop — an override
+      // that forwards its Object argument into a method of another class
+      // that names the registrar (the checkcast lives in the helper) is a
+      // registration body too. Whatever is still dropped while siblings are
+      // walked is abstained WITH the count and the site, never a silent
+      // debug line: a forwarded override beyond the hop must not lose its
+      // channels behind a sibling's successful claim.
+      const carrying = targets.filter((t) => overrideCarriesRegistrar(index, t, ref))
       if (carrying.length > 12) {
         state.diagnostics.abstains.push(`${key}: ${carrying.length} overrides carrying a registrar — too many, abstaining`)
         return
       }
-      debug(`${key}: ${targets.length - carrying.length} of ${targets.length} overrides carry no registrar — dropped, ${carrying.length} walked`)
+      const dropped = targets.length - carrying.length
+      if (dropped > 0 && carrying.length > 0) {
+        state.diagnostics.abstains.push(`${key}: ${dropped} of ${targets.length} overrides carry no registrar (own bytes or one forwarding hop) — dropped unfollowed, ${carrying.length} walked (${carrying.join(', ')})`)
+      } else {
+        debug(`${key}: ${dropped} of ${targets.length} overrides carry no registrar — dropped, ${carrying.length} walked`)
+      }
       targets.length = 0
       targets.push(...carrying)
     }
