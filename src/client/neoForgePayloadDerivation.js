@@ -79,6 +79,7 @@ const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveCo
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
+const REGISTRAR_SIMPLE = REGISTRAR_TYPE.split('/').pop()
 const RESLOC_TYPE = 'net/minecraft/resources/ResourceLocation'
 const PAYLOAD_TYPE_CLASS = 'net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type'
 
@@ -464,7 +465,11 @@ function simulate (index, classInfo, method, state, opts = {}) {
       case 0xb3: { // putstatic — keyed by the DECLARER, symmetric with getstatic (HF16-R rider)
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         const val = stack.pop()
-        if (ref && val && opts.recordPutstatic) {
+        // HF16-R2 rider — the STATIC-REGISTRAR shape: an entry that stores the
+        // registrar in a static field for population sites run later
+        // (`registrar = event.registrar("x").optional(); Networking.init()`)
+        // is a fact about the entry itself, recorded under every walk.
+        if (ref && val && (opts.recordPutstatic || val.k === 'registrar')) {
           state.fieldValues[staticFieldKey(index, ref)] = val
         }
         break
@@ -793,8 +798,19 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
       }
     }
     if (targets.length > 12) {
-      state.diagnostics.abstains.push(`${key}: ${targets.length} overrides carrying a registrar — too many, abstaining`)
-      return
+      // HF16-R2: a generic functional interface (kotlin Function1.invoke,
+      // Consumer.accept) has hundreds of scanned implementors, almost none of
+      // which can CARRY the registrar — an override that does names the
+      // registrar type (its checkcast / typed parameter). Count only those
+      // before the bound; the rest are provably not registration bodies.
+      const carrying = targets.filter((t) => { const b = index.rawBytes(t); return !!b && b.includes(REGISTRAR_SIMPLE) })
+      if (carrying.length > 12) {
+        state.diagnostics.abstains.push(`${key}: ${carrying.length} overrides carrying a registrar — too many, abstaining`)
+        return
+      }
+      debug(`${key}: ${targets.length - carrying.length} of ${targets.length} overrides carry no registrar — dropped, ${carrying.length} walked`)
+      targets.length = 0
+      targets.push(...carrying)
     }
   }
   if (targets.length === 0) return
@@ -1218,6 +1234,18 @@ const CLASS_TYPE = 'java/lang/Class'
 const AGG_MAX_DEPTH = 3
 const AGG_MAX_CONTEXTS = 512 // HF37: bounded by the step budgets below; 24 truncated a 160-holder pack (minecolonies) to nothing
 const AGG_MAX_STEPS_PER_EVAL = 30000
+// HF16-R2: an UNDECIDED loop (symbolic hasNext / unknown counter) is bounded
+// per pc at 64 as before — raising that bound pack-wide (256 in round 1) let
+// every undecided loop spin four times longer and exhausted the SHARED step
+// budget on a 71-jar pack (65 required channels lost to "aggregation budget
+// exhausted"). A DECIDED collection walk (a materialized iterator advancing
+// over the elements the pack itself queued) earns its extra visits one per
+// element consumed, charged to the walk that consumed them (opts.walk),
+// never to the shared budget's bound — so a 53-packet queue is walked whole
+// and an unknown loop still stops at 64.
+const AGG_MAX_LOOP_VISITS = 64
+const AGG_MAX_ITEMS = 512
+const AGG_MAX_POPULATION_SITES = 64
 const AGG_TOTAL_STEP_BUDGET = 2400000
 
 function seedProvenanceLocals (desc, isStatic, cls) {
@@ -1437,7 +1465,7 @@ function invokeLambda (index, state, opts, lam, args, push, hooks = {}) {
   const ref = { owner: impl.owner, name: impl.name, desc: impl.desc }
   const kind = isStatic ? 'static' : 'instance'
   if (hooks.onCall) hooks.onCall(ref, kind, recvVal, callArgs)
-  if (evaluatorPreInvoke(index, state, opts, ref, recvVal, callArgs, push, hooks)) return true
+  if (evaluatorPreInvoke(index, state, opts, ref, recvVal, callArgs, push, hooks, kind)) return true
   const classInfo = state.evalClassInfo || { className: impl.owner, jar: null }
   handleInvoke(index, classInfo, state, opts, { kind, ref, recv: recvVal, argVals: callArgs, push, pc: -1 })
   return true
@@ -1477,7 +1505,7 @@ function concatWithConstants (classInfo, bsmIndex, captured) {
 
 function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks = {}) {
   state.aggCache = state.aggCache || new Map()
-  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags } }
+  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags }, walk: { iterAdvances: 0 } }
   const cp = classInfo.cp
   const code = method.code
   const stack = []
@@ -1504,7 +1532,8 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
     }
     const seen = (visits.get(pc) || 0) + 1
     visits.set(pc, seen)
-    if (seen > 64) return // loop bound (collection expansion iterates for real)
+    // loop bound: 64 per pc for an undecided loop; a decided iterator walk adds one visit per element it consumed (bounded by the element cap)
+    if (seen > AGG_MAX_LOOP_VISITS + Math.min(opts.walk.iterAdvances, AGG_MAX_ITEMS)) return
     const op = code[pc]
     const next = pc + instrLen(pc)
     let jumped = false
@@ -1603,14 +1632,20 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
           }
         }
         const key = `${ref.owner}.${ref.name}`
-        if (key in state.fieldValues) push(state.fieldValues[key])
+        if (key in state.fieldValues) { push(state.fieldValues[key]); break }
+        // HF16-R2: the use-site owner may be a subclass/implementor of the
+        // declarer (JVMS §5.4.3.2) — read through the declarer key the
+        // putstatic side already writes (a Kotlin object INSTANCE / a
+        // companion read through an inheriting owner).
+        const declKey = staticFieldKey(index, ref)
+        if (declKey in state.fieldValues) push(state.fieldValues[declKey])
         else push({ k: 'field', owner: ref.owner, name: ref.name, desc: ref.desc })
         break
       }
       case 0xb3: { // putstatic — keyed by the DECLARER, symmetric with getstatic (HF16-R rider)
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         const val = stack.pop()
-        if (ref && val && opts.recordPutstatic) state.fieldValues[staticFieldKey(index, ref)] = val
+        if (ref && val && (opts.recordPutstatic || val.k === 'registrar')) state.fieldValues[staticFieldKey(index, ref)] = val // registrar statics: see the linear walk
         break
       }
       case 0xb4: { // getfield — construction-bound objects read real values
@@ -1669,7 +1704,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         const argVals = []
         for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
         if (hooks.onCall) hooks.onCall(ref, 'static', null, argVals)
-        if (evaluatorPreInvoke(index, state, opts, ref, null, argVals, push, hooks)) break
+        if (evaluatorPreInvoke(index, state, opts, ref, null, argVals, push, hooks, 'static')) break
         handleInvoke(index, classInfo, state, opts, { kind: 'static', ref, recv: null, argVals, push, pc })
         break
       }
@@ -1785,7 +1820,21 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
 // Evaluator-only invoke semantics layered ABOVE handleInvoke: real answers
 // for the reflection/enum/RL calls the aggregator shapes route ids through.
 // Returns true when the call was fully handled (value pushed as needed).
-function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}) {
+const MATERIALIZING_ADDS = { add: 'last', addLast: 'last', offer: 'last', offerLast: 'last', addFirst: 'first', offerFirst: 'first', push: 'first' }
+
+// Gathers a concrete element onto a constructed collection object; the same
+// lambda (same implementation, same captured values by identity) added twice
+// is one element — a producer runs once under its caller contexts and once
+// more when a context climb inlines it.
+function materializeElement (recv, v, first) {
+  recv.items = recv.items || []
+  const dup = !!v && v.k === 'lambda' && recv.items.some((it) => it && it.k === 'lambda' && it.impl.owner === v.impl.owner &&
+    it.impl.name === v.impl.name && it.impl.desc === v.impl.desc && it.captured.length === v.captured.length && it.captured.every((c, i) => c === v.captured[i]))
+  if (!isConcreteish(v) || dup || recv.items.length >= AGG_MAX_ITEMS) return
+  if (first) recv.items.unshift(v); else recv.items.push(v)
+}
+
+function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}, callKind = recv ? 'instance' : 'unknown') {
   // HF37 LAMBDA invocation: the functional-interface call on a lambda value
   // runs its implementation with captured + call arguments (a method
   // reference onto a loader API such as PayloadRegistrar::playToClient
@@ -1798,7 +1847,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // population cap and the step budgets).
   if (recv && (recv.k === 'obj' || recv.k === 'collection' || recv.k === 'varr') && ref.name === 'forEach' &&
       argVals.length === 1 && argVals[0] && argVals[0].k === 'lambda') {
-    for (const item of (recv.items || []).slice(0, 192)) invokeLambda(index, state, opts, argVals[0], [item], () => {}, hooks)
+    for (const item of (recv.items || []).slice(0, AGG_MAX_ITEMS)) invokeLambda(index, state, opts, argVals[0], [item], () => {}, hooks)
     return true
   }
   if (!recv && ref.owner === 'java/util/Objects' && ref.name === 'requireNonNull' && argVals.length >= 1) {
@@ -1813,10 +1862,23 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // gathers concrete elements onto that object; `iterator` replays exactly
   // them. This is what keeps multi-instance aggregators separate (each
   // manager's HashSet is its own vObj) — per-instance versions never mix.
-  if (recv && recv.k === 'obj' && ref.name === 'add' && ref.desc === '(Ljava/lang/Object;)Z') {
-    recv.items = recv.items || []
-    if (isConcreteish(argVals[0]) && recv.items.length < 192) recv.items.push(argVals[0])
-    push(vInt(1))
+  // HF16-R2 round 2: every single-element collection mutator the producer
+  // detector accepts (COLLECTION_MUTATORS) materializes — add/addLast/offer/
+  // offerLast append, addFirst/offerFirst/push prepend (a Deque used as a
+  // stack replays LIFO), Map.put keeps the VALUE (a values() walk replays
+  // them). One rule, one element cap, one identity dedupe.
+  if (recv && recv.k === 'obj' && MATERIALIZING_ADDS[ref.name] && (ref.desc === '(Ljava/lang/Object;)Z' || ref.desc === '(Ljava/lang/Object;)V')) {
+    materializeElement(recv, argVals[0], MATERIALIZING_ADDS[ref.name] === 'first')
+    if (ref.desc.endsWith('Z')) push(vInt(1))
+    return true
+  }
+  if (recv && recv.k === 'obj' && ref.name === 'put' && ref.desc === '(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;') {
+    materializeElement(recv, argVals[1], false)
+    push(UNKNOWN)
+    return true
+  }
+  if (recv && recv.k === 'obj' && ref.name === 'values' && ref.desc === '()Ljava/util/Collection;') {
+    push({ k: 'collection', items: recv.items || [] })
     return true
   }
   // NOTE: every {k:'obj'} was CONSTRUCTED inside this evaluation universe
@@ -1831,7 +1893,11 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   }
   if (recv && recv.k === 'iter') {
     if (ref.name === 'hasNext') { push(vInt(recv.i < recv.items.length ? 1 : 0)); return true }
-    if (ref.name === 'next') { push(recv.items[recv.i++] ?? UNKNOWN); return true }
+    if (ref.name === 'next') {
+      if (recv.i < recv.items.length && opts.walk) opts.walk.iterAdvances++ // a decided advance — the walk earns one more loop visit
+      push(recv.items[recv.i++] ?? UNKNOWN)
+      return true
+    }
   }
   // Class.isAssignableFrom over the scanned hierarchy
   if (ref.owner === CLASS_TYPE && ref.name === 'isAssignableFrom' && recv && recv.k === 'cls' && argVals[0] && argVals[0].k === 'cls') {
@@ -1929,7 +1995,12 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // implementation is named by a META-INF/services file dispatches into that
   // implementation (veil's platform Factory.create). The services file is
   // primary-source truth, never a guess; ambiguity (several impls) abstains.
-  if ((!recv || recv.k === 'field' || recv === UNKNOWN) && index.services) {
+  // HF16-R2 rider: an invokestatic against the interface (a static interface
+  // method, geckolib GeckoLibNetworking.registerPacket) has NO receiver to
+  // dispatch on — seeding the impl as slot 0 shifted every argument by one
+  // (the Type became the service object). Static calls take the static
+  // inline rule below; the services rule is for receiver-less INSTANCE calls.
+  if (callKind !== 'static' && (!recv || recv.k === 'field' || recv === UNKNOWN) && index.services) {
     const impls = index.services.get(ref.owner)
     if (impls && new Set(impls).size === 1 && index.get(impls[0])) {
       const implRecv = { k: 'obj', cls: impls[0], fields: {}, fieldsBound: true, serviceImpl: true }
@@ -2016,7 +2087,12 @@ function findInvocationSites (index, state, target) {
     const info = index.get(cls)
     if (!info) continue
     const stub = info.codes.find((c) => c.method === target.name && c.desc === target.desc && isThrowOnlyStub(c))
-    if (stub && resolveGraftImpl(index, state, cls, target.name, target.desc) === target.cls) ownerAliases.add(cls)
+    if (stub && resolveGraftImpl(index, state, cls, target.name, target.desc) === target.cls) { ownerAliases.add(cls); continue }
+    // HF16-R2 — JVMS §5.4.3.3 downward: javac/kotlinc qualify an inherited
+    // method by the receiver's STATIC type, so `this.register(p)` inside a
+    // subclass names the SUBCLASS as owner; it resolves up the superclass
+    // chain to the target when no class in between overrides it.
+    if (target.name !== '<init>' && resolvesUpTo(index, cls, target)) ownerAliases.add(cls)
   }
   // abstract-owner aliasing: an invocation written against an interface or
   // abstract ancestor (VeilPacketManager.registerClientbound, the platform
@@ -2068,6 +2144,38 @@ function findInvocationSites (index, state, target) {
   }
   state.aggCache.set(key, sites)
   return sites
+}
+
+// Does an invocation written against `cls` (which does not declare the
+// method itself) resolve up the superclass chain to target.cls? Bounded walk.
+// HF16-R2 round 2: when no superclass declares the method, the resolution
+// continues into the interfaces of every class on the chain (an interface
+// DEFAULT method, JVMS §5.4.3.3 step 3) — bounded, superclass-first.
+function resolvesUpTo (index, cls, target) {
+  const chain = []
+  let cur = cls
+  for (let depth = 0; cur && depth <= 8; depth++) {
+    const info = index.get(cur)
+    if (!info) break
+    if (cur !== cls && cur === target.cls) return true
+    if (info.codes.some((c) => c.method === target.name && c.desc === target.desc)) return false
+    if (info.superName === target.cls) return true
+    chain.push(info)
+    cur = info.superName
+  }
+  const seen = new Set()
+  const queue = chain.flatMap((info) => info.interfaces || [])
+  for (let n = 0; n < queue.length && n < 64; n++) {
+    const itf = queue[n]
+    if (seen.has(itf)) continue
+    seen.add(itf)
+    if (itf === target.cls) return true
+    const ii = index.get(itf)
+    if (!ii) continue
+    if (ii.codes.some((c) => c.method === target.name && c.desc === target.desc)) return false
+    queue.push(...(ii.interfaces || []))
+  }
+  return false
 }
 
 // Concrete calling contexts for a method: run each invocation site under the
@@ -2266,6 +2374,106 @@ function collectFocusInstances (index, state, focusCls) {
     state.aggConstructed = prevConstructed
   }
   return constructed
+}
+
+// The static java.util registries an entry method reads: on OTHER classes
+// (focus-pass candidates) and on the entry's OWN class (own-registry
+// population, HF16-R2).
+function entryRegistries (index, info, method) {
+  const registries = new Set()
+  const own = new Set()
+  walkLinear(method.code, info.cp, (op, pc, cp, code) => {
+    if (op !== 0xb2) return
+    const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+    if (!ref || !ref.desc.startsWith('Ljava/util/') || !index.get(ref.owner)) return
+    if (ref.owner === info.className) own.add(ref.name)
+    else registries.add(ref.owner)
+  })
+  return { registries, own, any: registries.size + own.size > 0 }
+}
+
+// HF16-R2 — OWN-REGISTRY POPULATION (the queue-deferred registration idiom):
+// the entry's class initializer runs first (the collections and the
+// object INSTANCE exist), then every production site — a method anywhere
+// in the jars that reads one of the fields (directly, or through a
+// straight-line getter of the entry class) AND calls a collection mutator —
+// runs under its resolved CALLER CONTEXTS (the aggregator's context climb:
+// interface dispatch through the services file, subclass-qualified
+// callers, `new Packet()` at the initializer), falling back to provenance
+// locals when no caller is found (the deep walk then records an id-less
+// registration that abstains loudly, never a silent zero). Bounded by the
+// site cap, the context cap and the shared step budgets.
+const COLLECTION_MUTATORS = new Set(['add', 'addAll', 'addFirst', 'addLast', 'offer', 'push', 'put', 'putAll', 'putIfAbsent', 'set', 'plusAssign'])
+
+function populateOwnRegistries (index, state, info, fieldNames, entryMethod) {
+  const cls = info.className
+  const key = `ownreg:${cls}`
+  if (state.aggCache.has(key)) return
+  state.aggCache.set(key, true)
+  // straight-line getters of the registry fields: `getstatic f; areturn`
+  const getters = new Map()
+  for (const m of info.codes) {
+    if (m.code && m.code.length === 4 && m.code[0] === 0xb2 && m.code[3] === 0xb0) {
+      const ref = cpRef(info.cp, m.code.readUInt16BE(1))
+      if (ref && ref.owner === cls && fieldNames.has(ref.name)) getters.set(`${m.method}${m.desc}`, ref.name)
+    }
+  }
+  const simple = cls.split('/').pop()
+  const producers = []
+  let capped = false
+  for (const name of state.allClassNames) {
+    const bytes = index.rawBytes(name)
+    if (!bytes || !bytes.includes(simple)) continue
+    const pinfo = index.get(name)
+    if (!pinfo) continue
+    for (const m of pinfo.codes) {
+      if (name === cls && (m.method === '<clinit>' || (m.method === entryMethod.method && m.desc === entryMethod.desc))) continue
+      let reads = false
+      let mutates = false
+      walkLinear(m.code, pinfo.cp, (op, pc, cp, code) => {
+        if (op === 0xb2) {
+          const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+          if (ref && ref.owner === cls && fieldNames.has(ref.name)) reads = true
+        } else if (op >= 0xb6 && op <= 0xb9) {
+          const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+          if (!ref) return
+          if (ref.owner === cls && getters.has(`${ref.name}${ref.desc}`)) reads = true
+          else if (COLLECTION_MUTATORS.has(ref.name)) mutates = true
+        }
+      })
+      if (reads && mutates) producers.push({ info: pinfo, m })
+      if (producers.length > AGG_MAX_POPULATION_SITES) { capped = true; break }
+    }
+    if (capped) break
+  }
+  if (capped) state.diagnostics.abstains.push(`${cls}: more than ${AGG_MAX_POPULATION_SITES} population sites for its static registries — the remainder's channels unclaimed`)
+  // Phase 1 — caller contexts of every production site (the climb runs the
+  // sites themselves under provenance locals as a side effect, which would
+  // queue a packet-less lambda that can only abstain). Phase 2 — the entry
+  // class initializer, AFTER the climb, so the registries the deep walk
+  // reads are fresh and hold exactly what phase 3 queues under bindings.
+  const contexts = producers.map(({ info: pinfo, m }) => m.method === '<clinit>' ? { contexts: [] } : resolveCallContexts(index, state, { cls: pinfo.className, name: m.method, desc: m.desc }, 0))
+  const clinit = info.codes.find((c) => c.method === '<clinit>')
+  if (clinit) evaluateMethod(index, info, clinit, state, { locals: [], recordPutstatic: true }, {})
+  const prevInlineAll = state.aggInlineAll
+  state.aggInlineAll = true
+  try {
+    for (let i = 0; i < producers.length; i++) {
+      const { info: pinfo, m } = producers[i]
+      if (state.aggBudgetBlown) break
+      const isStatic = (m.flags & 0x0008) !== 0
+      const ctx = contexts[i]
+      const bindings = ctx.contexts.slice(0, AGG_MAX_CONTEXTS).map((c) => isStatic ? seedArgLocals(m.desc, c.args || []) : seedArgLocals(m.desc, c.args || [], c.recv ?? UNKNOWN))
+      if (bindings.length === 0) bindings.push(seedProvenanceLocals(m.desc, isStatic, pinfo.className))
+      for (const locals of bindings) {
+        if (state.aggBudgetBlown) break
+        evaluateMethod(index, pinfo, m, state, { locals, recordPutstatic: false }, {})
+      }
+      if (process.env.MINEPAL_AGG_DEBUG) debug(`ownreg ${cls}: producer ${pinfo.className}.${m.method} run under ${bindings.length} binding(s)`)
+    }
+  } finally {
+    state.aggInlineAll = prevInlineAll
+  }
 }
 
 // The aggregation resolver: for every pending (id-unresolved) registration,
@@ -2530,7 +2738,7 @@ function deriveNeoForgeComponents (jarPaths) {
   const silentEntries = []
   const record = (reg) => {
     const spec = REGISTRATION_METHODS[reg.method]
-    if (process.env.MINEPAL_AGG_DEBUG) debug(`record ${reg.method} id=${reg.id} site=${reg.site} version=${reg.registrar && reg.registrar.version}`)
+    if (process.env.MINEPAL_AGG_DEBUG) debug(`record ${reg.method} id=${reg.id} idVal=${JSON.stringify(reg.idVal).slice(0, 160)} site=${reg.site} version=${reg.registrar && reg.registrar.version}`)
     if (!spec) return
     registrations.push({ ...reg, ...spec })
   }
@@ -2544,8 +2752,22 @@ function deriveNeoForgeComponents (jarPaths) {
     // invoked on the event argument.
     const locals = seedProvenanceLocals(method.desc, (method.flags & 0x0008) !== 0, info.className)
     let reached = 0
-    simulate(index, info, method, state, { onRegistration: (r) => { reached++; record(r) }, recordPutstatic: false, locals })
-    if (reached === 0) silentEntries.push({ info, method })
+    let reachedWithId = 0
+    const abstainStart = diagnostics.abstains.length
+    const regStart = registrations.length
+    simulate(index, info, method, state, { onRegistration: (r) => { reached++; if (r.id) reachedWithId++; record(r) }, recordPutstatic: false, locals })
+    // HF16-R2: the linear walk's abstains for an entry the deep pass takes
+    // over are held back and published only if the deep pass fails too — a
+    // "too many overrides" line next to the very channels it names as
+    // claimed is false awareness. An entry that reached only ID-LESS
+    // registrations through a scanned-subclass guess while reading a static
+    // collection is walked deep as well (the collection's populated
+    // elements are the truth the guess lacked).
+    if (reached === 0) {
+      silentEntries.push({ info, method, linearAbstains: diagnostics.abstains.splice(abstainStart) })
+    } else if (reachedWithId === 0 && entryRegistries(index, info, method).any) {
+      silentEntries.push({ info, method, soft: true, linearAbstains: diagnostics.abstains.splice(abstainStart), linearRegs: registrations.slice(regStart) })
+    }
   }
   // HF37 SILENT-ENTRY deep pass (mechanism, javap-verified on framework
   // 0.13.11 + createcolonies 2.0.6): an entry whose registrar never reaches
@@ -2556,19 +2778,42 @@ function deriveNeoForgeComponents (jarPaths) {
   // population sites (the focus pass), then lambdas run, collections walk
   // and method references onto the registrar register. An entry that still
   // yields nothing is reported — never a silent zero.
-  for (const { info, method } of silentEntries) {
-    if (method.method.startsWith('lambda$')) continue // a lambda body's enclosing entry reports for it
+  // HF16-R2 (queue-deferred registration, javap-verified on a Kotlin pack):
+  // the registry the entry iterates may live on the entry's OWN class
+  // (`object Events { val queue = ArrayList<(PayloadRegistrar) -> Unit>() }`),
+  // populated from OTHER classes through its getter with lambda VALUES
+  // (invokedynamic / a Lambda subclass) whose captured packet is the
+  // producer's PARAMETER. Such a registry is populated from its production
+  // sites run under THEIR resolved caller contexts (populateOwnRegistries),
+  // so every queued lambda captures a concrete packet object and the deep
+  // walk registers each with a jar-proven id; the queue's Function1.invoke /
+  // Consumer.accept on the lambda value runs its body with the registrar
+  // bound (the evaluator's lambda law).
+  for (const entry of silentEntries) {
+    const { info, method } = entry
+    // a lambda body's enclosing entry reports for it — when there IS one: a
+    // listener lambda registered from a plain `init(IEventBus)` (the
+    // STATIC-REGISTRAR shape: geckolib's `bus.addListener(this::onRegister)`)
+    // has no enclosing entry and is walked on its own (HF16-R2 rider; before,
+    // such a class derived ZERO with ZERO abstains — and the server CRASHED
+    // sending its unguarded optional payload to the unclaimed client).
+    if (method.method.startsWith('lambda$') && entryMethods.some((e) => e.info === info && !e.method.method.startsWith('lambda$'))) {
+      diagnostics.abstains.push(...entry.linearAbstains)
+      continue
+    }
     const before = registrations.length
-    const registries = new Set()
-    walkLinear(method.code, info.cp, (op, pc, cp, code) => {
-      if (op !== 0xb2) return
-      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-      if (ref && index.get(ref.owner) && ref.owner !== info.className && ref.desc.startsWith('Ljava/util/')) registries.add(ref.owner)
-    })
+    const { registries, own } = entryRegistries(index, info, method)
     state.aggCache = state.aggCache || new Map()
     for (const owner of registries) {
       if (state.aggBudgetBlown) break
       collectFocusInstances(index, state, owner)
+    }
+    if (own.size > 0 && !state.aggBudgetBlown) {
+      try {
+        populateOwnRegistries(index, state, info, own, method)
+      } catch (err) {
+        diagnostics.errors.push(`population of ${info.className} static registries failed (${err.message})`)
+      }
     }
     const prevInlineAll = state.aggInlineAll
     state.aggInlineAll = true
@@ -2580,8 +2825,18 @@ function deriveNeoForgeComponents (jarPaths) {
     } finally {
       state.aggInlineAll = prevInlineAll
     }
-    if (registrations.length === before) {
-      diagnostics.abstains.push(`${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size} static registr${registries.size === 1 ? 'y' : 'ies'}) — this entry's channels unclaimed`)
+    const resolvedDeep = registrations.slice(before).some((r) => r.id)
+    if (resolvedDeep && entry.linearRegs) {
+      // the deep walk proved the ids the linear guess could not: the guess's
+      // id-less rows would only abstain against the same channels downstream
+      for (const r of entry.linearRegs) {
+        const at = registrations.indexOf(r)
+        if (at >= 0 && !r.id) registrations.splice(at, 1)
+      }
+    }
+    if (!resolvedDeep) diagnostics.abstains.push(...entry.linearAbstains)
+    if (registrations.length === before && !entry.soft) {
+      diagnostics.abstains.push(`${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size + own.size} static registr${registries.size + own.size === 1 ? 'y' : 'ies'}) — this entry's channels unclaimed`)
     }
   }
 
