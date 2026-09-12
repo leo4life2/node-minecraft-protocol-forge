@@ -10,15 +10,16 @@ const { WRITE_PRIMS, READ_PRIMS } = require('./itemStackWireDerivation')
 // generalised to whole vanilla packets).
 //
 // A mod may mixin into a vanilla network packet's (de)serializer and append
-// bytes to its body: Immersive Portals' imm_ptl_core (nested inside the
-// immersive-portals jar) injects at the RETURN of every
-// ServerboundMovePlayerPacket$*.read(FriendlyByteBuf) a DimId.readWorldId →
-// readInt (the player's dimension int id), paired with a client-side
-// injection at the RETURN of the matching write(FriendlyByteBuf) → writeInt,
-// and extends ClientboundPlayerPositionPacket the same way (server writes,
-// client ctor reads when bytes remain). A vanilla-shaped 34-byte
-// position_look is then kicked at the server's decoder ("readerIndex(34) +
-// length(4) exceeds writerIndex(34)").
+// bytes to its body: a server-side injection at the RETURN of a packet's
+// read(FriendlyByteBuf) that reads a primitive, paired with a client-side
+// injection at the RETURN of the matching write(FriendlyByteBuf) that writes
+// it (a clientbound packet the same way: server writes, client ctor reads
+// when bytes remain). A vanilla-shaped packet is then kicked at the server's
+// decoder ("readerIndex(N) + length(4) exceeds writerIndex(N)"). One example
+// of the shape (the case this was first derived from): a portal mod's nested
+// core jar appending an int world id to every ServerboundMovePlayerPacket$*
+// and to ClientboundPlayerPositionPacket. Nothing below names that mod; the
+// jar's own bytes, refmap and descriptors decide every row and every receipt.
 //
 // This module DERIVES the extension from the local jars (mixin annotations +
 // injection bytecode read as class-file data; nothing is loaded or run):
@@ -56,11 +57,25 @@ const MAX_CALL_HOPS = 3
 const VANILLA = {
   buf: new Set(['net/minecraft/network/FriendlyByteBuf', 'net/minecraft/class_2540']),
   compound: new Set(['net/minecraft/nbt/CompoundTag', 'net/minecraft/class_2487']),
-  resourceLocation: new Set(['net/minecraft/resources/ResourceLocation', 'net/minecraft/class_2960'])
+  resourceLocation: new Set(['net/minecraft/resources/ResourceLocation', 'net/minecraft/class_2960']),
+  resourceKey: new Set(['net/minecraft/resources/ResourceKey', 'net/minecraft/class_5321']),
+  level: new Set(['net/minecraft/world/level/Level', 'net/minecraft/class_1937'])
 }
 const isBuf = (c) => VANILLA.buf.has(c)
 const isCompound = (c) => VANILLA.compound.has(c)
 const isResLoc = (c) => VANILLA.resourceLocation.has(c)
+const isResKey = (c) => VANILLA.resourceKey.has(c)
+const isLevel = (c) => VANILLA.level.has(c)
+// The Mojang simple name of a vanilla class the walk knows (intermediary or
+// Mojang spelling) for receipts; any other class keeps its own simple name.
+const VANILLA_NAMES = { FriendlyByteBuf: VANILLA.buf, CompoundTag: VANILLA.compound, ResourceLocation: VANILLA.resourceLocation, ResourceKey: VANILLA.resourceKey, Level: VANILLA.level }
+function vanillaName (cls) { for (const [n, set] of Object.entries(VANILLA_NAMES)) if (set.has(cls)) return n; return String(cls).split('/').pop() }
+// `name(desc)` of a buffer member as a receipt: FriendlyByteBuf.method_44116(ResourceKey)
+function bufMemberLabel (call) {
+  const i = String(call).indexOf('('); const name = i < 0 ? String(call) : call.slice(0, i); const desc = i < 0 ? '' : call.slice(i)
+  const params = desc.slice(1, desc.indexOf(')') + 1)
+  return `FriendlyByteBuf.${name}(${classTokens(params).map(vanillaName).join(', ') || params.replace(/[()]/g, '')})`
+}
 
 // Loader transports whose registration a mod calls from its own bytecode;
 // the framing is the loader's wire law (Forge SimpleChannel prefixes each
@@ -137,8 +152,8 @@ function nestedJarEntries (entries, buf) {
 // descriptor (META-INF/mods.toml, META-INF/neoforge.mods.toml) first — its
 // `${file.jarVersion}` resolved from META-INF/MANIFEST.MF Implementation-Version
 // (the version the jar really carries) — then fabric.mod.json. A multi-loader
-// jar can ship a stale fabric.mod.json next to its live toml (immersive-portals
-// 3.0.7-all says "9.0" there; toml + manifest say 3.0.7): the version voiced in
+// jar can ship a stale fabric.mod.json next to its live toml (e.g. a portal
+// mod's 3.0.7-all jar says "9.0" there; toml + manifest say 3.0.7): the version voiced in
 // every receipt and abstain copy must be the jar's, so the toml wins when it is
 // present and an unresolvable template is null, never the literal.
 function modIdentity (entries, buf) {
@@ -331,11 +346,11 @@ function scanClass (parsed, aliases, unit, load) {
   if (!mixin) return null
   const targets = [].concat(mixin.elements.value || [], mixin.elements.targets || [])
     .filter((t) => typeof t === 'string').map((t) => t.replace(/^L|;$/g, '').replace(/\./g, '/'))
-  const found = { className: parsed.className, targets, jar: path.basename(unit.jarPath), nested: unit.nested, mod: unit.mod, injections: [], payloadInjections: [], handles: [], unresolved: [] }
+  const found = { className: parsed.className, targets, jar: path.basename(unit.jarPath), nested: unit.nested, mod: unit.mod, injections: [], payloadInjections: [], otherTargets: [], handles: [], unresolved: [] }
   for (const m of parsed.methods) {
     for (const a of annsAt(parsed, m.annotationsAt, m.invisibleAnnotationsAt)) {
       const inj = String(a.type).match(INJECTOR_RE)
-      if (!inj || inj[1] !== 'Inject') continue
+      if (!inj) continue
       for (const raw of methodNames(a.elements)) {
         const ref = splitRef(raw)
         const ownerRaw = ref.owner || targets[0] || null
@@ -345,11 +360,20 @@ function scanClass (parsed, aliases, unit, load) {
         const params = ref.desc ? handlerParams(ref.desc) : handlerParams(m.desc)
         const bufParam = params.length === 1 && isBuf(params[0].replace(/^L|;$/g, ''))
         let side = null
-        if (name === 'write' && bufParam) side = 'write'
-        else if (name === 'read' && bufParam) side = 'read'
-        else if (name === '<init>' && bufParam) side = 'read'
+        if (inj[1] === 'Inject' && name === 'write' && bufParam) side = 'write'
+        else if (inj[1] === 'Inject' && name === 'read' && bufParam) side = 'read'
+        else if (inj[1] === 'Inject' && name === '<init>' && bufParam) side = 'read'
         if (name === 'handle' && ref.desc) { const lp = handlerParams(ref.desc)[0]; if (lp) found.handles.push(lp.replace(/^L|;$/g, '')) }
-        if (!side) continue
+        if (!side) {
+          // Any other injection into the target (a @Redirect / @ModifyArg, or
+          // an @Inject on a member outside the read/write/ctor law — a codec
+          // field's static init, a StreamCodec lambda) is recorded BY NAME: a
+          // tabled packet class that receives only such injections is a named
+          // stop in deriveSpec, never a silent vanilla shape. `handle` is the
+          // packet's processing, not its serialisation, and changes no wire.
+          if (name !== 'handle') found.otherTargets.push({ owner, ownerRaw, resolved: !/^net\/minecraft\/class_\d+/.test(owner), injector: inj[1], target: name, desc: ref.desc || null, handler: m.name })
+          continue
+        }
         // The handler must touch the packet's OWN buffer (its first parameter,
         // local 1 of an instance handler): an injection that only reads or
         // writes a buffer held in a field (a custom payload's inner data) never
@@ -375,6 +399,7 @@ function scanClass (parsed, aliases, unit, load) {
           anchor,
           at: value,
           fields: deep.fields,
+          bufCalls: deep.bufCalls,
           source: deep.source,
           preCalls: deep.preCalls,
           optional: side === 'read' && deep.bufCalls.some((c) => /^isReadable\(/.test(c))
@@ -384,7 +409,7 @@ function scanClass (parsed, aliases, unit, load) {
       }
     }
   }
-  return found.injections.length || found.payloadInjections.length ? found : null
+  return found.injections.length || found.payloadInjections.length || found.otherTargets.length ? found : null
 }
 
 // ------------------------------------------------------ redirect derivation
@@ -394,8 +419,8 @@ function scanClass (parsed, aliases, unit, load) {
 // reads a header off the PAYLOAD (the dimension through the provider's record
 // + a packet id) and constructs a vanilla packet by id from the rest — the
 // server then ships every world packet of the player's dimension wrapped that
-// way once the client has shown it speaks the mod (Immersive Portals'
-// imm_ptl:rd). The client must unwrap or it never sees a chunk.
+// way once the client has shown it speaks the mod (e.g. a portal mod's
+// `<modid>:rd` channel). The client must unwrap or it never sees a chunk.
 const LISTENER_FAMILY = { 'net/minecraft/network/protocol/game/ClientGamePacketListener': { state: 'play', direction: 'toClient' } }
 
 function deriveRedirect (mixins, load, provider) {
@@ -476,6 +501,19 @@ function deriveProvider (source, load, units) {
   }
   if (!record) return { provider: null, abstain: { reason: 'unknown-value-provider', detail: `${source.className}.${source.method} obtains its value from no record class in the jar` } }
   const recCls = load(record)
+  // the value KEY: what the write side hands the getter to pick the value — read off the getter's own descriptor + generic Signature (class-file data).
+  // ResourceKey<Level> = the world the client is in (login/respawn's worldName, the same key string the record's map carries) → keySource 'world-key';
+  // any other parameter is a named stop: the installer never assumes the world name.
+  const getterM = recCls.methods.find((m) => m.name === getter && /\)[IJSB]$/.test(m.desc)) || null
+  const keyParams = getterM ? handlerParams(getterM.desc).map((p) => p.replace(/^L|;$/g, '')) : []
+  // the generic argument counts only when the signature's erasure IS the descriptor's parameter (a stale signature never speaks for a changed descriptor)
+  const sigM = getterM && getterM.signature ? getterM.signature.match(/^\(L([^<;]+)<L([^<;]+);>;\)/) : null
+  const sigArg = sigM && sigM[1] === keyParams[0] ? sigM[2] : null
+  const keySource = keyParams.length === 1 && isResKey(keyParams[0]) && sigArg && isLevel(sigArg) ? 'world-key' : null
+  if (!keySource) {
+    const keyed = keyParams.length === 1 ? `${vanillaName(keyParams[0])}${sigArg ? `<${vanillaName(sigArg)}>` : ''}` : `${keyParams.length} parameters`
+    return { provider: null, abstain: { reason: 'unknown-value-key', detail: `${record}.${getter}${getterM ? getterM.desc : ''} is keyed by ${keyed}${getterM && getterM.signature ? ` (signature ${getterM.signature})` : ''}, not the world the client is in — which value to send is not derivable` } }
+  }
   // the record's NBT reader: a method taking a compound that calls getCompound(String) after an ldc key
   let compoundKey = null; let valueType = null; let tagReader = null
   for (const m of recCls.methods) {
@@ -555,6 +593,8 @@ function deriveProvider (source, load, units) {
       kind: 'nbt-int-map',
       record,
       getter,
+      getterDesc: getterM.desc,
+      keySource,
       compoundKey,
       valueType,
       reader: `${reader.className}.${reader.method}`,
@@ -571,7 +611,9 @@ function where (row, m) { return `${m.className} (${row.target} of ${row.owner})
 function deriveSpec (mixins, version) {
   const table = packetTableFor(version)
   const all = mixins.flatMap((m) => m.injections.map((r) => ({ ...r, mixin: m })))
-  if (!all.length) return { exts: [], provider: null, abstain: null }
+  // injections into a TABLED packet class outside the read/write/ctor law (resolved names only: an intermediary owner no refmap maps is not a table class)
+  const others = mixins.flatMap((m) => (m.otherTargets || []).filter((o) => o.resolved && table[o.owner]).map((o) => ({ ...o, mixin: m })))
+  if (!all.length && !others.length) return { exts: [], provider: null, abstain: null }
   const modOf = (m) => m.mod || m.mixin?.mod || null
   // the packets an abstain names, as data for the copy: owner class → table row (direction + nmp packet name) when tabled, the direction from
   // the vanilla class name otherwise, the injected sides; `wraps` = the jar also injects a payload ctor (world packets wrapped for mod clients)
@@ -580,9 +622,12 @@ function deriveSpec (mixins, version) {
   const unresolved = all.filter((r) => !r.resolved)
   if (unresolved.length) return abstain('no-refmap', `injection targets ${[...new Set(unresolved.map((r) => r.owner))].join(', ')} are intermediary names and no refmap in the jar maps them to packet classes`, all)
   const packetRows = all.filter((r) => /^net\/minecraft\/network\/protocol\//.test(r.owner))
-  if (!packetRows.length) return { exts: [], provider: null, abstain: null }
   const byClass = new Map()
   for (const r of packetRows) { if (!byClass.has(r.owner)) byClass.set(r.owner, []); byClass.get(r.owner).push(r) }
+  // a tabled packet class whose only injections are outside the law (its codec members, a redirect inside write): what reaches the wire is not derivable — a NAMED stop with the member
+  const lone = others.filter((o) => !byClass.has(o.owner))
+  if (lone.length) return abstain('packet-target-not-derivable', `${lone.map((o) => `${o.owner.split('/').pop()}.${o.target}${o.desc || ''} receives a @${o.injector} from ${o.mixin.className}`).join('; ')} — not the read/write/ctor law this build follows, so what the packet carries on the wire is not derivable`, lone)
+  if (!packetRows.length) return { exts: [], provider: null, abstain: null }
   const exts = []
   for (const [cls, rows] of byClass) {
     const reads = rows.filter((r) => r.side === 'read'); const writes = rows.filter((r) => r.side === 'write')
@@ -600,7 +645,15 @@ function deriveSpec (mixins, version) {
     const [r] = reads; const [w] = writes
     if (!r.anchor || !w.anchor) return abstain('unknown-anchor', `injection point not understood (read at ${r.at || '?'}, write at ${w.at || '?'})`, rows)
     if (r.anchor !== w.anchor) return abstain('anchor-mismatch', `read side extends at ${r.anchor}, write side at ${w.anchor}`, rows)
-    if (!r.fields.length || !w.fields.length) return abstain('no-primitives', 'the injection bodies write/read no buffer primitive this walk recognises', rows)
+    if (!r.fields.length || !w.fields.length) {
+      // the buffer members the body DOES call are named (a ResourceKey writer, a codec) — the stop says what it saw, not just what it missed
+      const sides = [['read', r], ['write', w]].filter(([, x]) => !x.fields.length)
+      const valueCalls = (x) => (x.bufCalls || []).filter((c) => !/^(?:isReadable|readableBytes|readerIndex|writerIndex)\(/.test(c)) // readability probes carry no value
+      const named = sides.some(([, x]) => valueCalls(x).length)
+      return abstain(named ? 'buffer-member-not-derivable' : 'no-primitives', named
+        ? `${cls.split('/').pop()}: ${sides.map(([s, x]) => `the ${s} side calls ${valueCalls(x).length ? valueCalls(x).map(bufMemberLabel).join(', ') : 'no value member'} on the packet buffer`).join('; ')} — not a wire primitive this build can follow`
+        : 'the injection bodies write/read no buffer primitive this walk recognises', rows)
+    }
     if (r.fields.join(',') !== w.fields.join(',')) return abstain('field-mismatch', `read side [${r.fields.join(',')}] vs write side [${w.fields.join(',')}]`, rows)
     // the guard: a write conditioned on a jar flag ((){Z} before any primitive) armed by a clientbound read's (Z)V setter
     const guardCall = w.preCalls.find((c) => c.op === 0xb8 && /^\(\)Z$/.test(c.desc) && !isBuf(c.owner) && !/^(?:java|org\/apache|org\/spongepowered)\//.test(c.owner))
@@ -681,7 +734,8 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
       }
     }
     if (!mixins.length) continue
-    receipts.mixins.push(...mixins.map((m) => ({ className: m.className, jar: m.jar, nested: m.nested, mod: m.mod, injections: m.injections.length })))
+    // the receipt lists the mixins that inject into a (de)serializer; a class whose only injections are outside the law is named by the abstain it causes, if any
+    receipts.mixins.push(...mixins.filter((m) => m.injections.length || m.payloadInjections.length).map((m) => ({ className: m.className, jar: m.jar, nested: m.nested, mod: m.mod, injections: m.injections.length })))
     const spec = deriveSpec(mixins, version)
     if (spec.abstain) { result = { ...spec, mod: spec.abstain.mod }; break }
     if (!spec.exts.length) continue
@@ -697,4 +751,4 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
   return { ...result, ...receipts }
 }
 
-module.exports = { scanPacketBodyWireExtensions, packetTableFor, PACKET_CLASS_TABLE, LOADER_TRANSPORTS, buildAliases, collectUnits, splitRef, _internals: { scanClass, classLoader, deriveSpec, deriveProvider, deriveRedirect, primsInDeep, modIdentity, abstainPackets } }
+module.exports = { scanPacketBodyWireExtensions, packetTableFor, PACKET_CLASS_TABLE, LOADER_TRANSPORTS, buildAliases, collectUnits, splitRef, _internals: { scanClass, classLoader, deriveSpec, deriveProvider, deriveRedirect, primsInDeep, modIdentity, abstainPackets, bufMemberLabel, vanillaName } }

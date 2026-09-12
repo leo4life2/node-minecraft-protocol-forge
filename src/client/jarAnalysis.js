@@ -118,7 +118,12 @@ function parseClassFile (b) {
     // readAnnotationsAttr(b, annotationsAt, cp, { rich: true }).
     const ann = m.attrs.find((a) => a.name === 'RuntimeVisibleAnnotations')
     const inv = m.attrs.find((a) => a.name === 'RuntimeInvisibleAnnotations')
-    methods.push({ name: m.name, desc: m.desc, flags: m.flags, annotationsAt: ann ? ann.start : null, invisibleAnnotationsAt: inv ? inv.start : null })
+    // HF41-r: the member's generic Signature (the erased descriptor's type
+    // arguments, e.g. a getter keyed by ResourceKey<Level>) — class-file data
+    // the value-key derivation reads; null when the compiler emitted none.
+    const sig = m.attrs.find((a) => a.name === 'Signature')
+    const signature = sig && sig.len >= 2 ? cpUtf8(cp, b.readUInt16BE(sig.start)) : null
+    methods.push({ name: m.name, desc: m.desc, flags: m.flags, signature, annotationsAt: ann ? ann.start : null, invisibleAnnotationsAt: inv ? inv.start : null })
     const code = m.attrs.find((a) => a.name === 'Code')
     if (!code) continue
     const codeLen = b.readUInt32BE(code.start + 4)

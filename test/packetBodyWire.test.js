@@ -307,7 +307,7 @@ describe('HF41 packet-body wire install (fake client, real protodef compile)', f
     assert.deepEqual(t.Read.pbw_tail_i32[1](Buffer.alloc(2), 0), { value: null, size: 0 })
     assert.throws(() => tailTypes(['string']), /no optional-tail codec/)
     const c = mkClient()
-    const r = installPacketBodyWireExtension(c, { exts: [{ direction: 'toServer', packet: 'nope', anchor: 'tail', fields: [{ name: 'x', type: 'i32' }], mixin: {} }], provider: { kind: 'nbt-int-map', compoundKey: 'k', valueType: 'int', channels: [{ id: 'a:b', framing: 'raw' }] } })
+    const r = installPacketBodyWireExtension(c, { exts: [{ direction: 'toServer', packet: 'nope', anchor: 'tail', fields: [{ name: 'x', type: 'i32' }], mixin: {} }], provider: { kind: 'nbt-int-map', keySource: 'world-key', compoundKey: 'k', valueType: 'int', channels: [{ id: 'a:b', framing: 'raw' }] } })
     assert.equal(r.installed, false)
     assert.match(r.reason, /compile-failed: packet-shape-unsupported/)
     const p = createProvider(new EventEmitter(), { kind: 'nbt-int-map', compoundKey: 'k', valueType: 'int', channels: [] }, {})
@@ -486,5 +486,90 @@ describe('HF41 r2: identity, abstain rows as data, and the 1.20.2+ install order
     assert.equal(d.bytes(1).length, 38, 'the tail kept after the late item swap')
     assert.ok(r2.reasserted >= 1, 'the re-assert is counted in the receipt')
     assert.equal(r2.recompiled, 1)
+  })
+})
+
+describe('HF41-r: the value key is derived, StreamCodec-era buffer members and non-law injections abstain by name, 1.21.x evidence pinned', function () {
+  const { mutateJar } = require('./helpers/jarMutate')
+  const { KEY_SOURCES } = require('../src/client/packetBodyWireInstall')
+  const FABRIC_121 = path.join(__dirname, 'fixtures', 'immersive-portals-6.0.6-mc1.21.1-fabric.trimmed.jar')
+  const bend = (name, src, rules) => { const p = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'hf41-r-')), name); fs.writeFileSync(p, mutateJar(fs.readFileSync(src), rules).buf); return p }
+
+  it('keySource: both 1.20.1 jars derive the getter keyed by ResourceKey<Level> (descriptor + generic Signature) → world-key; the getter descriptor rides the provider spec', function () {
+    for (const [f, desc] of [[FABRIC, '(Lnet/minecraft/class_5321;)I'], [FORGE, '(Lnet/minecraft/resources/ResourceKey;)I']]) {
+      const r = scanPacketBodyWireExtensions([f], { version: '1.20.1' })
+      assert.equal(r.abstain, null)
+      assert.equal(r.provider.keySource, 'world-key')
+      assert.equal(r.provider.getter, 'getIntId')
+      assert.equal(r.provider.getterDesc, desc)
+    }
+  })
+
+  it('abstain (unknown-value-key): the getter descriptor bent to a String key (record + caller) → a named stop carrying the descriptor; the stale generic Signature never speaks for the changed descriptor', function () {
+    const p = bend('immersive-portals-5.2.0-mc1.20.1-fabric.jar', FABRIC, { rewrite: (f, s) => (/q_misc_util\/dimension\/(DimId|DimensionIdRecord)\.class$/.test(f) && s === '(Lnet/minecraft/class_5321;)I' ? '(Ljava/lang/String;)I' : undefined) })
+    const r = scanPacketBodyWireExtensions([p], { version: '1.20.1' })
+    assert.equal(r.exts.length, 0)
+    assert.equal(r.provider, null)
+    assert.equal(r.abstain.reason, 'unknown-value-key')
+    assert.match(r.abstain.detail, /DimensionIdRecord\.getIntId\(Ljava\/lang\/String;\)I is keyed by String \(signature \(Lnet\/minecraft\/class_5321<Lnet\/minecraft\/class_1937;>;\)I\), not the world the client is in/)
+    assert.deepEqual(r.abstain.packets.map((x) => `${x.direction}/${x.packet}`).sort(), ['toClient/position', 'toServer/flying', 'toServer/look', 'toServer/position', 'toServer/position_look'])
+    assert.equal(r.abstain.mod.version, '5.2.0')
+  })
+
+  it('abstain (unknown-value-key): the same descriptor but a Signature keyed by another registry (ResourceKey<class_1959>) → named, the signature in the receipt', function () {
+    const p = bend('immersive-portals-5.2.0-mc1.20.1-fabric.jar', FABRIC, { rewrite: (f, s) => (/DimensionIdRecord\.class$/.test(f) && s === '(Lnet/minecraft/class_5321<Lnet/minecraft/class_1937;>;)I' ? '(Lnet/minecraft/class_5321<Lnet/minecraft/class_1959;>;)I' : undefined) })
+    const r = scanPacketBodyWireExtensions([p], { version: '1.20.1' })
+    assert.equal(r.abstain.reason, 'unknown-value-key')
+    assert.match(r.abstain.detail, /is keyed by ResourceKey<class_1959> \(signature \(Lnet\/minecraft\/class_5321<Lnet\/minecraft\/class_1959;>;\)I\)/)
+  })
+
+  it('install: the provider selects the key by the derived keySource and never assumes the world name — a spec without a known keySource installs nothing (named reason); world-key answers after login/respawn', function () {
+    const spec = { kind: 'nbt-int-map', compoundKey: 'k', valueType: 'int', channels: [] }
+    const nbt = require('prismarine-nbt')
+    const body = nbt.writeUncompressed({ type: 'compound', name: '', value: { k: { type: 'compound', value: { 'minecraft:overworld': { type: 'int', value: 4 } } } } }, 'big')
+    for (const [keySource, expect] of [['world-key', 4], [undefined, null], ['entity-id', null]]) {
+      const c = new EventEmitter(); const receipt = {}
+      const p = createProvider(c, { ...spec, keySource, channels: [{ id: 'a:b', framing: 'raw' }] }, receipt)
+      c.emit('packet', { channel: 'a:b', data: body }, { state: 'play', name: 'custom_payload' })
+      c.emit('packet', { worldName: 'minecraft:overworld' }, { state: 'play', name: 'login' })
+      assert.equal(p.value(), expect, `keySource ${keySource}`)
+      assert.equal(receipt.provider.keySource, expect == null ? null : 'world-key')
+    }
+    assert.deepEqual(Object.keys(KEY_SOURCES), ['world-key'])
+    const r = installPacketBodyWireExtension(new EventEmitter(), { exts: [{ direction: 'toServer', packet: 'position', anchor: 'tail', fields: [{ name: 'x', type: 'i32' }], mixin: {} }], provider: { ...spec, keySource: 'entity-id', record: 'a/B', getter: 'g', getterDesc: '(I)I' }, version: '1.20.1' })
+    assert.equal(r.installed, false)
+    assert.equal(r.reason, 'unknown-value-key-source: entity-id (a/B.g(I)I)')
+  })
+
+  it('1.21.1 evidence (Immersive Portals 6.0.6, real trimmed jar): the refmap resolves to the tabled classes, the injections ARE the read/write/ctor law, but the buffer members are ResourceKey read/write (method_44112 / method_44116) — a NAMED stop with the members, never a silent vanilla shape', function () {
+    const r = scanPacketBodyWireExtensions([FABRIC_121], { version: '1.21.1' })
+    assert.equal(r.exts.length, 0)
+    assert.equal(r.provider, null)
+    assert.equal(r.abstain.reason, 'buffer-member-not-derivable')
+    assert.equal(r.abstain.detail, 'ClientboundPlayerPositionPacket: the read side calls FriendlyByteBuf.method_44112(ResourceKey) on the packet buffer; the write side calls FriendlyByteBuf.method_44116(ResourceKey) on the packet buffer — not a wire primitive this build can follow')
+    assert.deepEqual(r.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ClientboundPlayerPositionPacket', direction: 'toClient', packet: 'position', sides: ['read', 'write'] }])
+    assert.deepEqual(r.abstain.mod, { id: 'immersive_portals', name: 'Immersive Portals', version: '6.0.6', descriptor: 'fabric.mod.json' })
+    assert.equal(r.abstain.mixins.length, 2)
+    assert.ok(r.abstain.mixins.every((m) => /ClientboundPlayerPositionPacket\)/.test(m)), r.abstain.mixins.join(' | '))
+    // the serverbound move mixins of the same jar are resolved table classes with law targets (the walk got there; the stop is the members, not the table)
+    const units = collectUnits(FABRIC_121); const aliases = buildAliases(units); const load = require('../src/client/packetBodyWireDerivation')._internals.classLoader(units)
+    const { scanClass } = require('../src/client/packetBodyWireDerivation')._internals
+    const { parseClassFile } = require('../src/client/jarAnalysis')
+    const owners = new Set()
+    for (const u of units) for (const e of u.classes.values()) { let p; try { p = parseClassFile(zipEntryData(u.buf, e)) } catch { continue } const f = p && scanClass(p, aliases, u, load); if (f) for (const i of f.injections) owners.add(`${i.owner.split('/').pop()}.${i.target}`) }
+    for (const o of ['ServerboundMovePlayerPacket$Pos.write', 'ServerboundMovePlayerPacket$Pos.read', 'ServerboundMovePlayerPacket$PosRot.write', 'ServerboundMovePlayerPacket$StatusOnly.read']) assert.ok(owners.has(o), o)
+  })
+
+  it('abstain (packet-target-not-derivable): a tabled packet class whose only injections are outside the law (Pos write/read renamed to a codec member) → named with the member and injector; the jar with no injection into any tabled class stays exts=[]', function () {
+    const p = bend('immersive-portals-3.0.7-all.jar', FORGE, { rewrite: (f, s) => (/ServerboundMovePlayerPacket\$Pos;(write|read)\(/.test(s) ? s.replace(/;(write|read)\(/, ';codec(') : undefined) })
+    const r = scanPacketBodyWireExtensions([p], { version: '1.20.1' })
+    assert.equal(r.exts.length, 0)
+    assert.equal(r.abstain.reason, 'packet-target-not-derivable')
+    assert.match(r.abstain.detail, /^ServerboundMovePlayerPacket\$Pos\.codec\(Lnet\/minecraft\/network\/FriendlyByteBuf;\)V receives a @Inject from qouteall\/imm_ptl\/core\/mixin\/client\/sync\/MixinServerboundMovePlayerPacketPos; ServerboundMovePlayerPacket\$Pos\.codec\(/)
+    assert.match(r.abstain.detail, /not the read\/write\/ctor law this build follows/)
+    assert.deepEqual(r.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$Pos', direction: 'toServer', packet: 'position', sides: [] }])
+    assert.equal(r.abstain.mod.version, '3.0.7')
+    const stacc = scanPacketBodyWireExtensions([STACC], { version: '1.20.1' })
+    assert.deepEqual({ exts: stacc.exts, abstain: stacc.abstain }, { exts: [], abstain: null })
   })
 })

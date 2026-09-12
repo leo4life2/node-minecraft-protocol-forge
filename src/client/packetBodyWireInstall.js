@@ -103,13 +103,25 @@ function compileFor (version, exts, { slotExt = null } = {}) {
   return out
 }
 
+// The key the derived record is read by — `spec.keySource`, derived from the
+// getter's parameter type. 'world-key' = the world this client is in (login /
+// respawn worldName, the same ResourceKey<Level> string the record's map is
+// keyed by). A source this table lacks installs nothing (the deriver already
+// abstained by name); the installer never assumes the world name.
+const KEY_SOURCES = {
+  'world-key': (state, receipt) => (data, meta) => {
+    if ((meta.name === 'login' || meta.name === 'respawn') && data && typeof data.worldName === 'string') { state.dimension = data.worldName; receipt.provider.dimension = data.worldName }
+  }
+}
+
 // The derived provider: parses the record the server syncs (an NBT compound
-// with a `compoundKey` map of dimension name -> value on one of the derived
-// channels, with the channel's framing) and answers the value for the
-// dimension this client is in (login / respawn world name).
+// with a `compoundKey` map of key -> value on one of the derived channels,
+// with the channel's framing) and answers the value for THIS client's key,
+// selected by the derived keySource.
 function createProvider (client, spec, receipt) {
   const state = { ids: null, dimension: null, channel: null, framing: null, index: null, rejected: 0, synced: 0 }
-  receipt.provider = { kind: spec.kind, compoundKey: spec.compoundKey, valueType: spec.valueType, channels: spec.channels.map((c) => c.id), synced: 0, rejected: 0, channel: null, dimension: null, ids: null }
+  const observeKey = KEY_SOURCES[spec.keySource] ? KEY_SOURCES[spec.keySource](state, receipt) : null
+  receipt.provider = { kind: spec.kind, compoundKey: spec.compoundKey, valueType: spec.valueType, keySource: KEY_SOURCES[spec.keySource] ? spec.keySource : null, channels: spec.channels.map((c) => c.id), synced: 0, rejected: 0, channel: null, dimension: null, ids: null }
   const byId = new Map(spec.channels.map((c) => [c.id, c]))
   const parse = (chan, data) => {
     if (!Buffer.isBuffer(data)) return
@@ -130,10 +142,10 @@ function createProvider (client, spec, receipt) {
   client.on('packet', (data, meta) => {
     if (!meta || (meta.state !== 'play' && meta.state !== 'configuration')) return
     if (meta.name === 'custom_payload' && data && byId.has(data.channel)) parse(byId.get(data.channel), data.data)
-    else if ((meta.name === 'login' || meta.name === 'respawn') && data && typeof data.worldName === 'string') { state.dimension = data.worldName; receipt.provider.dimension = data.worldName }
+    else if (observeKey) observeKey(data, meta)
   })
   return {
-    value: () => (state.ids && state.dimension != null && Number.isFinite(state.ids[state.dimension]) ? state.ids[state.dimension] : null),
+    value: () => (observeKey && state.ids && state.dimension != null && Number.isFinite(state.ids[state.dimension]) ? state.ids[state.dimension] : null),
     state
   }
 }
@@ -193,6 +205,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
   }
   client.minepalPacketBodyWire = receipt
   if (!spec.provider) { receipt.reason = 'no-value-provider'; return receipt }
+  if (!KEY_SOURCES[spec.provider.keySource]) { receipt.reason = `unknown-value-key-source: ${spec.provider.keySource ?? 'none'} (${spec.provider.record || '?'}.${spec.provider.getter || '?'}${spec.provider.getterDesc || ''})`; return receipt }
   // the slot extension (HF35) is read at EVERY swap, not baked at install: on
   // 1.20.2+ this install runs in configuration, before the item-stack install
   // at play, so the play swap recompiles from the CURRENT slot extension and
@@ -279,7 +292,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
     receipt.lastIncoming = { packet: meta.name, value: v }
     if (!receipt.armed && guarded.some((e) => e.guard.armedBy.direction === 'toClient' && e.guard.armedBy.packet === meta.name)) {
       receipt.armed = true
-      log(`[packet-wire] armed: the server's ${meta.name} carried the extension (value ${v}); movement packets now carry the derived ${spec.provider.compoundKey} value`)
+      log(`[packet-wire] armed: the server's ${meta.name} carried the extension (value ${v}); ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${spec.provider.compoundKey} value`)
     }
   })
   receipt.value = () => provider.value()
@@ -295,4 +308,4 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
   return receipt
 }
 
-module.exports = { installPacketBodyWireExtension, compileFor, createProvider, tailTypes, redirectUnwrapper }
+module.exports = { installPacketBodyWireExtension, compileFor, createProvider, tailTypes, redirectUnwrapper, KEY_SOURCES }
