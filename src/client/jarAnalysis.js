@@ -196,7 +196,12 @@ function readAnnotationsAttr (b, start, cp, { rich = false } = {}) {
         p += 2
         return v
       }
-      case 'B': case 'C': case 'D': case 'F': case 'I': case 'J': case 'S': case 'Z':
+      case 'B': case 'C': case 'I': case 'S': case 'Z': { // int-backed consts (JVMS 4.7.16.1): modeled when rich (@At ordinal, cancellable)
+        const c = cp[b.readUInt16BE(p)]; p += 2
+        if (!rich || !c || c.tag !== 3) return null
+        return tag === 'Z' ? c.int !== 0 : c.int
+      }
+      case 'D': case 'F': case 'J':
         p += 2
         return null
       case '[': {
@@ -250,6 +255,8 @@ function decodeInstructions (code, cp) {
       case 0x11: row.int = code.readInt16BE(pc + 1); break // sipush
       case 0x19: row.aload = code[pc + 1]; break // aload <n>
       case 0x2a: case 0x2b: case 0x2c: case 0x2d: row.aload = op - 0x2a; break // aload_0..3
+      case 0x3a: row.astore = code[pc + 1]; break // astore <n>
+      case 0x4b: case 0x4c: case 0x4d: case 0x4e: row.astore = op - 0x4b; break // astore_0..3
       case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
         row.int = op - 0x03; break // iconst_m1..iconst_5
       case 0xb2: case 0xb3: case 0xb4: case 0xb5: // getstatic/putstatic/getfield/putfield
