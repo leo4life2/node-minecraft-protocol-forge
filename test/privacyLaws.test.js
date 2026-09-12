@@ -40,7 +40,9 @@ const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js'
   // HF35 r2: ItemStack wire-shape derivation (mixin annotations + bytecode walk, local jars only)
   'itemStackWireDerivation.js',
   // HF35 rider: the derived slot extension installed into the compiled play protocol (protodef compile only; no fs/net)
-  'itemStackWireInstall.js']
+  'itemStackWireInstall.js',
+  // HF41: packet-body wire derivation (nested jars + refmap + bytecode walk, local jars only) + its installer (protodef compile only)
+  'packetBodyWireDerivation.js', 'packetBodyWireInstall.js']
 const SRC = path.join(__dirname, '..', 'src', 'client')
 
 // build a synthetic mod that DOES derive, so the network-spy test exercises
@@ -332,7 +334,9 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         './loginWindow',
         // HF35 rider: itemStackWireInstall compiles the extended slot into nmp's play protocol - protocol data +
         // the protodef compiler + nmp's datatype table + prismarine-nbt are local, pure-parsing dependencies
-        './itemStackWireDerivation', 'minecraft-data', 'protodef', 'prismarine-nbt', 'minecraft-protocol/src/datatypes/compiler-minecraft'])
+        './itemStackWireDerivation', 'minecraft-data', 'protodef', 'prismarine-nbt', 'minecraft-protocol/src/datatypes/compiler-minecraft',
+        // HF41: packetBodyWireInstall compiles the extended packet types the same way; the derivation reads jars only
+        './packetBodyWireDerivation'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

@@ -28,6 +28,8 @@ module.exports = {
   loginBytes: require('./src/client/loginBytes'),
   // HF35 r2: jar-derived ItemStack wire-shape extensions (derivation + installer)
   itemStackWire: { ...require('./src/client/itemStackWireDerivation'), ...require('./src/client/itemStackWireInstall') },
+  // HF41: jar-derived PACKET-BODY wire extensions (the item-stack walker generalised to whole packets + the value provider)
+  packetBodyWire: { ...require('./src/client/packetBodyWireDerivation'), ...require('./src/client/packetBodyWireInstall') },
   forgeHandshakeConfig: require('./src/client/forgeHandshakeConfig'),
   autoVersionForge: require('./src/client/autoVersionForge'),
   decodeOptimized: require('./src/client/decodeOptimized'),
