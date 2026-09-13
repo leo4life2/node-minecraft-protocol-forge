@@ -86,6 +86,7 @@ const PAYLOAD_TYPE_CLASSES = new Set([
 ])
 const RESLOC_CLASSES = new Set([
   'net/minecraft/resources/ResourceLocation', // mojmap
+  'net/minecraft/resources/Identifier', // mojmap 26.1+ (HF43: ResourceLocation renamed)
   'net/minecraft/class_2960', // intermediary
   'net/minecraft/util/Identifier' // yarn (dev jars)
 ])
@@ -452,7 +453,7 @@ const CLIENTBOUND_CAPABLE_REGISTRATIONS = new Set([
 ])
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const MOJMAP_PAYLOAD_TYPE = 'net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type'
-const MOJMAP_RESLOC = 'net/minecraft/resources/ResourceLocation'
+const MOJMAP_RESLOCS = ['net/minecraft/resources/ResourceLocation', 'net/minecraft/resources/Identifier'] // HF43: 26.1 rename
 // Bounds — the LAW that keeps the provenance walk honest and finite.
 const CONTAINER_MAX_CLASSES = 12
 const CONTAINER_WALK_MAX_DEPTH = 8
@@ -667,7 +668,7 @@ function deriveContainerCarriedListenChannels (index, diagnostics, ev) {
       // ctor with NO Type parameter falls back to its first ResourceLocation
       // parameter (the (RL, …) ctor idiom that builds `new Type(rl)` inside).
       const typeSlots = types.reduce((acc, t, i) => (t === `L${MOJMAP_PAYLOAD_TYPE};` ? acc.concat(i) : acc), [])
-      const rlSlot = types.findIndex((t) => t === `L${MOJMAP_RESLOC};`)
+      const rlSlot = types.findIndex((t) => MOJMAP_RESLOCS.some((rl) => t === `L${rl};`))
       const slots = typeSlots.length > 0 ? typeSlots : (rlSlot < 0 ? [] : [rlSlot])
       for (const i of slots) walk({ cls: K, name: '<init>', desc: m.desc }, i, 0)
     }

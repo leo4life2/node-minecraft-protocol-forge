@@ -81,7 +81,8 @@ function owoIdentifierHash (ns, p) { return (Math.imul(31, javaStringHash(ns)) +
 const OWO_IDENTIFIER_CLASSES = new Set([
   'net/minecraft/class_2960', // intermediary (shipped Fabric jars)
   'net/minecraft/util/Identifier', // yarn (dev jars)
-  'net/minecraft/resources/ResourceLocation' // mojmap/srg (Connector-remapped)
+  'net/minecraft/resources/ResourceLocation', // mojmap/srg (Connector-remapped)
+  'net/minecraft/resources/Identifier' // mojmap 26.1+ (HF43: ResourceLocation renamed)
 ])
 const OWO_CHANNEL_CLASS = 'io/wispforest/owo/network/OwoNetChannel'
 const OWO_CONTROLLER_CLASS = 'io/wispforest/owo/particles/systems/ParticleSystemController'

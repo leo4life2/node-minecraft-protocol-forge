@@ -80,7 +80,21 @@ const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveCo
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
 const REGISTRAR_SIMPLE = REGISTRAR_TYPE.split('/').pop()
-const RESLOC_TYPE = 'net/minecraft/resources/ResourceLocation'
+// HF43: the id class is a SET, not one name — Minecraft 26.1 renamed
+// net.minecraft.resources.ResourceLocation to net.minecraft.resources.Identifier
+// (same static factories: fromNamespaceAndPath / parse / tryParse / tryBuild /
+// withDefaultNamespace). Every owner/descriptor comparison below goes through
+// these helpers so a 26.1 jar's Identifier.fromNamespaceAndPath resolves
+// exactly like a 1.21 jar's ResourceLocation.fromNamespaceAndPath. Rig-proven:
+// NeoForge 26.1.2.109 with 13 mods derived 0+0 components with 23 abstains
+// ("unresolved payload type id" across five unrelated mods) purely because
+// the id type name changed under the same registration shapes.
+const RESLOC_TYPES = new Set(['net/minecraft/resources/ResourceLocation', 'net/minecraft/resources/Identifier'])
+const isReslocOwner = (owner) => RESLOC_TYPES.has(owner)
+const isReslocDesc = (desc) => typeof desc === 'string' && desc.startsWith('L') && desc.endsWith(';') && RESLOC_TYPES.has(desc.slice(1, -1))
+const returnsResloc = (desc) => { const m = typeof desc === 'string' && desc.match(/\)L([^;]+);$/); return !!m && RESLOC_TYPES.has(m[1]) }
+const isStrToReslocDesc = (desc) => typeof desc === 'string' && desc.startsWith('(Ljava/lang/String;)') && returnsResloc(desc)
+const isStrStrToReslocDesc = (desc) => typeof desc === 'string' && desc.startsWith('(Ljava/lang/String;Ljava/lang/String;)') && returnsResloc(desc)
 const PAYLOAD_TYPE_CLASS = 'net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type'
 
 // PayloadRegistrar registration methods -> {protocols, flow} (decompiled 21.1.248)
@@ -277,8 +291,8 @@ function resolveNamespaceHelper (index, owner, name, desc, cache) {
           // semantics) — tracks_plus 1.0.6b2's `Tracks.path` helper builds
           // every payload id through it and the old list silently missed the
           // whole mod (3 required play channels abstained).
-          if (ref && ref.owner === RESLOC_TYPE && (ref.name === 'fromNamespaceAndPath' || ref.name === 'tryBuild' || ref.name === 'm_339182_')) sawFrom = true
-          if (ref && ref.owner === RESLOC_TYPE && (ref.name === 'parse' || ref.name === 'tryParse')) sawConcatParse = true
+          if (ref && isReslocOwner(ref.owner) && (ref.name === 'fromNamespaceAndPath' || ref.name === 'tryBuild' || ref.name === 'm_339182_')) sawFrom = true
+          if (ref && isReslocOwner(ref.owner) && (ref.name === 'parse' || ref.name === 'tryParse')) sawConcatParse = true
         }
       })
       if (sawFrom && strings.length === 1) result = { nsPrefix: strings[0] }
@@ -392,7 +406,7 @@ function resolveStringValue (index, val, state) {
 function resolveReslocValue (index, val, state) {
   if (!val) return null
   if (val.k === 'resloc') return val.v
-  if (val.k === 'field' && val.desc === `L${RESLOC_TYPE};`) {
+  if (val.k === 'field' && isReslocDesc(val.desc)) {
     const resolved = lookupStaticField(index, val, state)
     if (resolved && resolved.k === 'resloc') return resolved.v
   }
@@ -523,8 +537,16 @@ function simulate (index, classInfo, method, state, opts = {}) {
         const c = cp[code.readUInt16BE(pc + 1)]
         const nat = c && cp[c.natIndex]
         const desc = nat ? cpUtf8(cp, nat.descIndex) : '()V'
-        pop(argSlots(desc).length)
-        if (!returnsVoid(desc)) push(UNKNOWN)
+        const n = argSlots(desc).length
+        const captured = stack.splice(Math.max(0, stack.length - n), n)
+        // HF43: fold StringConcatFactory recipes when every operand is
+        // concrete (the deep evaluator already did; the linear walk pushed
+        // UNKNOWN, so a "ns:" + path helper never yielded an id here).
+        const samName = nat ? cpUtf8(cp, nat.nameIndex) : null
+        const impl = (c && classInfo.bootstrapMethods) ? resolveLambdaImpl(classInfo, c.bsmIndex) : null
+        if (samName === 'makeConcatWithConstants' && c && classInfo.bootstrapMethods) push(concatWithConstants(classInfo, c.bsmIndex, captured))
+        else if (impl && impl.refKind >= 5 && impl.refKind <= 9 && !returnsVoid(desc)) push({ k: 'lambda', impl, captured, sam: samName })
+        else if (!returnsVoid(desc)) push(UNKNOWN)
         break
       }
       case 0xb0: { // areturn: hand the returned abstract value to the caller
@@ -541,6 +563,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
 function handleInvoke (index, classInfo, state, opts, call) {
   const { ref, recv, argVals, push } = call
   const retVoid = returnsVoid(ref.desc)
+  if (opts.onInvoke) opts.onInvoke(call, classInfo)
 
   // <init>: bind constructor args onto the aliased 'new' object
   if (ref.name === '<init>') {
@@ -721,8 +744,8 @@ function handleInvoke (index, classInfo, state, opts, call) {
   }
 
   // namespace helper: static (String) -> ResourceLocation
-  if (call.kind === 'static' && ref.desc === `(Ljava/lang/String;)L${RESLOC_TYPE};`) {
-    if (ref.owner === RESLOC_TYPE && (ref.name === 'parse' || ref.name === 'tryParse')) {
+  if (call.kind === 'static' && isStrToReslocDesc(ref.desc)) {
+    if (isReslocOwner(ref.owner) && (ref.name === 'parse' || ref.name === 'tryParse' || ref.name === 'withDefaultNamespace')) {
       const s = asStr(argVals[0])
       push(s && s.includes(':') ? vResloc(s) : UNKNOWN)
       return
@@ -741,7 +764,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
     push(chained && chained.k === 'resloc' ? chained : UNKNOWN)
     return
   }
-  if (call.kind === 'static' && ref.owner === RESLOC_TYPE && ref.desc === `(Ljava/lang/String;Ljava/lang/String;)L${RESLOC_TYPE};`) {
+  if (call.kind === 'static' && isReslocOwner(ref.owner) && isStrStrToReslocDesc(ref.desc)) {
     const ns = asStr(argVals[0]); const p = asStr(argVals[1])
     push(ns !== null && p !== null ? vResloc(`${ns}:${p}`) : UNKNOWN)
     return
@@ -749,9 +772,20 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // HF11: any OTHER in-index static helper returning a ResourceLocation
   // ((String,String) two-arg wrappers included) resolves by simulating its
   // body — same bounds, honest UNKNOWN on miss.
-  if (call.kind === 'static' && ref.owner !== RESLOC_TYPE && ref.desc.endsWith(`)L${RESLOC_TYPE};`) && index.get(ref.owner)) {
+  if (call.kind === 'static' && !isReslocOwner(ref.owner) && returnsResloc(ref.desc) && index.get(ref.owner)) {
     const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'resloc')
     push(chained && chained.k === 'resloc' ? chained : UNKNOWN)
+    return
+  }
+  // HF43: an in-index static STRING helper feeding an id factory
+  // (sophisticatedcore 26.1: `Identifier.parse(getRegistryName(p))` where
+  // getRegistryName = makeConcatWithConstants("sophisticatedcore:" + p)) —
+  // the (String)->Identifier helper's body only ever saw UNKNOWN here because
+  // no branch simulated a String-returning helper. Same bounds as the
+  // resloc helper chain (frame budget + re-entrancy guard); UNKNOWN on miss.
+  if (call.kind === 'static' && ref.desc.endsWith(')Ljava/lang/String;') && argVals.length > 0 && argVals.every((a) => a && (a.k === 'str' || a.k === 'int')) && index.get(ref.owner)) {
+    const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'str')
+    push(chained && chained.k === 'str' ? chained : UNKNOWN)
     return
   }
   if (call.kind === 'static' && ref.owner === 'java/lang/String' && ref.name === 'valueOf' && argVals[0] && argVals[0].k === 'int') {
@@ -1085,7 +1119,7 @@ function deriveEnumRegistries (index, state, markers) {
         if (ref && ref.name === 'toLowerCase') lowercases = true
       } else if (op === 0xb8) {
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-        if (ref && ref.desc === `(Ljava/lang/String;)L${RESLOC_TYPE};`) {
+        if (ref && isStrToReslocDesc(ref.desc)) {
           const helper = resolveNamespaceHelper(index, ref.owner, ref.name, ref.desc, state.helperCache)
           if (helper) helperNs = helper.nsPrefix
         }
@@ -2737,10 +2771,147 @@ function deriveAckContracts (index, state) {
  * @returns {{components: {configuration: Array, play: Array},
  *            diagnostics: {jars, abstains, errors, registrations}}}
  */
+// ---------- HF43: MOD-PRESENCE GATES ----------
+//
+// SHAPE (sophisticatedcore 1.5.0 / 26.1.2, rig-proven): a compat table
+//   CompatRegistry.registerCompat(new CompatInfo("create"), () -> CreateCompat::new)
+// whose loader only instantiates the compat class when CompatInfo.isLoaded()
+// (= ModList.getModContainerById(modId).isPresent()) says the keyed mod is
+// loaded; CreateCompat then registers three REQUIRED play channels. The
+// server registers them only with Create installed, so a client claiming
+// them on a Create-less pack fails the negotiation ("missing.client.server")
+// exactly as an unclaimed required channel would the other way round.
+//
+// MECHANISM (data-driven, no mod names): (1) PRESENCE-KEY HOLDERS are
+// in-index classes constructed with a String whose own methods invoke a
+// loader mod-presence probe (ModList.isLoaded / getModContainerById /
+// getModFileById, Forge or NeoForge spelling). (2) A GATE is a call that
+// carries such a holder (keyed by a constant string) NEXT TO a lambda /
+// method reference; the classes that lambda constructs (transitively,
+// bounded) are gated on that key. (3) An instance-hosted entry method whose
+// class is ONLY ever constructed under a gate is claimed iff the key names a
+// mod in the jar census (mods.toml ids of every scanned jar, nested jars
+// included); otherwise its channels are left unclaimed with a NAMED abstain.
+// A class also constructed anywhere outside a gate is not gated (claimed as
+// before). Receipted in diagnostics.presenceGates for both outcomes.
+const PRESENCE_PROBE_OWNERS = new Set([
+  'net/neoforged/fml/ModList', 'net/neoforged/fml/loading/LoadingModList', 'net/neoforged/fml/loading/FMLLoader',
+  'net/minecraftforge/fml/ModList', 'net/minecraftforge/fml/loading/LoadingModList', 'net/minecraftforge/fml/loading/FMLLoader'
+])
+const PRESENCE_PROBE_METHODS = new Set(['isLoaded', 'getModContainerById', 'getModFileById'])
+const GATE_LAMBDA_DEPTH = 4
+const ALWAYS_PRESENT_MOD_IDS = new Set(['minecraft', 'neoforge', 'forge'])
+
+function presenceProbeOf (info) {
+  let found = null
+  for (const m of info.codes) {
+    if (found) break
+    walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+      if (found) return
+      if (op === 0xb6 || op === 0xb8 || op === 0xb9) {
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (ref && PRESENCE_PROBE_OWNERS.has(ref.owner) && PRESENCE_PROBE_METHODS.has(ref.name)) found = `${m.method} -> ${ref.owner.split('/').pop()}.${ref.name}`
+      }
+    })
+  }
+  return found
+}
+
+function lambdaConstructs (index, impl, depth, out, seen) {
+  if (!impl || depth > GATE_LAMBDA_DEPTH) return
+  if (impl.refKind === 8) { if (index.get(impl.owner)) out.add(impl.owner); return } // C::new
+  const key = `${impl.owner}.${impl.name}${impl.desc}`
+  if (seen.has(key)) return
+  seen.add(key)
+  const info = index.get(impl.owner)
+  const m = info && info.codes.find((c) => c.method === impl.name && c.desc === impl.desc)
+  if (!m) return
+  walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+    if (op === 0xbb) {
+      const cls = cpClassName(cp, code.readUInt16BE(pc + 1))
+      if (cls && index.get(cls)) out.add(cls)
+    } else if (op === 0xba) {
+      const c = cp[code.readUInt16BE(pc + 1)]
+      const inner = (c && info.bootstrapMethods) ? resolveLambdaImpl(info, c.bsmIndex) : null
+      if (inner && inner.refKind >= 5 && inner.refKind <= 9) lambdaConstructs(index, inner, depth + 1, out, seen)
+    } else if (op === 0xb8) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (ref && index.get(ref.owner)) lambdaConstructs(index, { ...ref, refKind: 6 }, depth + 1, out, seen)
+    }
+  })
+}
+
+function deriveModPresenceGates (index, state) {
+  const holders = new Map()
+  for (const name of state.allClassNames) {
+    const bytes = index.rawBytes(name)
+    if (!bytes) continue
+    let mentions = false
+    for (const o of PRESENCE_PROBE_OWNERS) if (bytes.includes(o)) { mentions = true; break }
+    if (!mentions) continue
+    const info = index.get(name)
+    if (!info) continue
+    if (!info.codes.some((c) => c.method === '<init>' && c.desc.startsWith('(Ljava/lang/String;'))) continue
+    const probe = presenceProbeOf(info)
+    if (probe) holders.set(name, probe)
+  }
+  const gates = new Map()
+  if (holders.size === 0) return gates
+  const walkedLambdas = new Set()
+  for (const name of state.allClassNames) {
+    const bytes = index.rawBytes(name)
+    if (!bytes) continue
+    let hit = null
+    for (const h of holders.keys()) if (bytes.includes(h)) { hit = h; break }
+    if (!hit) continue
+    const info = index.get(name)
+    if (!info) continue
+    for (const m of info.codes) {
+      const locals = seedProvenanceLocals(m.desc, (m.flags & 0x0008) !== 0, info.className)
+      simulate(index, info, m, state, {
+        locals,
+        onInvoke: (call) => {
+          const keyed = call.argVals.find((a) => a && a.k === 'obj' && holders.has(a.cls) && a.ctorArgs && a.ctorArgs[0] && a.ctorArgs[0].k === 'str')
+          const lambdas = call.argVals.filter((a) => a && a.k === 'lambda')
+          if (!keyed || lambdas.length === 0) return
+          const constructed = new Set()
+          for (const lam of lambdas) lambdaConstructs(index, lam.impl, 0, constructed, walkedLambdas)
+          for (const cls of constructed) {
+            if (holders.has(cls) || gates.has(cls)) continue
+            gates.set(cls, { modId: a0(keyed), holder: keyed.cls, probe: holders.get(keyed.cls), site: `${info.className}.${m.method}` })
+          }
+        }
+      })
+    }
+  }
+  // a gated class ALSO constructed outside any walked lambda body is not
+  // gated — the plain construction registers regardless of the key.
+  if (gates.size > 0) {
+    for (const name of state.allClassNames) {
+      const bytes = index.rawBytes(name)
+      if (!bytes) continue
+      const gatedHere = [...gates.keys()].filter((g) => bytes.includes(g))
+      if (gatedHere.length === 0) continue
+      const info = index.get(name)
+      if (!info) continue
+      for (const m of info.codes) {
+        if (walkedLambdas.has(`${info.className}.${m.method}${m.desc}`)) continue
+        walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+          if (op !== 0xbb) return
+          const cls = cpClassName(cp, code.readUInt16BE(pc + 1))
+          if (cls && gates.has(cls) && cls !== info.className) gates.delete(cls)
+        })
+      }
+    }
+  }
+  return gates
+  function a0 (obj) { return obj.ctorArgs[0].v }
+}
+
 function deriveNeoForgeComponents (jarPaths) {
   const started = Date.now()
   const index = makeClassIndex()
-  const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0 }
+  const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0, presenceGates: [] }
   for (const p of jarPaths) collectJarClasses(p, index, diagnostics, path.basename(p))
 
   const versionByModId = Object.create(null)
@@ -2773,6 +2944,8 @@ function deriveNeoForgeComponents (jarPaths) {
 
   const registrations = []
   const silentEntries = []
+  const presenceGates = deriveModPresenceGates(index, state)
+  const censusHas = (modId) => ALWAYS_PRESENT_MOD_IDS.has(modId) || diagnostics.jars.some((j) => (j.modIds || []).includes(modId))
   const record = (reg) => {
     const spec = REGISTRATION_METHODS[reg.method]
     if (process.env.MINEPAL_AGG_DEBUG) debug(`record ${reg.method} id=${reg.id} idVal=${JSON.stringify(reg.idVal).slice(0, 160)} site=${reg.site} version=${reg.registrar && reg.registrar.version}`)
@@ -2787,6 +2960,15 @@ function deriveNeoForgeComponents (jarPaths) {
     // what the aggregation pass binds candidates to. The event/registrar
     // values are still produced by the interpreter when registrar() is
     // invoked on the event argument.
+    const gate = (method.flags & 0x0008) === 0 ? presenceGates.get(info.className) : null
+    if (gate) {
+      const present = censusHas(gate.modId)
+      diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, modId: gate.modId, present, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
+      if (!present) {
+        diagnostics.abstains.push(`${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} keys ${gate.holder.split('/').pop()}("${gate.modId}") whose ${gate.probe} decides construction, and "${gate.modId}" is not in the jar census (${diagnostics.jars.length} jars) — this entry's channels unclaimed (the server registers them only with that mod loaded)`)
+        continue
+      }
+    }
     const locals = seedProvenanceLocals(method.desc, (method.flags & 0x0008) !== 0, info.className)
     let reached = 0
     let reachedWithId = 0

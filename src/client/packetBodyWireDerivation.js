@@ -57,7 +57,7 @@ const MAX_CALL_HOPS = 3
 const VANILLA = {
   buf: new Set(['net/minecraft/network/FriendlyByteBuf', 'net/minecraft/class_2540']),
   compound: new Set(['net/minecraft/nbt/CompoundTag', 'net/minecraft/class_2487']),
-  resourceLocation: new Set(['net/minecraft/resources/ResourceLocation', 'net/minecraft/class_2960']),
+  resourceLocation: new Set(['net/minecraft/resources/ResourceLocation', 'net/minecraft/resources/Identifier', 'net/minecraft/class_2960']), // HF43: 26.1 rename
   resourceKey: new Set(['net/minecraft/resources/ResourceKey', 'net/minecraft/class_5321']),
   level: new Set(['net/minecraft/world/level/Level', 'net/minecraft/class_1937'])
 }

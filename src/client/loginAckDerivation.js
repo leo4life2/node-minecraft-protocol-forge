@@ -62,6 +62,7 @@ const LOGIN_ACK_DERIVATION_VERSION = 2
 
 const RL_CLASSES = new Set([
   'net/minecraft/resources/ResourceLocation', // mojmap/srg (Forge 1.17+ mods)
+  'net/minecraft/resources/Identifier', // mojmap 26.1+ (HF43: ResourceLocation renamed)
   'net/minecraft/util/ResourceLocation', // MCP/srg (Forge 1.13-1.16 = FML2-era mods)
   'net/minecraft/class_2960', // intermediary (shipped Fabric jars)
   'net/minecraft/util/Identifier' // yarn (dev jars)

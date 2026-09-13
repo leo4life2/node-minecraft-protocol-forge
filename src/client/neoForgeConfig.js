@@ -300,6 +300,117 @@ function encodeNetworkQuery (components) {
 }
 
 // NetworkPayloadSetup: Map<ConnectionProtocol, Map<ResourceLocation, NetworkChannel(id, version)>>
+// HF43: the server's own `neoforge:register` query is ModdedNetworkQueryPayload
+// .fromRegistry(...) — ITS component sets per protocol (id, version, optional
+// flow, optional flag), the same wire shape encodeNetworkQuery writes. Decoded
+// as ground truth for the negotiation: what the server has, at which version.
+function decodeNetworkQuery (buf) {
+  let offset = 0
+  const mapCount = readVarInt(buf, offset); offset += mapCount.size
+  const query = {}
+  for (let i = 0; i < mapCount.value; i++) {
+    const ordinal = readVarInt(buf, offset); offset += ordinal.size
+    const protocol = PROTOCOL_NAMES[ordinal.value] ?? `protocol_${ordinal.value}`
+    const count = readVarInt(buf, offset); offset += count.size
+    const rows = []
+    for (let j = 0; j < count.value; j++) {
+      const id = readString(buf, offset); offset += id.size
+      const version = readString(buf, offset); offset += version.size
+      const hasFlow = buf[offset]; offset += 1
+      let flow = null
+      if (hasFlow) {
+        const fo = readVarInt(buf, offset); offset += fo.size
+        flow = fo.value === 0 ? 'serverbound' : fo.value === 1 ? 'clientbound' : `flow_${fo.value}`
+      }
+      const optional = buf[offset] === 1; offset += 1
+      rows.push({ id: id.value, version: version.value, flow, optional })
+    }
+    query[protocol] = rows
+  }
+  return query
+}
+
+// HF43: the server rows a client claim set would fail on (decompiled
+// NetworkComponentNegotiator: a NON-optional server component absent on the
+// client fails "missing.server.client"; a non-optional client component
+// absent on the server fails the other way). Pure — feeds the learn belt.
+function negotiationDelta (serverQuery, components) {
+  const delta = { missingOnClient: [], extraOnClient: [] }
+  if (!serverQuery) return delta
+  for (const protocol of ['configuration', 'play']) {
+    const ours = new Set((components[protocol] || []).map((c) => c.id))
+    const theirs = new Map((serverQuery[protocol] || []).map((r) => [r.id, r]))
+    for (const r of theirs.values()) if (!r.optional && !ours.has(r.id)) delta.missingOnClient.push({ protocol, ...r })
+    for (const c of components[protocol] || []) if (!c.optional && !theirs.has(c.id)) delta.extraOnClient.push({ protocol, id: c.id, version: c.version })
+  }
+  return delta
+}
+
+// HF43: typed reading of neoforge:modded_network_setup_failed rows against
+// the server's own query — the translate key names the rule that failed,
+// the query row names the tuple the server holds for that channel.
+function classifyNegotiationFailure (reasons, serverQuery) {
+  const out = []
+  const rowOf = (id) => {
+    for (const protocol of ['configuration', 'play']) {
+      const r = ((serverQuery && serverQuery[protocol]) || []).find((x) => x.id === id)
+      if (r) return { protocol, ...r }
+    }
+    return null
+  }
+  // every translate/text key in the component TREE — NeoForge wraps the
+  // rule key inside neoforge.network.negotiation.failure.mod's arguments
+  // (rig-proven 26.1.2: {translate: ...failure.mod, with: [{translate:
+  // ...missing.server.client}]}), so the top-level key alone says nothing.
+  const keyOf = (why, depth = 0) => {
+    if (!why || depth > 6) return ''
+    if (typeof why === 'string') return why
+    if (Array.isArray(why)) return why.map((w) => keyOf(w, depth + 1)).filter(Boolean).join(' ')
+    if (typeof why !== 'object') return ''
+    const parts = []
+    if (typeof why.translate === 'string') parts.push(why.translate)
+    if (typeof why.text === 'string') parts.push(why.text)
+    for (const k of ['with', 'extra', 'value']) if (why[k] !== undefined && why[k] !== null) { const inner = keyOf(why[k], depth + 1); if (inner) parts.push(inner) }
+    return parts.join(' ')
+  }
+  for (const [id, why] of Object.entries(reasons || {})) {
+    const key = keyOf(why)
+    let kind = 'other'
+    if (/missing\.server\.client/.test(key)) kind = 'missing_on_client'
+    else if (/missing\.client\.server/.test(key)) kind = 'missing_on_server'
+    else if (/version/.test(key)) kind = 'version_mismatch'
+    else if (/flow\.[a-z]+\.missing/.test(key)) kind = 'flow_missing'
+    else if (/flow/.test(key)) kind = 'flow_mismatch'
+    else if (/failure\.mod/.test(key)) kind = 'mod_rule'
+    const server = rowOf(id)
+    // version.mismatch carries BOTH versions as arguments (decompiled
+    // validateComponent: translatable(key, [theirs, ours])) — surfaced so a
+    // learner can take the one that is not its own claim.
+    const versions = []
+    const strings = (w, depth = 0) => {
+      if (w === null || w === undefined || depth > 6) return
+      if (typeof w === 'string') { versions.push(w); return }
+      if (Array.isArray(w)) { for (const x of w) strings(x, depth + 1); return }
+      if (typeof w === 'object') { if (typeof w.text === 'string') versions.push(w.text); else if (w.with !== undefined) strings(w.with, depth + 1) }
+    }
+    // the RULE component (the one whose translate key names flow/version)
+    // carries the expected value in ITS arguments — failure.mod's own first
+    // argument is the mod's display name, never a version
+    const ruleOf = (w, depth = 0) => {
+      if (!w || typeof w !== 'object' || depth > 6) return null
+      if (Array.isArray(w)) { for (const x of w) { const r = ruleOf(x, depth + 1); if (r) return r } return null }
+      if (typeof w.translate === 'string' && /failure\.(flow|version)/.test(w.translate)) return w
+      return w.with !== undefined ? ruleOf(w.with, depth + 1) : null
+    }
+    if (kind === 'version_mismatch' || kind === 'flow_missing' || kind === 'flow_mismatch') { const rule = ruleOf(why); if (rule) strings(rule.with) }
+    // flow.<side>.missing / flow.<side>.mismatch carry the PRESENT flow's
+    // PacketFlow.toString() (CLIENTBOUND / SERVERBOUND) as an argument
+    const flowArg = versions.map((v) => String(v).toLowerCase()).find((v) => v === 'clientbound' || v === 'serverbound') ?? null
+    out.push({ id, kind, key, server, versions, flow: flowArg })
+  }
+  return out
+}
+
 function decodeNetworkSetup (buf) {
   let offset = 0
   const mapCount = readVarInt(buf, offset); offset += mapCount.size
@@ -515,17 +626,52 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   // serverbound built-ins (our own acks/replies) pass through untouched.
   // (`neoforge:split` falls out of both contracts by the same law.)
   const unclaimedBuiltins = []
-  const builtinFilter = (contract) => (c) => {
+  const toleratedDerived = [] // HF43: loader-derived clientbound play built-ins beyond the 21.1-pinned list
+  const builtinFilter = (contract, tolerateDerivedClientbound = false) => (c) => {
     if (typeof c.id !== 'string' || !c.id.startsWith('neoforge:')) return true
     if (c.flow === 'serverbound') return true
     if (contract.includes(c.id)) return true
+    // HF43: the loader jar is the authority on ITS play built-ins — a
+    // clientbound one is a pure toClient stream by the HF6 argument (no
+    // serverbound counterpart, no blocking task at play) and MUST be claimed:
+    // NetworkRegistry.checkPacket throws on the server's own send of an
+    // unnegotiated payload and the join dies at placeNewPlayer (rig-proven
+    // 26.1.2.109: `neoforge:recipe_content`, new in 26.1, "Invalid player
+    // data"). The framing carrier (neoforge:split, flow null) stays refused.
+    if (tolerateDerivedClientbound && c.flow === 'clientbound' && c.id !== 'neoforge:split') {
+      toleratedDerived.push(c.id)
+      return true
+    }
     unclaimedBuiltins.push(c.id)
     return false
   }
   const components = {
     configuration: (rawComponents.configuration || []).filter(builtinFilter(HANDLED_CLIENTBOUND_CONFIG_CHANNELS)),
-    play: (rawComponents.play || []).filter(builtinFilter(TOLERATED_CLIENTBOUND_PLAY_CHANNELS))
+    play: (rawComponents.play || []).filter(builtinFilter(TOLERATED_CLIENTBOUND_PLAY_CHANNELS, true))
   }
+  if (toleratedDerived.length > 0) {
+    debug(`neoforge config: tolerating ${toleratedDerived.length} loader-derived clientbound play built-in(s) beyond the pinned list: ${toleratedDerived.join(', ')}`)
+  }
+  // HF43 LEARN BELT: channels the SERVER named in an earlier negotiation
+  // failure (tuple from its own query) ride the claim STAMPED learned — never
+  // as derived; their payloads are received and dropped, never acted on.
+  // Built-ins and ids already derived never enter here.
+  const learnedIds = new Set()
+  const learnedRows = { configuration: [], play: [] }
+  for (const protocol of ['configuration', 'play']) {
+    for (const row of ((options.learnedComponents || {})[protocol] || [])) {
+      if (!row || typeof row.id !== 'string' || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(row.id) || row.id.startsWith('neoforge:') || row.id.startsWith('minecraft:')) continue
+      if (components[protocol].some((c) => c.id === row.id) || learnedIds.has(`${protocol}/${row.id}`)) continue
+      const flow = row.flow === 'serverbound' || row.flow === 'clientbound' ? row.flow : null
+      // optional unless the learner says otherwise: an optional client row
+      // the server lacks is dropped by the negotiator, a required one fails it
+      const learned = { id: row.id, version: String(row.version ?? ''), flow, optional: row.optional !== false, learned: true, source: `learned:${row.learnedFrom || 'server'}` }
+      components[protocol].push(learned)
+      learnedRows[protocol].push(learned)
+      learnedIds.add(`${protocol}/${row.id}`)
+    }
+  }
+  const learnedChannelIds = new Set([...learnedRows.configuration, ...learnedRows.play].map((r) => r.id))
   if (unclaimedBuiltins.length > 0) {
     debug(`neoforge config: refusing to claim ${unclaimedBuiltins.length} configuration built-in(s) this responder cannot answer: ${unclaimedBuiltins.join(', ')}`)
   }
@@ -564,11 +710,16 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     dataMapsAnswered: false,
     declaredListening: null,
     listenOnlyDeclared: null, // HF15: how many jar-derived listen-only ids rode the declaration
-    queryAnswer: null, // HF8: {configuration, play, bytes} once answered
+    queryAnswer: null, // HF8: {configuration, play, bytes} once answered (+ HF43 learned counts)
+    serverQuery: null, // HF43: the server's own component sets from its neoforge:register query
+    serverDelta: null, // HF43: {missingOnClient, extraOnClient} — the rows the negotiator would fail on
+    learned: { configuration: learnedRows.configuration.map((r) => r.id), play: learnedRows.play.map((r) => r.id) }, // HF43 receipt: claimed-as-learned ids
+    learnedDropped: {}, // HF43: payloads received on learned channels and dropped, by id
     setupFailed: null, // HF8: the server's per-channel failure reasons
     pongHold: null, // HF37: {id, heldMs, outcome} — the configuration pong held until the negotiation verdict
     acked: [], // HF11: {trigger, ack} rows actually answered this phase
     unclaimedBuiltins,
+    toleratedDerived, // HF43 receipt
     unhandled: [],
     log: [],
     // HF9 receipts: which mod sync tasks were acked, what was consumed —
@@ -578,6 +729,17 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
       : null
   }
   client.neoForgeConfig = state
+  if (learnedChannelIds.size > 0) {
+    debug(`neoforge config: ${learnedChannelIds.size} channel(s) ride the claim as LEARNED from this server's own negotiation (not jar-derived): ${[...learnedChannelIds].join(', ')}`)
+    // play-phase payloads on learned channels: counted and dropped (the
+    // transport ignores unknown custom payloads; the receipt says how many)
+    client.on('packet', (packet, meta) => {
+      if (meta.state !== 'play' || meta.name !== 'custom_payload') return
+      if (typeof packet.channel === 'string' && learnedChannelIds.has(packet.channel)) {
+        state.learnedDropped[packet.channel] = (state.learnedDropped[packet.channel] || 0) + 1
+      }
+    })
+  }
   // D3: NeoForge 1.20.5+ advanced_add_entity is a COMPANION payload (entityId
   // + custom bytes next to vanilla add_entity — javap 20.4.237 / 21.1.248);
   // the decoder derives that from the local universal jar and synthesizes
@@ -723,6 +885,16 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     try {
       switch (channel) {
         case 'neoforge:register': {
+          try {
+            state.serverQuery = decodeNetworkQuery(data)
+            state.serverDelta = negotiationDelta(state.serverQuery, components)
+            const sq = state.serverQuery
+            debug(`neoforge config: server query holds ${(sq.configuration || []).length} configuration + ${(sq.play || []).length} play components; ${state.serverDelta.missingOnClient.length} required server row(s) absent from our claim${state.serverDelta.missingOnClient.length ? ` [${state.serverDelta.missingOnClient.map((r) => `${r.id}@${r.version}`).join(',')}]` : ''}; ${state.serverDelta.extraOnClient.length} required claim(s) the server lacks${state.serverDelta.extraOnClient.length ? ` [${state.serverDelta.extraOnClient.map((r) => r.id).join(',')}]` : ''}`)
+            client.emit('neoForgeServerQuery', { serverQuery: state.serverQuery, delta: state.serverDelta })
+          } catch (err) {
+            state.serverQuery = null
+            debug(`neoforge config: server query not decodable (${err.message}) — answering from the jar-derived claim alone`)
+          }
           // The server's (empty) component query. Answer with our claimed
           // component sets BEFORE the vanilla pong can classify us as a
           // vanilla client (the query always precedes ping(0), so a
@@ -743,7 +915,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
             // negotiation completes); the jar-derived listen-only surface
             // rides behind it, deduped. onMinecraftRegister is addAll-
             // additive server-side, so extra frames are lawful (HF8).
-            const contract = [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS]
+            const contract = [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS, ...toleratedDerived]
             const contractSet = new Set(contract)
             const extras = listenOnly.filter((id) => !contractSet.has(id))
             state.declaredListening = [...contract, ...extras]
@@ -769,6 +941,8 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           state.queryAnswer = {
             configuration: components.configuration.length,
             play: components.play.length,
+            learnedConfiguration: learnedRows.configuration.length,
+            learnedPlay: learnedRows.play.length,
             bytes: reply.length
           }
           send('neoforge:register', reply)
@@ -845,6 +1019,13 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           break
         }
         default:
+          if (typeof channel === 'string' && learnedChannelIds.has(channel)) {
+            // HF43: a learned channel's payload is received and DROPPED —
+            // its protocol is unknown to this client by construction.
+            state.learnedDropped[channel] = (state.learnedDropped[channel] || 0) + 1
+            debug(`neoforge config: payload on learned channel ${channel} (${data.length} bytes) dropped (${state.learnedDropped[channel]} so far)`)
+            break
+          }
           // HF9 — content-mod sync-task payloads (jar-proven contracts): the
           // mod's configuration task sent this and blocks the phase until
           // the mod's own finish ack arrives. Ack once per task id (see the
@@ -914,6 +1095,9 @@ module.exports = {
   MAX_SERVERBOUND_CUSTOM_PAYLOAD_BYTES,
   splitDinnerboneFrames,
   encodeNetworkQuery,
+  decodeNetworkQuery,
+  negotiationDelta,
+  classifyNegotiationFailure,
   decodeNetworkSetup,
   decodeSetupFailed,
   decodeFrozenStart,

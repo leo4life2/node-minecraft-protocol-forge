@@ -121,6 +121,10 @@ function decodeSwitchAt (code, pc) {
 }
 
 // --- the id-formula proof ---------------------------------------------------
+// HF43: the id class is a set — 26.1 renamed ResourceLocation to Identifier.
+const RL_CLASSES = new Set(['net/minecraft/resources/ResourceLocation', 'net/minecraft/resources/Identifier'])
+const returnsRl = (desc) => { const m = typeof desc === 'string' && desc.match(/\)L([^;]+);$/); return !!m && RL_CLASSES.has(m[1]) }
+
 // Chases a (String)->ResourceLocation helper for its namespace constant and
 // the lowercase transform. Depth-bounded (<=2 hops: ns(String) -> of(ns,
 // String) -> ResourceLocation factory). Returns {namespace} or null.
@@ -142,10 +146,10 @@ function chaseNamespaceHelper (index, owner, name, desc, depth = 0) {
     }
     if ((row.op === 0xb6 || row.op === 0xb8 || row.op === 0xb9) && row.ref) {
       if (row.ref.name === 'toLowerCase') sawLower = true
-      if (row.ref.owner === 'net/minecraft/resources/ResourceLocation' &&
+      if (RL_CLASSES.has(row.ref.owner) &&
           ['fromNamespaceAndPath', 'tryParse', 'parse', 'of'].includes(row.ref.name)) sawFactory = true
-      if (row.op === 0xb8 && row.ref.desc && row.ref.desc.endsWith(')Lnet/minecraft/resources/ResourceLocation;') &&
-          row.ref.owner !== 'net/minecraft/resources/ResourceLocation') {
+      if (row.op === 0xb8 && row.ref.desc && returnsRl(row.ref.desc) &&
+          !RL_CLASSES.has(row.ref.owner)) {
         next = row.ref
       }
     }
@@ -175,7 +179,7 @@ function chaseHelperTransform (index, owner, name, desc) {
   for (const row of decodeInstructions(method.code, info.cp)) {
     if ((row.op === 0xb6 || row.op === 0xb8) && row.ref) {
       if (row.ref.name === 'toLowerCase') sawLower = true
-      if (row.ref.owner === 'net/minecraft/resources/ResourceLocation' &&
+      if (RL_CLASSES.has(row.ref.owner) &&
           ['fromNamespaceAndPath', 'tryParse', 'parse', 'of'].includes(row.ref.name)) sawFactory = true
     }
   }
@@ -328,7 +332,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
       let sawSimple = false
       for (const row of idiom.rows) {
         if (row.op === 0xb6 && row.ref && row.ref.owner === 'java/lang/Class' && row.ref.name === 'getSimpleName') sawSimple = true
-        if (sawSimple && row.op === 0xb8 && row.ref && row.ref.desc === '(Ljava/lang/String;)Lnet/minecraft/resources/ResourceLocation;') {
+        if (sawSimple && row.op === 0xb8 && row.ref && row.ref.desc.startsWith('(Ljava/lang/String;)') && returnsRl(row.ref.desc)) {
           const chased = chaseNamespaceHelper(index, row.ref.owner, row.ref.name, row.ref.desc)
           if (chased) namespace = chased.namespace
           break
