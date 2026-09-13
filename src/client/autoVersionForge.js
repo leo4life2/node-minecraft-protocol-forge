@@ -9,7 +9,7 @@ const forgeHandshakeConfig = require('./forgeHandshakeConfig')
 const decodeOptimized = require('./decodeOptimized')
 const { deriveNeoForgeComponents } = require('./neoForgePayloadDerivation')
 const { installNeoForgeConfigNegotiation } = require('./neoForgeConfig')
-const { warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments } = require('./loginAckDerivation')
+const { warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, isLoginAssessmentCached } = require('./loginAckDerivation')
 
 // HF38: THE PRE-LOGIN DERIVATION. The inputs of every jar-derived login
 // verdict — the ping's channel census + the local instance jars — are known
@@ -33,6 +33,43 @@ function preloginDerivation (client, options, channelNames, modsPaths) {
   // here is provably before set_protocol (the server's clock does not exist
   // yet). Bounded (options.preloginSyncBudgetMs, default 8 s); with the
   // persistent store it is ~0 ms on every run after the first.
+  // HF46: an OFF-THREAD warmer (options.loginAssessmentWarm(channelNames, modsPaths)
+  // -> Promise<entries as exportLoginAssessments() shapes them>) replaces both the
+  // on-loop sync pass and the setImmediate stepping that used to assess one
+  // channel per turn (each a full jar walk: seconds of blocked loop per step on a
+  // large local mods folder, right through PLAY entry — the keep-alive timeout
+  // mechanism). Entries import into the cache as they arrive; a query that lands
+  // before its channel is warm still takes the inline path (unchanged).
+  const warm = options && typeof options.loginAssessmentWarm === 'function' ? options.loginAssessmentWarm : null
+  if (warm) {
+    const startedAt = Date.now()
+    const queue = (channelNames || []).filter((ch) => typeof ch === 'string' && ch.includes(':') && !/^(fml|forge|minecraft):/.test(ch))
+    const pathsKey = (modsPaths || []).filter(Boolean).join('|')
+    const cachedNow = queue.filter((ch) => isLoginAssessmentCached(`${pathsKey}::${ch}`)).length
+    const pre = { assessed: cachedNow, fromCache: cachedNow, ms: 0, syncMs: 0, imported, channels: queue.length, startedAt, finishedAt: null, finishedBeforeLoginStart: null, remaining: queue.length - cachedNow, offThread: true }
+    client.forgePreloginDerivation = pre
+    const report = () => {
+      console.log(`[forge] pre-login derivation: ${pre.assessed} login-channel verdict(s) ready in ${pre.ms} ms (${pre.fromCache} from cache, ${pre.assessed - pre.fromCache} assessed OFF the main thread; ${pre.remaining} still pending when the login started: ${pre.finishedBeforeLoginStart === false ? 'inline path covers them' : 'none'})`)
+      if (store && typeof store.save === 'function' && pre.assessed > pre.fromCache) {
+        try { store.save(exportLoginAssessments()) } catch (err) { debug(`login-assessment store save failed (${err.message})`) }
+      }
+    }
+    if (pre.remaining === 0) { pre.finishedAt = startedAt; pre.finishedBeforeLoginStart = true; report(); return Promise.resolve(pre) }
+    return Promise.resolve()
+      .then(() => warm(queue.filter((ch) => !isLoginAssessmentCached(`${pathsKey}::${ch}`)), modsPaths))
+      .then((entries) => {
+        const n = importLoginAssessments(entries)
+        const startAt = client.forgeLoginWindow && client.forgeLoginWindow.startAt
+        pre.finishedAt = Date.now()
+        pre.ms = pre.finishedAt - startedAt
+        pre.assessed = cachedNow + n
+        pre.finishedBeforeLoginStart = startAt == null || pre.finishedAt <= startAt
+        pre.remaining = Math.max(0, queue.length - pre.assessed)
+        report()
+        return pre
+      })
+      .catch((err) => { debug(`off-thread login assessment warm failed (${err && err.message}); inline path covers every channel`); pre.error = String(err && err.message); return pre })
+  }
   const syncBudget = Number.isFinite(options && options.preloginSyncBudgetMs) ? options.preloginSyncBudgetMs : DEFAULT_PRELOGIN_SYNC_BUDGET_MS
   const sync = warmLoginAssessmentsSync(channelNames, modsPaths, syncBudget)
   const startedAt = Date.now() - sync.ms

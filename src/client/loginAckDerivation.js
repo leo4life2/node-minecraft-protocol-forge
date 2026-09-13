@@ -966,6 +966,9 @@ function reviveAssessment (obj) {
 }
 
 /** @returns {Array.<{key: string, result: object}>} every cached verdict (JSON-safe) */
+/** HF46: whether a cache key (`${paths.join('|')}::${channelId}`) is already assessed. */
+function isLoginAssessmentCached (key) { return assessCache.has(key) }
+
 function exportLoginAssessments () {
   const entries = []
   for (const [key, result] of assessCache) entries.push({ key, result: serializeAssessment(result) })
@@ -1077,4 +1080,4 @@ function assessUncached (channelId, paths) {
   }
 }
 
-module.exports = { LOGIN_ACK_DERIVATION_VERSION, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
+module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
