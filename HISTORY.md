@@ -1,5 +1,11 @@
 # History
 
+## 1.2.0
+* [Update CI to Node 24 (#47)](https://github.com/PrismarineJS/node-minecraft-protocol-forge/commit/7c3714250c577463acec946f8cb5d6a8d12d1b57) (thanks @rom1504)
+* [Bump mocha from 10.8.2 to 11.0.1 (#39)](https://github.com/PrismarineJS/node-minecraft-protocol-forge/commit/d723566a5627b220a99e136b4b9cbc453c62e8bc) (thanks @dependabot[bot])
+* [node 22 (#40)](https://github.com/PrismarineJS/node-minecraft-protocol-forge/commit/2fc312629042ba190981580cf7052f1d821a9949) (thanks @rom1504)
+* [Better handling of other loginwrapperchannel (FML2, FML3) (#34)](https://github.com/PrismarineJS/node-minecraft-protocol-forge/commit/3a7f0ea49c903ec042ec95f0b60289e096145075) (thanks @Mykola1453)
+
 ## 1.1.0
 * [Standard + basic code health (#30)](https://github.com/PrismarineJS/node-minecraft-protocol-forge/commit/0bb14ed5e10362f800a12864710153925ffc06e0) (thanks @rom1504)
 * [Create npm-publish.yml](https://github.com/PrismarineJS/node-minecraft-protocol-forge/commit/e380e6c2b460bc8a32726143354d5cace06af077) (thanks @rom1504)
