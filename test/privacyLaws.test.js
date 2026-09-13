@@ -34,6 +34,8 @@ const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js'
   'loaderSpawnDerivation.js', 'loaderSpawnDecoder.js', 'neoForgeLoaderLocator.js',
   // D3 rider: dimension bounds from the wire (login/respawn/registry_data) for the plausibility gate
   'worldBounds.js',
+  // HF45: the declare_commands boundary + the command argument-type derivation/install (jar bytes -> parser layouts, per client)
+  'commandTreeParser.js', 'commandArgumentTypeDerivation.js', 'commandArgumentTypeInstall.js', 'declareCommandsBoundary.js',
   // HF35: the owo-lib login handshake derivation (jar bytes -> channel/controller fingerprints)
   // + its FriendlyByteBuf primitives, shared by the Forge and Fabric lanes
   'owoHandshake.js', 'loginBytes.js',
@@ -336,7 +338,9 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // the protodef compiler + nmp's datatype table + prismarine-nbt are local, pure-parsing dependencies
         './itemStackWireDerivation', 'minecraft-data', 'protodef', 'prismarine-nbt', 'minecraft-protocol/src/datatypes/compiler-minecraft',
         // HF41: packetBodyWireInstall compiles the extended packet types the same way; the derivation reads jars only
-        './packetBodyWireDerivation'])
+        './packetBodyWireDerivation',
+        // HF45: the command-tree reader (schema + protodef, per client) and the argument-type derivation (jar bytes only)
+        './commandTreeParser', './commandArgumentTypeDerivation'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

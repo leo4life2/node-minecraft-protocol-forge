@@ -111,7 +111,11 @@ const FLOW_ORDINALS = { serverbound: 0, clientbound: 1 }
 const SNAPSHOT_REGISTRIES = {
   'minecraft:item': 'item',
   'minecraft:block': 'block',
-  'minecraft:entity_type': 'entity_type'
+  'minecraft:entity_type': 'entity_type',
+  // HF45: the server's command argument-type numbering (loader/mod parser
+  // ids after the vanilla table) — the wire half of the declare_commands
+  // argument-type derivation (commandArgumentTypeInstall.js)
+  'minecraft:command_argument_type': 'command_argument_type'
 }
 
 // HF6 — the responder's HANDLER CONTRACT: every clientbound (or

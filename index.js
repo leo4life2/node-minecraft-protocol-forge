@@ -34,6 +34,13 @@ module.exports = {
   autoVersionForge: require('./src/client/autoVersionForge'),
   decodeOptimized: require('./src/client/decodeOptimized'),
   installTolerantPlayParser: require('./src/client/tolerantPlayParser'),
+  // HF45: the declare_commands boundary + the derived command argument-type table (per client)
+  commandTree: {
+    ...require('./src/client/commandTreeParser'),
+    ...require('./src/client/commandArgumentTypeDerivation'),
+    ...require('./src/client/commandArgumentTypeInstall'),
+    ...require('./src/client/declareCommandsBoundary')
+  },
   neoForgeConfig: require('./src/client/neoForgeConfig'),
   neoForgeLoaderLocator: require('./src/client/neoForgeLoaderLocator'),
   deriveNeoForgeComponents: require('./src/client/neoForgePayloadDerivation').deriveNeoForgeComponents,
