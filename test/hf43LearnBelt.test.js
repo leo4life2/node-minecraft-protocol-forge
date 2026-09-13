@@ -33,6 +33,17 @@ describe('HF43 learn belt (lib)', function () {
     const d = negotiationDelta(server, { configuration: [{ id: 'a:b', version: '1', optional: false }, { id: 'mine:y', version: '1', optional: false }, { id: 'mine:opt', version: '1', optional: true }], play: [] })
     assert.deepStrictEqual(d.missingOnClient.map((r) => r.id), ['c:d'])
     assert.deepStrictEqual(d.extraOnClient.map((r) => r.id), ['mine:y'])
+    assert.strictEqual(d.known, true)
+  })
+
+  it('HF43-r MED-3: an empty or absent server query is UNKNOWN — known=false, nothing compared, no extraOnClient rows', () => {
+    const ours = { configuration: [{ id: 'mine:req', version: '1', optional: false }], play: [{ id: 'mine:play', version: '1', optional: false }] }
+    for (const q of [null, undefined, {}, { configuration: [], play: [] }]) {
+      const d = negotiationDelta(q, ours)
+      assert.strictEqual(d.known, false)
+      assert.deepStrictEqual(d.extraOnClient, [])
+      assert.deepStrictEqual(d.missingOnClient, [])
+    }
   })
 
   it('classifyNegotiationFailure reads the rule key nested in failure.mod and lifts flow / version arguments', () => {
@@ -74,7 +85,9 @@ describe('HF43 learn belt (lib)', function () {
     assert.strictEqual(c.neoForgeConfig.queryAnswer.learnedConfiguration, 1)
     assert.strictEqual(c.neoForgeConfig.queryAnswer.learnedPlay, 2)
     assert.deepStrictEqual(c.neoForgeConfig.serverQuery, {})
-    assert.deepStrictEqual(c.neoForgeConfig.serverDelta, { missingOnClient: [], extraOnClient: [{ protocol: 'configuration', id: 'derived:cfg', version: '1' }] })
+    // HF43-r (MED-3): an EMPTY server query compares nothing — no row is
+    // "extra on the client" against a server that listed no component
+    assert.deepStrictEqual(c.neoForgeConfig.serverDelta, { known: false, missingOnClient: [], extraOnClient: [] })
     const before = c.writes.length
     c.emit('packet', { channel: 'learned:cfg', data: Buffer.from([1, 2, 3]) }, meta)
     assert.strictEqual(c.writes.length, before, 'nothing sent back on a learned channel')

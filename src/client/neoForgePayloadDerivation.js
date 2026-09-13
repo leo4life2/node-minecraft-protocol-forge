@@ -579,6 +579,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
         if (rl !== null) {
           recv.k = 'type'
           recv.v = rl
+          if (argVals[0].counter) recv.counter = argVals[0].counter
         }
       }
     }
@@ -656,6 +657,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
         method: ref.name,
         id: typeId,
         idVal: argVals[0],
+        counter: argVals[0] && argVals[0].counter ? argVals[0].counter : null,
         methodCtx: opts.methodCtx,
         registrar: recv,
         jar: classInfo.jar,
@@ -1318,6 +1320,28 @@ const AGG_MAX_LOOP_VISITS = 64
 const AGG_MAX_ITEMS = 512
 const AGG_MAX_POPULATION_SITES = 64
 const AGG_TOTAL_STEP_BUDGET = 2400000
+// HF43-r MOD-ROOT walk: the JVM's own order — every @Mod constructor runs
+// (class init included), THEN the loader fires RegisterPayloadHandlersEvent
+// at each listener the constructors registered. Its own step budget: a pack
+// whose constructors are heavy must not starve the entry passes below.
+const MOD_ROOT_STEP_BUDGET = 1600000
+const MOD_ROOT_MAX_LISTENERS = 256
+const PLATFORM_MODELED_TYPES = new Set([REGISTRAR_TYPE, EVENT_TYPE]) // modeled by handleInvoke, never inlined from the loader jar
+const COUNTER_TYPES = new Set(['java/util/concurrent/atomic/AtomicInteger', 'java/util/concurrent/atomic/AtomicLong'])
+const LISTENER_REGISTRATION_METHODS = new Set(['addListener', 'addGenericListener', 'register']) // the loader bus API (NeoForge / Forge)
+// The loader's own dispatch order (javap net/neoforged/neoforge/internal/
+// CommonModLoader.load, 26.1.2.109): "Common setup" (FMLCommonSetupEvent,
+// enqueueWork drained after) -> "Sided setup" (FMLDedicatedServerSetupEvent
+// on a server) -> "Registration events" (NetworkRegistry.setup posts
+// RegisterPayloadHandlersEvent). A mod may build its network in common setup
+// and still register it; the walk fires the phases in that order.
+const LIFECYCLE_PHASES = [
+  'net/neoforged/fml/event/lifecycle/FMLConstructModEvent',
+  'net/neoforged/fml/event/lifecycle/FMLCommonSetupEvent',
+  'net/neoforged/fml/event/lifecycle/FMLDedicatedServerSetupEvent',
+  EVENT_TYPE
+]
+const isModEntryAnnotation = (type) => /^L(?:net\/neoforged\/fml\/common|net\/minecraftforge\/fml\/common)\/Mod;$/.test(String(type))
 
 function seedProvenanceLocals (desc, isStatic, cls) {
   const locals = isStatic ? [] : [{ k: 'this', cls }]
@@ -1487,11 +1511,44 @@ function armThrowsImmediately (code, startPc, cp) {
 function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {}) {
   const prevClassInfo = state.evalClassInfo
   state.evalClassInfo = classInfo
+  const stack = state.modRootPass ? state.rootStack : null
+  if (stack) {
+    const k = `${classInfo.className}.${method.method}${method.desc}`
+    stack.push(k)
+    if (state.rootVisited) state.rootVisited.add(k)
+  }
   try {
     return evaluateMethodInner(index, classInfo, method, state, opts, hooks)
   } finally {
     state.evalClassInfo = prevClassInfo
+    if (stack) stack.pop()
   }
+}
+
+// HF43-r: a (object, field) counter holder — who advanced it (roots /
+// listeners) and whether it was ever re-stored. Registered on the object.
+function counterHolder (state, obj, name) {
+  obj.counters = obj.counters || {}
+  if (!obj.counters[name]) obj.counters[name] = { touches: new Set(), mutated: false, cls: obj.cls, field: name }
+  const h = obj.counters[name]
+  if (state.currentRoot) h.touches.add(state.currentRoot)
+  return h
+}
+
+// HF43-r: run a class's static initializer once, on first static read
+// (JVMS §5.5), cycle-guarded and budget-bounded; a class outside the jars,
+// or one already initialized, is a no-op.
+function lazyClassInit (index, state, cls) {
+  state.clinitDone = state.clinitDone || new Set()
+  if (state.clinitDone.has(cls)) return
+  const info = index.get(cls)
+  if (!info) return
+  state.clinitDone.add(cls)
+  const clinit = info.codes.find((c) => c.method === '<clinit>')
+  if (!clinit) return
+  if (state.aggSteps > (state.aggStepLimit ?? AGG_TOTAL_STEP_BUDGET) * 0.8) return
+  if (process.env.MINEPAL_MODROOT_TRACE) debug(`mr-clinit ${cls} steps=${state.aggSteps}`)
+  evaluateMethod(index, info, clinit, state, { locals: [], recordPutstatic: true }, state.rootHooks || {})
 }
 
 // HF37: run a lambda value. captured + call arguments seed the implementation
@@ -1513,7 +1570,12 @@ function invokeLambda (index, state, opts, lam, args, push, hooks = {}) {
   const recvVal = isStatic ? null : all[0]
   const callArgs = isStatic ? all : all.slice(1)
   const dispatchCls = (!isStatic && recvVal && recvVal.k === 'obj' && index.get(recvVal.cls)) ? recvVal.cls : impl.owner
-  const target = index.get(dispatchCls) ? findVirtualMethod(index, dispatchCls, impl.name, impl.desc) : null
+  // HF43-r: the loader's registrar / event are MODELED values (handleInvoke),
+  // never run from their own bytecode — with the loader universal jar in the
+  // census a `PayloadRegistrar::playToClient` method reference would
+  // otherwise inline the loader's body and the registration would vanish.
+  const platform = PLATFORM_MODELED_TYPES.has(dispatchCls) || (recvVal && recvVal.k === 'registrar')
+  const target = (!platform && index.get(dispatchCls)) ? findVirtualMethod(index, dispatchCls, impl.name, impl.desc) : null
   if (target) {
     state.aggInlineStack = state.aggInlineStack || new Set()
     const key = `l:${target.info.className}.${impl.name}${impl.desc}`
@@ -1559,6 +1621,7 @@ function concatWithConstants (classInfo, bsmIndex, captured) {
   if (recipe === null) return UNKNOWN
   let out = ''
   let di = 0; let ci = 0
+  let taint = null
   for (const ch of recipe) {
     if (ch === '\u0001') {
       const v = captured[di++]
@@ -1566,12 +1629,15 @@ function concatWithConstants (classInfo, bsmIndex, captured) {
       else if (v && v.k === 'int') out += String(v.v)
       else if (v && v.k === 'resloc') out += v.v
       else return UNKNOWN
+      if (v.counter) taint = v.counter
     } else if (ch === '\u0002') {
       if (ci >= consts.length) return UNKNOWN
       out += consts[ci++]
     } else out += ch
   }
-  return vStr(out)
+  const res = vStr(out)
+  if (taint) res.counter = taint
+  return res
 }
 
 function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks = {}) {
@@ -1597,7 +1663,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
   }
 
   while (pc >= 0 && pc < code.length) {
-    if (++steps > AGG_MAX_STEPS_PER_EVAL || ++state.aggSteps > AGG_TOTAL_STEP_BUDGET) {
+    if (++steps > AGG_MAX_STEPS_PER_EVAL || ++state.aggSteps > (state.aggStepLimit ?? AGG_TOTAL_STEP_BUDGET)) {
       state.aggBudgetBlown = true
       return
     }
@@ -1677,6 +1743,17 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       case 0x59: push(stack[stack.length - 1]); break
       case 0x5a: { const a = stack.pop(); const b = stack.pop(); push(a); push(b); push(a); break }
       case 0x5c: { const a = stack[stack.length - 1]; const b = stack[stack.length - 2]; push(b); push(a); break }
+      case 0x60: case 0x64: case 0x68: { // iadd / isub / imul — decided for two ints (HF43-r: `"/" + next++` int-field counters); the counter taint rides the result
+        const b = stack.pop(); const a = stack.pop()
+        if (a && a.k === 'int' && b && b.k === 'int') {
+          const v = op === 0x60 ? a.v + b.v : op === 0x64 ? a.v - b.v : Math.imul(a.v, b.v)
+          const out = vInt(v)
+          const taint = a.counter || b.counter
+          if (taint) out.counter = taint
+          push(out)
+        } else push(UNKNOWN)
+        break
+      }
       case 0x84: { // iinc — real counters keep enum-values() loops finite
         const slot = code[pc + 1]
         const delta = code.readInt8(pc + 2)
@@ -1709,6 +1786,13 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         // putstatic side already writes (a Kotlin object INSTANCE / a
         // companion read through an inheriting owner).
         const declKey = staticFieldKey(index, ref)
+        // HF43-r: under the mod-root walk a static read of a class whose
+        // initializer has not run yet runs it first (JVMS §5.5: getstatic
+        // triggers class initialization) — once per class, cycle-guarded,
+        // under the walk's own budget. This is what makes a packet's static
+        // TYPE / ID and a mod's static channel object real values instead of
+        // {k:'field'} placeholders.
+        if (state.lazyClinit && !(declKey in state.fieldValues)) lazyClassInit(index, state, declKey.slice(0, declKey.length - ref.name.length - 1))
         if (declKey in state.fieldValues) push(state.fieldValues[declKey])
         else push({ k: 'field', owner: ref.owner, name: ref.name, desc: ref.desc })
         break
@@ -1716,7 +1800,8 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       case 0xb3: { // putstatic — keyed by the DECLARER, symmetric with getstatic (HF16-R rider)
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         const val = stack.pop()
-        if (ref && val && (opts.recordPutstatic || val.k === 'registrar')) state.fieldValues[staticFieldKey(index, ref)] = val // registrar statics: see the linear walk
+        if (ref && state.lazyClinit && opts.methodCtx && opts.methodCtx.name !== '<clinit>') lazyClassInit(index, state, staticFieldDeclarer(index, ref)) // JVMS §5.5: putstatic initializes the class
+        if (ref && val && (opts.recordPutstatic || val.k === 'registrar' || state.modRootPass)) state.fieldValues[staticFieldKey(index, ref)] = val // HF43-r: under the mod-root walk every static store is JVM state (a channel built in a setup lambda is read back by getstatic); registrar statics: see the linear walk
         break
       }
       case 0xb4: { // getfield — construction-bound objects read real values
@@ -1724,7 +1809,24 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         const obj = stack.pop()
         if (obj && obj.k === 'obj' && ref) {
           if (!obj.fieldsBound && obj.ctorDesc && index.get(obj.cls)) bindCtorFields(index, state, obj)
-          if (obj.fields && ref.name in obj.fields) { push(obj.fields[ref.name]); break }
+          if (obj.fields && ref.name in obj.fields) {
+            const held = obj.fields[ref.name]
+            // HF43-r: an int read from a field the object later re-stores is
+            // a registration COUNTER candidate — the taint carries the field
+            // holder so the assembly can prove (or refuse) its order.
+            if (held && held.k === 'int' && state.modRootPass) {
+              const holder = counterHolder(state, obj, ref.name)
+              push({ k: 'int', v: held.v, counter: holder })
+            } else push(held)
+            break
+          }
+          // HF43-r: a primitive field the constructor never stored holds the
+          // JVM default (JVMS §2.3 / §4.5) — decided only for an object built
+          // in this universe whose constructor body ran (`private int next;`).
+          if (obj.fieldsBound && obj.ctorDesc && /^[IJSBCZ]$/.test(ref.desc) && state.modRootPass) {
+            push({ k: 'int', v: 0, counter: counterHolder(state, obj, ref.name) })
+            break
+          }
           push({ k: 'instfield', obj, name: ref.name, desc: ref.desc })
         } else push(UNKNOWN)
         break
@@ -1735,12 +1837,15 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         const obj = stack.pop()
         if (obj && obj.k === 'obj' && ref) {
           obj.fields = obj.fields || {}
+          const prev = obj.fields[ref.name]
+          if (state.modRootPass && val && val.k === 'int' && prev && prev.k === 'int' && prev.v !== val.v) counterHolder(state, obj, ref.name).mutated = true
           obj.fields[ref.name] = val
         }
         break
       }
       case 0xbb: {
         const cls = cpClassName(cp, code.readUInt16BE(pc + 1))
+        if (state.lazyClinit) lazyClassInit(index, state, cls) // JVMS §5.5: `new` initializes the class
         push({ k: 'new', cls })
         break
       }
@@ -1774,6 +1879,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         const args = argSlots(ref.desc)
         const argVals = []
         for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
+        if (state.lazyClinit) lazyClassInit(index, state, ref.owner) // JVMS §5.5: invokestatic initializes the class
         if (hooks.onCall) hooks.onCall(ref, 'static', null, argVals)
         if (evaluatorPreInvoke(index, state, opts, ref, null, argVals, push, hooks, 'static')) break
         handleInvoke(index, classInfo, state, opts, { kind: 'static', ref, recv: null, argVals, push, pc })
@@ -1921,6 +2027,13 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
     for (const item of (recv.items || []).slice(0, AGG_MAX_ITEMS)) invokeLambda(index, state, opts, argVals[0], [item], () => {}, hooks)
     return true
   }
+  // HF43-r FML deferred work: event.enqueueWork(runnable|supplier) runs on the
+  // sync executor before the next lifecycle phase — run it now.
+  if (ref.name === 'enqueueWork' && !index.get(ref.owner) && argVals.length === 1 && argVals[0] && argVals[0].k === 'lambda') {
+    invokeLambda(index, state, opts, argVals[0], [], () => {}, hooks)
+    if (!returnsVoid(ref.desc)) push(UNKNOWN)
+    return true
+  }
   if (!recv && ref.owner === 'java/util/Objects' && ref.name === 'requireNonNull' && argVals.length >= 1) {
     push(argVals[0]) // identity pass-through (javac's null-check idiom around method references)
     return true
@@ -1994,6 +2107,92 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
     if (ref.name === 'ordinal' && ref.desc === '()I' && recv.ctorArgs[1]) {
       push(recv.ctorArgs[1])
       return true
+    }
+  }
+  // HF43-r registry COUNTERS (java.util.concurrent.atomic): the counter is a
+  // construction-bound object whose value advances in evaluation order — the
+  // class-init order the JVM would follow. Every value it hands out carries
+  // the counter so an id built from it can be refused when the order is not
+  // provable (two independent listeners advancing one counter).
+  if (recv && recv.k === 'obj' && COUNTER_TYPES.has(recv.cls)) {
+    const holder = counterHolder(state, recv, '#atomic')
+    if (recv.count === undefined) {
+      const seed = recv.ctorArgs && recv.ctorArgs[0]
+      recv.count = !seed ? 0 : (seed.k === 'int' ? seed.v : null)
+    }
+    if (state.currentRoot) holder.touches.add(state.currentRoot)
+    const known = recv.count !== null
+    const arg0 = argVals[0] && argVals[0].k === 'int' ? argVals[0].v : null
+    const out = (v) => { const r = vInt(v); r.counter = holder; return r }
+    switch (ref.name) {
+      case 'get': case 'intValue': case 'longValue': case 'getPlain': case 'getAcquire': push(known ? out(recv.count) : UNKNOWN); return true
+      case 'getAndIncrement': holder.mutated = true; if (known) { push(out(recv.count)); recv.count++ } else push(UNKNOWN); return true
+      case 'incrementAndGet': holder.mutated = true; if (known) { recv.count++; push(out(recv.count)) } else push(UNKNOWN); return true
+      case 'getAndDecrement': holder.mutated = true; if (known) { push(out(recv.count)); recv.count-- } else push(UNKNOWN); return true
+      case 'decrementAndGet': holder.mutated = true; if (known) { recv.count--; push(out(recv.count)) } else push(UNKNOWN); return true
+      case 'getAndAdd': holder.mutated = true; if (known && arg0 !== null) { push(out(recv.count)); recv.count += arg0 } else { recv.count = null; push(UNKNOWN) } return true
+      case 'addAndGet': holder.mutated = true; if (known && arg0 !== null) { recv.count += arg0; push(out(recv.count)) } else { recv.count = null; push(UNKNOWN) } return true
+      case 'set': case 'lazySet': case 'setPlain': holder.mutated = true; recv.count = arg0; if (!returnsVoid(ref.desc)) push(UNKNOWN); return true
+      default: recv.count = null; if (!returnsVoid(ref.desc)) push(UNKNOWN); return true // anything else (compareAndSet, updateAndGet ...) makes the value unprovable
+    }
+  }
+  // HF43-r Identifier derivations on a resolved id: withSuffix / withPrefix /
+  // withPath (26.1 Identifier + 1.21 ResourceLocation spell them alike).
+  if (recv && recv.k === 'resloc' && isReslocOwner(ref.owner) && ref.desc === `(Ljava/lang/String;)L${ref.owner};` && argVals[0] && argVals[0].k === 'str') {
+    const [ns, ...rest] = String(recv.v).split(':')
+    const p = rest.join(':')
+    let v = null
+    if (ref.name === 'withSuffix') v = `${recv.v}${argVals[0].v}`
+    else if (ref.name === 'withPrefix') v = `${ns}:${argVals[0].v}${p}`
+    else if (ref.name === 'withPath') v = `${ns}:${argVals[0].v}`
+    if (v !== null) {
+      const out = vResloc(v)
+      const taint = recv.counter || argVals[0].counter
+      if (taint) out.counter = taint
+      push(out)
+      return true
+    }
+  }
+  // HF43-r class-NAME ids: the message class reference (an ldc class
+  // constant) names itself — getSimpleName / getName / getTypeName /
+  // getPackageName are decided from the constant, never from a runtime Class.
+  if (recv && recv.k === 'cls' && ref.owner === CLASS_TYPE && ref.desc === '()Ljava/lang/String;') {
+    const internal = String(recv.v)
+    const binary = internal.replace(/\//g, '.')
+    if (ref.name === 'getSimpleName') { const last = internal.split('/').pop(); push(vStr(last.slice(last.lastIndexOf('$') + 1))); return true }
+    if (ref.name === 'getName' || ref.name === 'getTypeName' || ref.name === 'getCanonicalName') { push(vStr(ref.name === 'getName' ? binary : binary.replace(/\$/g, '.'))); return true }
+    if (ref.name === 'getPackageName') { push(vStr(binary.includes('.') ? binary.slice(0, binary.lastIndexOf('.')) : '')); return true }
+  }
+  // HF43-r java.util.Optional (JDK semantics): a DECIDED optional carries its
+  // value; ifPresent on an optional this universe cannot decide (a mod's
+  // event bus looked up from the loader) runs the consumer — the loader
+  // hands every loaded mod its bus, and a registration behind an undecided
+  // presence check is one the server performs. A decided-EMPTY optional
+  // never runs it.
+  if (callKind === 'static' && ref.owner === 'java/util/Optional') {
+    if (ref.name === 'of' || ref.name === 'ofNullable') { push({ k: 'optional', v: argVals[0] ?? UNKNOWN }); return true }
+    if (ref.name === 'empty') { push({ k: 'optional', v: { k: 'null' } }); return true }
+  }
+  if (ref.owner === 'java/util/Optional' && (!recv || recv.k !== 'obj')) {
+    const decided = recv && recv.k === 'optional'
+    const empty = decided && recv.v && recv.v.k === 'null'
+    const held = decided && !empty ? (recv.v ?? UNKNOWN) : UNKNOWN
+    if ((ref.name === 'ifPresent' || ref.name === 'ifPresentOrElse') && argVals[0] && argVals[0].k === 'lambda') {
+      if (!empty) invokeLambda(index, state, opts, argVals[0], [held], () => {}, hooks)
+      else if (ref.name === 'ifPresentOrElse' && argVals[1] && argVals[1].k === 'lambda') invokeLambda(index, state, opts, argVals[1], [], () => {}, hooks)
+      return true
+    }
+    if (decided) {
+      if (ref.name === 'isPresent') { push(held === UNKNOWN && !empty ? UNKNOWN : vInt(empty ? 0 : 1)); return true }
+      if (ref.name === 'isEmpty') { push(held === UNKNOWN && !empty ? UNKNOWN : vInt(empty ? 1 : 0)); return true }
+      if (ref.name === 'get' || ref.name === 'orElseThrow' || ref.name === 'orElse' || ref.name === 'orElseGet') { push(empty ? (ref.name === 'orElse' ? (argVals[0] ?? UNKNOWN) : UNKNOWN) : held); return true }
+      if ((ref.name === 'map' || ref.name === 'flatMap') && argVals[0] && argVals[0].k === 'lambda') {
+        if (empty) { push(recv); return true }
+        let returned = UNKNOWN
+        invokeLambda(index, state, opts, argVals[0], [held], (v) => { returned = v }, hooks)
+        push(ref.name === 'map' ? { k: 'optional', v: returned ?? UNKNOWN } : (returned && returned.k === 'optional' ? returned : { k: 'optional', v: UNKNOWN }))
+        return true
+      }
     }
   }
   // ResourceLocation accessors on a resolved id
@@ -2071,11 +2270,20 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // dispatch on — seeding the impl as slot 0 shifted every argument by one
   // (the Type became the service object). Static calls take the static
   // inline rule below; the services rule is for receiver-less INSTANCE calls.
-  if (callKind !== 'static' && (!recv || recv.k === 'field' || recv === UNKNOWN) && index.services) {
-    const impls = index.services.get(ref.owner)
-    if (impls && new Set(impls).size === 1 && index.get(impls[0])) {
-      const implRecv = { k: 'obj', cls: impls[0], fields: {}, fieldsBound: true, serviceImpl: true }
-      return inlineDispatch(index, state, opts, implRecv, ref, argVals, push, hooks)
+  if (callKind !== 'static' && (!recv || recv.k === 'field' || recv.k === 'instfield' || recv === UNKNOWN) && index.services) {
+    // HF43-r: a receiver read from a field DECLARED as the service interface
+    // (puzzles `ProxyImpl.INSTANCE`, called through a super-interface method)
+    // names the service by its declared type; the call's owner is the second
+    // key. Either way the services file is the truth and ambiguity abstains.
+    const candidates = []
+    if (recv && (recv.k === 'field' || recv.k === 'instfield') && typeof recv.desc === 'string' && recv.desc.startsWith('L') && recv.desc.endsWith(';')) candidates.push(recv.desc.slice(1, -1))
+    candidates.push(ref.owner)
+    for (const iface of candidates) {
+      const impls = index.services.get(iface)
+      if (impls && new Set(impls).size === 1 && index.get(impls[0]) && findVirtualMethod(index, impls[0], ref.name, ref.desc)) {
+        const implRecv = { k: 'obj', cls: impls[0], fields: {}, fieldsBound: true, serviceImpl: true }
+        return inlineDispatch(index, state, opts, implRecv, ref, argVals, push, hooks)
+      }
     }
   }
   // in-index virtual call on an abstract object: run the REAL body
@@ -2090,7 +2298,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // class and its ancestors): factory chains like PacketChannel.create /
   // VeilPacketManager.create evaluate for real, yielding the constructed
   // aggregator object.
-  if (!recv && ((state.aggStaticScope && state.aggStaticScope.has(ref.owner)) || state.aggInlineAll) && index.get(ref.owner)) {
+  if (!recv && ((state.aggStaticScope && state.aggStaticScope.has(ref.owner)) || state.aggInlineAll) && index.get(ref.owner) && !PLATFORM_MODELED_TYPES.has(ref.owner)) {
     const info = index.get(ref.owner)
     const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
     if (m) {
@@ -2149,7 +2357,6 @@ function findInvocationSites (index, state, target) {
   const key = `sites:${target.cls}.${target.name}${target.desc}`
   if (state.aggCache.has(key)) return state.aggCache.get(key)
   const sites = []
-  const simpleOwner = target.cls.split('/').pop()
   // owners whose invocation resolves to the target: itself + throw-only
   // stubs it grafts onto (glitchcore PacketHandler <- MixinPacketHandler)
   const ownerAliases = new Set([target.cls])
@@ -2908,6 +3115,162 @@ function deriveModPresenceGates (index, state) {
   function a0 (obj) { return obj.ctorArgs[0].v }
 }
 
+// HF43-r MOD-ROOT WALK (mechanism, javap-verified on PuzzlesLib 26.1.14 +
+// MutantMonsters 26.1.3 and ResourcefulLib 4.0.1 + FriendsAndFoes 4.0.27):
+// two id families are only readable in the loader's own order — a
+// registry-COUNTER id ("<ns>:main" + "/" + AtomicInteger.getAndIncrement(),
+// one per registration in class-init order) and a version-prefixed id
+// ("<ns>:<path>/v<N>" + "/" + the packet's own namespace/path or class name,
+// the "v<N>" registrar version built from an int constant). Both are born in
+// a @Mod constructor's call chain and registered when the loader fires
+// RegisterPayloadHandlersEvent at the listener that chain registered on the
+// mod bus. So: (A) every @Mod constructor runs under the evaluator (static
+// initializers on first read, services files, lambdas, Optional), collecting
+// the event-typed listeners it hands the bus; (B) each listener is fired
+// once with the event, in registration order, and its registrations are
+// recorded with the values the chain proved. A counter advanced from more
+// than one root/listener has no provable order — its ids are refused BY
+// NAME. Own step budget; per-root / per-listener isolation; nothing here
+// classloads or executes jar code.
+function deriveModRootRegistrations (index, state, record) {
+  const diagnostics = state.diagnostics
+  const summary = { roots: 0, listeners: 0, registrations: 0, resolvedIds: 0, unresolvedIds: 0, droppedUnprovenOrder: 0, budgetExhausted: false, listenerSites: [], rows: [] }
+  diagnostics.modRoot = summary
+  const roots = []
+  for (const name of state.allClassNames) {
+    const bytes = index.rawBytes(name)
+    if (!bytes || !bytes.includes('/Mod;')) continue
+    const info = index.get(name)
+    if (!info || !Array.isArray(info.annotations)) continue
+    const ann = info.annotations.find((a) => a && isModEntryAnnotation(a.type))
+    if (!ann) continue
+    roots.push({ info, modId: (ann.elements && typeof ann.elements.value === 'string') ? ann.elements.value : name })
+  }
+  roots.sort((a, b) => (a.modId < b.modId ? -1 : a.modId > b.modId ? 1 : (a.info.className < b.info.className ? -1 : 1)))
+  summary.roots = roots.length
+  if (roots.length === 0) return []
+  const savedSteps = state.aggSteps || 0
+  const prev = { pass: state.modRootPass, lazy: state.lazyClinit, inlineAll: state.aggInlineAll, limit: state.aggStepLimit, root: state.currentRoot, stack: state.rootStack }
+  state.modRootPass = true
+  state.lazyClinit = true
+  state.aggInlineAll = true
+  state.aggSteps = 0
+  state.aggStepLimit = MOD_ROOT_STEP_BUDGET
+  state.rootStack = []
+  state.rootHooks = null
+  state.modRootResolved = state.modRootResolved || new Set()
+  const listeners = []
+  const seenListeners = new Set()
+  const rows = []
+  const trace = process.env.MINEPAL_MODROOT_TRACE ? (ref, kind, recv, argVals) => debug(`mr-call ${state.currentRoot} ${ref.owner}.${ref.name}${ref.desc.slice(0, 60)} recv=${recv ? recv.k + (recv.cls ? ':' + recv.cls : '') : '-'} args=${argVals.map((a) => a ? a.k + ((a.k === 'str' || a.k === 'resloc' || a.k === 'int' || a.k === 'cls') ? ':' + a.v : a.k === 'obj' ? ':' + a.cls : a.k === 'lambda' ? ':' + a.impl.owner.split('/').pop() + '.' + a.impl.name : '') : '?').join(',')}`) : null
+  const listenerHooks = {
+    onCall: (ref, kind, recv, argVals) => {
+      if (trace) trace(ref, kind, recv, argVals)
+      if (!LISTENER_REGISTRATION_METHODS.has(ref.name) || index.get(ref.owner)) return // the loader's bus API lives outside the jars
+      for (const a of argVals) {
+        if (!a || a.k !== 'lambda') continue
+        const phase = LIFECYCLE_PHASES.findIndex((ev) => String(a.impl.desc).includes(`L${ev};`))
+        if (phase < 0) continue
+        const key = `${a.impl.owner}.${a.impl.name}${a.impl.desc}#${a.captured.map((c) => (c && c.k === 'obj') ? `obj:${c.cls}` : JSON.stringify(c)).join(',')}`
+        if (seenListeners.has(key) || listeners.length >= MOD_ROOT_MAX_LISTENERS) continue
+        seenListeners.add(key)
+        listeners.push({ lam: a, root: state.currentRoot, phase, order: listeners.length })
+      }
+    }
+  }
+  try {
+    state.rootHooks = listenerHooks // static initializers run on first touch register listeners too
+    for (const { info, modId } of roots) {
+      if (state.aggBudgetBlown) break
+      state.currentRoot = `root:${modId}`
+      try {
+        lazyClassInit(index, state, info.className)
+        for (const m of info.codes) {
+          if (m.method !== '<init>') continue
+          const locals = seedProvenanceLocals(m.desc, false, info.className)
+          evaluateMethod(index, info, m, state, { locals, recordPutstatic: true }, listenerHooks)
+        }
+      } catch (err) {
+        diagnostics.errors.push(`mod-root walk of ${info.className} failed (${err.message})`)
+      }
+    }
+    listeners.sort((a, b) => (a.phase - b.phase) || (a.order - b.order))
+    summary.listeners = listeners.length
+    summary.phases = LIFECYCLE_PHASES.map((ev, i) => ({ event: ev.split('/').pop(), listeners: listeners.filter((l) => l.phase === i).length }))
+    for (let i = 0; i < listeners.length; i++) {
+      if (state.aggBudgetBlown) break
+      const { lam, root } = listeners[i]
+      state.currentRoot = `listener:${i}:${lam.impl.owner}.${lam.impl.name}`
+      const site = `${lam.impl.owner}.${lam.impl.name}`
+      const opts = {
+        onRegistration: (r) => {
+          if (trace) debug(`mr-reg ${state.currentRoot} ${r.method} id=${r.id} version=${r.registrar && r.registrar.version} site=${r.site}`)
+          summary.registrations++
+          if (!r.id) { summary.unresolvedIds++; rows.push({ ...r, site: `${r.site} (mod-root ${root} -> ${site})`, root, listenerSite: site, unresolved: true }); return }
+          summary.resolvedIds++
+          resolvedHere = true
+          rows.push({ ...r, site: `${r.site} (mod-root ${root} -> ${site})`, root, listenerSite: site })
+        }
+      }
+      let resolvedHere = false
+      state.rootVisited = new Set([`${lam.impl.owner}.${lam.impl.name}${lam.impl.desc}`])
+      try {
+        state.rootStack.length = 0
+        invokeLambda(index, state, opts, lam, [{ k: 'param', i: 0 }], () => {}, trace ? { onCall: trace } : {})
+      } catch (err) {
+        diagnostics.errors.push(`mod-root listener ${site} failed (${err.message})`)
+      }
+      // every method the listener's chain executed on the way to a proven
+      // registration is part of the machinery that claimed it
+      if (resolvedHere) for (const k of state.rootVisited) state.modRootResolved.add(k)
+      state.rootVisited = null
+      summary.listenerSites.push(site)
+    }
+    if (state.aggBudgetBlown) {
+      summary.budgetExhausted = true
+      diagnostics.abstains.push(`mod-root walk: the step budget ran out after ${summary.listeners} listener(s) — registrations past that point are not derived here (the entry passes still run)`)
+    }
+  } finally {
+    state.aggBudgetBlown = false
+    state.aggSteps = savedSteps
+    state.modRootPass = prev.pass
+    state.lazyClinit = prev.lazy
+    state.aggInlineAll = prev.inlineAll
+    state.aggStepLimit = prev.limit
+    state.currentRoot = prev.root
+    state.rootStack = prev.stack
+    state.rootHooks = null
+  }
+  // the order law: an id built from a counter that more than one root or
+  // listener advanced is refused by name
+  const dropped = new Map()
+  const kept = []
+  for (const r of rows) {
+    if (r.unresolved) continue
+    const h = r.counter
+    if (h && h.mutated && h.touches.size > 1) {
+      const key = `${r.listenerSite}|${h.cls}.${h.field}`
+      if (!dropped.has(key)) dropped.set(key, { site: r.listenerSite, holder: h, ids: [] })
+      dropped.get(key).ids.push(r.id)
+      summary.droppedUnprovenOrder++
+      continue
+    }
+    kept.push(r)
+  }
+  for (const d of dropped.values()) {
+    diagnostics.abstains.push(`${d.site}: registry-counter ids (${d.ids.join(', ')}) whose counter ${d.holder.cls.split('/').pop()}.${d.holder.field} is advanced by ${d.holder.touches.size} independent listeners/roots — the registration order is not provable, unclaimed`)
+  }
+  const unresolvedSites = new Set(rows.filter((r) => r.unresolved).map((r) => `${r.site.split(' (mod-root')[0]}.${r.method} (via ${r.listenerSite})`))
+  for (const site of unresolvedSites) {
+    diagnostics.abstains.push(`${site}: the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed`)
+  }
+  for (const r of kept) {
+    record(r)
+    if (summary.rows.length < 400) summary.rows.push({ id: r.id, version: r.registrar ? r.registrar.version : null, flow: (REGISTRATION_METHODS[r.method] || {}).flow, family: r.counter ? 'counter' : 'chain', root: r.root, listener: r.listenerSite, jar: r.jar && r.jar.label ? r.jar.label : undefined })
+  }
+  return kept
+}
+
 function deriveNeoForgeComponents (jarPaths) {
   const started = Date.now()
   const index = makeClassIndex()
@@ -2945,6 +3308,7 @@ function deriveNeoForgeComponents (jarPaths) {
   const registrations = []
   const silentEntries = []
   const presenceGates = deriveModPresenceGates(index, state)
+  const modRootStart = registrations.length
   const censusHas = (modId) => ALWAYS_PRESENT_MOD_IDS.has(modId) || diagnostics.jars.some((j) => (j.modIds || []).includes(modId))
   const record = (reg) => {
     const spec = REGISTRATION_METHODS[reg.method]
@@ -2952,6 +3316,12 @@ function deriveNeoForgeComponents (jarPaths) {
     if (!spec) return
     registrations.push({ ...reg, ...spec })
   }
+  try {
+    deriveModRootRegistrations(index, state, record)
+  } catch (err) {
+    diagnostics.errors.push(`mod-root walk failed (${err.message})`)
+  }
+  diagnostics.registrations = registrations.length - modRootStart
   for (const { info, method } of entryMethods) {
     // HF11: locals seeded with PROVENANCE tags instead of bare unknowns (the
     // receiver as {k:'this'}, each argument as {k:'param', i}) — same null
@@ -3010,6 +3380,10 @@ function deriveNeoForgeComponents (jarPaths) {
   // bound (the evaluator's lambda law).
   for (const entry of silentEntries) {
     const { info, method } = entry
+    // HF43-r: an entry the mod-root walk ran to a proven registration (it is
+    // on the chain a listener's registrations came through) is resolved —
+    // no deep re-walk, no "never reaches" line against claimed channels.
+    if (state.modRootResolved && state.modRootResolved.has(`${info.className}.${method.method}${method.desc}`)) continue
     // a lambda body's enclosing entry reports for it — when there IS one: a
     // listener lambda registered from a plain `init(IEventBus)` (the
     // STATIC-REGISTRAR shape: geckolib's `bus.addListener(this::onRegister)`)
@@ -3055,7 +3429,7 @@ function deriveNeoForgeComponents (jarPaths) {
     }
     if (!resolvedDeep) diagnostics.abstains.push(...entry.linearAbstains)
     if (registrations.length === before && !entry.soft) {
-      diagnostics.abstains.push(`${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size + own.size} static registr${registries.size + own.size === 1 ? 'y' : 'ies'}) — this entry's channels unclaimed`)
+      diagnostics.abstains.push(`${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size + own.size} static registr${registries.size + own.size === 1 ? 'y' : 'ies'}) — no channel claimed from this entry`)
     }
   }
 

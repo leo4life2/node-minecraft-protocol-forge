@@ -1,0 +1,15 @@
+modLoader="javafml"
+loaderVersion="[4,)"
+license="fixture"
+[[mods]]
+modId="delta"
+version="2.0.0"
+[[mods]]
+modId="epsilon"
+version="2.0.0"
+[[mods]]
+modId="zeta"
+version="2.0.0"
+[[mods]]
+modId="eta"
+version="2.0.0"

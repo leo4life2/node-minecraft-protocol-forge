@@ -334,9 +334,14 @@ function decodeNetworkQuery (buf) {
 // NetworkComponentNegotiator: a NON-optional server component absent on the
 // client fails "missing.server.client"; a non-optional client component
 // absent on the server fails the other way). Pure — feeds the learn belt.
+// HF43-r (MED-3): an EMPTY or absent server query is UNKNOWN, not "the server
+// holds nothing" — 26.1.2 and 1.21.1 both send a 0+0 query and still hold
+// required channels. `known` is false then and no row is called extra on
+// the client; a query that lists at least one component is compared.
 function negotiationDelta (serverQuery, components) {
-  const delta = { missingOnClient: [], extraOnClient: [] }
-  if (!serverQuery) return delta
+  const listed = serverQuery ? ['configuration', 'play'].reduce((n, p) => n + ((serverQuery[p] || []).length), 0) : 0
+  const delta = { known: listed > 0, missingOnClient: [], extraOnClient: [] }
+  if (!delta.known) return delta
   for (const protocol of ['configuration', 'play']) {
     const ours = new Set((components[protocol] || []).map((c) => c.id))
     const theirs = new Map((serverQuery[protocol] || []).map((r) => [r.id, r]))

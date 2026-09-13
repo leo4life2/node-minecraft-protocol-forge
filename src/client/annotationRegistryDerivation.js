@@ -57,7 +57,7 @@
 'use strict'
 
 const debug = require('../../debug')
-const { decodeInstructions, walkBytecode, cpRef, cpUtf8 } = require('./jarAnalysis')
+const { decodeInstructions, walkBytecode } = require('./jarAnalysis')
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const TASKS_EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterConfigurationTasksEvent'
