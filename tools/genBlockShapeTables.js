@@ -24,6 +24,27 @@
 // derivation rules (property parsing, alias chains, super-call semantics,
 // hierarchy walk) at scale before any mod jar is ever read.
 //
+// HF48-P2: the same run also emits, per namespace, the FriendlyByteBuf
+// WRITE-METHOD vocabulary (namespaces.<era>.ids.friendlyByteBufWrites =
+// {mojangName: [eraNames]} + ids.classNames.friendlyByteBuf) for every
+// Mojang write the runtime layout reader models (the shared table
+// src/client/friendlyByteBufWrites.js, so generator and reader cannot
+// drift): mojang -> obf through the proguard mappings (name + JVM
+// descriptor, so overloads that share an obf name never cross), obf -> srg
+// through the tsrg2 line of the same obf class + descriptor, obf ->
+// intermediary through tiny-v2; an unobfuscated member (the netty
+// ByteBuf overrides writeByte/writeInt/...) is its own name in every era.
+// SRG ids are stable across MC versions, so the 1.20.1 srg vocabulary
+// covers every SRG-era (1.17-1.20.1) Forge jar.
+//
+// Inputs used for the shipped table (2026-09-15, Mac mini):
+//   --srg-jar /Users/nemossoftware/minepal-coop/forge-block-registry/verify/server/libraries/net/minecraft/server/1.20.1-20230612.114412/server-1.20.1-20230612.114412-srg.jar
+//   --tsrg    <forge 1.20.1-47.3.22 install>/libraries/de/oceanlabs/mcp/mcp_config/1.20.1-20230612.114412/mcp_config-1.20.1-20230612.114412-mappings.txt
+//             (the installer's extracted config/joined.tsrg, header "tsrg2 obf srg id")
+//   --mojmap  <forge 1.20.1-47.3.22 install>/libraries/net/minecraft/server/1.20.1-20230612.114412/server-1.20.1-20230612.114412-mappings.txt (proguard)
+//   --tiny    mappings/mappings.tiny out of https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.1/intermediary-1.20.1-v2.jar
+//   --mc-data node_modules/minecraft-data
+//
 // Usage:
 //   node tools/genBlockShapeTables.js \
 //     --srg-jar <server-...-srg.jar> --tsrg <joined.tsrg> \
@@ -35,6 +56,10 @@ const path = require('path')
 const {
   zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions
 } = require('../src/client/jarAnalysis')
+const { WRITES } = require('../src/client/friendlyByteBufWrites')
+
+const FBB_CLS = 'net/minecraft/network/FriendlyByteBuf'
+const REGISTRY_FBB_CLS = 'net/minecraft/network/RegistryFriendlyByteBuf' // 1.20.5+ only; absent on 1.20.1
 
 // ---------------------------------------------------------------------------
 function parseArgs () {
@@ -577,6 +602,12 @@ function main () {
   const { memberMapSrgToObf } = parseTsrg(fs.readFileSync(args.tsrg, 'utf8'))
   const tiny = parseTiny(fs.readFileSync(args.tiny, 'utf8'))
   const inter = translateTables(srgTables, classMapMojToObf, memberMapSrgToObf, tiny)
+  const writeVocab = friendlyByteBufWriteVocab(fs.readFileSync(args.mojmap, 'utf8'), fs.readFileSync(args.tsrg, 'utf8'), tiny, classMapMojToObf)
+  srgTables.ids.friendlyByteBufWrites = writeVocab.srg
+  srgTables.ids.classNames.friendlyByteBuf = FBB_CLS
+  inter.ids.friendlyByteBufWrites = writeVocab.intermediary
+  inter.ids.classNames.friendlyByteBuf = tiny.classes.get(classMapMojToObf.get(FBB_CLS)) ?? null
+  console.log('friendlyByteBufWrites:', JSON.stringify(writeVocab))
 
   // vanilla no-collision block names (minecraft-data: boundingBox empty)
   const vanillaNonSolid = mcData.filter((b) => b.boundingBox === 'empty').map((b) => b.name)
@@ -739,6 +770,69 @@ function translateTables (srg, classMojToObf, memberSrgToObf, tiny) {
   }
   const overridesCollision = srg.overridesCollision.map(cls).filter(Boolean)
   return { ids, hierarchy, classContrib, propCard, blocksFieldToName, enumCounts, overridesCollision }
+}
+
+// -- FriendlyByteBuf write vocabulary (HF48-P2) -----------------------------
+// proguard member lines of one Mojang class: "    [l:l:]ret name(args) -> obf"
+function parseProguardMembers (text, mojClass) {
+  const dotted = mojClass.replace(/\//g, '.')
+  const out = []
+  let inClass = false
+  for (const line of text.split('\n')) {
+    if (!line.startsWith(' ')) { inClass = line.startsWith(dotted + ' -> '); continue }
+    if (!inClass) continue
+    const m = line.match(/^\s+(?:\d+:\d+:)?(\S+) (\S+)\((.*)\) -> (\S+)$/)
+    if (m) out.push({ ret: m[1], name: m[2], args: m[3] ? m[3].split(',') : [], obf: m[4] })
+  }
+  return out
+}
+
+// a proguard (Java-source) type -> JVM descriptor in OBF class names
+function jvmType (t, classMojToObf) {
+  let dims = 0
+  while (t.endsWith('[]')) { dims++; t = t.slice(0, -2) }
+  const prim = { void: 'V', boolean: 'Z', byte: 'B', char: 'C', short: 'S', int: 'I', long: 'J', float: 'F', double: 'D' }[t]
+  const inner = prim || ('L' + (classMojToObf.get(t.replace(/\./g, '/')) || t.replace(/\./g, '/')) + ';')
+  return '['.repeat(dims) + inner
+}
+
+// tsrg2 members keyed by obf class: "obfName#obfDesc" -> srg name
+function parseTsrgByClass (text) {
+  const byClass = new Map()
+  let cur = null
+  for (const line of text.split('\n').slice(1)) {
+    if (!line || line.startsWith('\t\t')) continue
+    if (!line.startsWith('\t')) { cur = new Map(); byClass.set(line.trim().split(/\s+/)[0], cur); continue }
+    const parts = line.trim().split(/\s+/)
+    if (parts.length >= 3 && parts[1].startsWith('(')) cur.set(`${parts[0]}#${parts[1]}`, parts[2])
+  }
+  return byClass
+}
+
+function friendlyByteBufWriteVocab (mojmapText, tsrgText, tiny, classMojToObf) {
+  const byClass = parseTsrgByClass(tsrgText)
+  const srg = {}
+  const intermediary = {}
+  for (const mojClass of [FBB_CLS, REGISTRY_FBB_CLS]) {
+    const obfClass = classMojToObf.get(mojClass)
+    if (!obfClass) continue
+    const members = parseProguardMembers(mojmapText, mojClass)
+    const tsrgMembers = byClass.get(obfClass) || new Map()
+    for (const mojang of Object.keys(WRITES)) {
+      for (const m of members) {
+        if (m.name !== mojang) continue
+        const desc = `(${m.args.map((a) => jvmType(a.trim(), classMojToObf)).join('')})${jvmType(m.ret, classMojToObf)}`
+        const unobf = m.obf === mojang // netty override: no obfuscation, its own name in every era
+        const srgName = unobf ? mojang : tsrgMembers.get(`${m.obf}#${desc}`)
+        const interName = unobf ? mojang : tiny.methods.get(`${obfClass}#${m.obf}#${desc}`)
+        if (!srgName) console.warn(`no tsrg line for ${mojClass}.${mojang}${desc} (obf ${m.obf}); srg vocabulary skips it`)
+        if (!interName) console.warn(`no tiny line for ${mojClass}.${mojang}${desc} (obf ${m.obf}); intermediary vocabulary skips it`)
+        if (srgName && !(srg[mojang] || []).includes(srgName)) (srg[mojang] = srg[mojang] || []).push(srgName)
+        if (interName && !(intermediary[mojang] || []).includes(interName)) (intermediary[mojang] = intermediary[mojang] || []).push(interName)
+      }
+    }
+  }
+  return { srg, intermediary }
 }
 
 main()

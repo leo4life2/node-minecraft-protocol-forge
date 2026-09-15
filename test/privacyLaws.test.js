@@ -340,7 +340,9 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // HF41: packetBodyWireInstall compiles the extended packet types the same way; the derivation reads jars only
         './packetBodyWireDerivation',
         // HF45: the command-tree reader (schema + protodef, per client) and the argument-type derivation (jar bytes only)
-        './commandTreeParser', './commandArgumentTypeDerivation'])
+        './commandTreeParser', './commandArgumentTypeDerivation',
+        // HF48-P2: the shared write table + the GENERATED mapping-era vocabulary (a local JSON, no network)
+        './friendlyByteBufWrites'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

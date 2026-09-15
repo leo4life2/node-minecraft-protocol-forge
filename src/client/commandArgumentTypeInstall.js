@@ -68,7 +68,7 @@ function installCommandArgumentTypes (client, { resolveJars, log = debug } = {})
       source,
       registry_size: registry.size,
       vanilla: res.vanilla,
-      derived: res.derived.map((d) => ({ id: d.id, name: d.name, layout: d.fields.map((f) => f.type).join(',') || 'none', jar: d.source.jar, serializer: d.source.serializer, evidence: d.source.evidence })),
+      derived: res.derived.map((d) => ({ id: d.id, name: d.name, layout: d.fields.map((f) => f.type).join(',') || 'none', jar: d.source.jar, serializer: d.source.serializer, evidence: d.source.evidence, ...(d.source.era ? { vocab: `${d.source.era} (${d.source.writes.join('; ')})` } : {}) })),
       abstains: res.abstains,
       aliases: res.aliases,
       jars_scanned: res.jars.length,
@@ -77,7 +77,7 @@ function installCommandArgumentTypes (client, { resolveJars, log = debug } = {})
     }
     const beyond = registry.size - res.vanilla
     log(`[command-args] ${source} synced ${registry.size} command argument types (${res.vanilla} vanilla, ${beyond} beyond the ${client.version} schema): ` +
-      `${res.derived.length} derived${res.derived.length ? ' [' + res.derived.map((d) => `${d.id}=${d.name}:${d.fields.map((f) => f.type).join(',') || 'none'}`).join(' ') + ']' : ''}` +
+      `${res.derived.length} derived${res.derived.length ? ' [' + res.derived.map((d) => `${d.id}=${d.name}:${d.fields.map((f) => f.type).join(',') || 'none'}${d.source.era ? ` (${d.source.writes.join('; ')})` : ''}`).join(' ') + ']' : ''}` +
       `${res.abstains.length ? `, ${res.abstains.length} NOT derivable [` + res.abstains.map((a) => `${a.id}=${a.name}:${a.reason}`).join(' ') + ']' : ''}` +
       `${res.aliases.length ? `, ${res.aliases.length} vanilla ids named differently on the wire [` + res.aliases.map((a) => `${a.id}=${a.name}`).join(' ') + ']' : ''} from ${res.jars.length} jars in ${res.ms} ms`)
   }

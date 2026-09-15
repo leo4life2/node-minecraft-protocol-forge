@@ -37,23 +37,37 @@ const SINGLETON_INFO = 'net/minecraft/commands/synchronization/SingletonArgument
 const REGISTER_BY_CLASS = { owner: 'net/minecraft/commands/synchronization/ArgumentTypeInfos', name: 'registerByClass' }
 const FRIENDLY_BYTE_BUF = /(^|\/)(Registry)?FriendlyByteBuf$|(^|\/)ByteBuf$/
 
-// FriendlyByteBuf write -> protodef type (minecraft-data's own primitive names).
-const WRITES = {
-  writeUtf: 'string',
-  writeResourceLocation: 'string',
-  writeIdentifier: 'string',
-  writeResourceKey: 'string',
-  writeBoolean: 'bool',
-  writeByte: 'i8',
-  writeShort: 'i16',
-  writeInt: 'i32',
-  writeLong: 'i64',
-  writeFloat: 'f32',
-  writeDouble: 'f64',
-  writeVarInt: 'varint',
-  writeVarLong: 'varlong',
-  writeEnum: 'varint',
-  writeUUID: 'UUID'
+// FriendlyByteBuf write -> protodef type: the shared table (one source for
+// the reader and the mapping generator).
+const { WRITES, eraOfMember } = require('./friendlyByteBufWrites')
+
+// HF48-P2 — mapping-era write vocabulary, GENERATED from the real mappings
+// (tools/genBlockShapeTables.js: mojang -> obf (proguard) -> srg (tsrg2) and
+// -> intermediary (tiny-v2)); never hand-written. Forge 1.17-1.20.1 jars
+// call FriendlyByteBuf.m_130070_ (= writeUtf), Fabric jars method_10814.
+// Each era maps every era name back to the Mojang name the WRITES table
+// keys; an era name the mappings did not know stays the named abstain.
+const ERA_WRITES = (() => {
+  const out = {}
+  const tables = require('./data/blockShapeTables.json')
+  for (const [era, ns] of Object.entries(tables.namespaces || {})) {
+    const m = new Map()
+    for (const [mojang, names] of Object.entries((ns.ids && ns.ids.friendlyByteBufWrites) || {})) {
+      for (const n of names) if (n !== mojang && WRITES[mojang]) m.set(n, mojang)
+    }
+    out[era] = m
+  }
+  return out
+})()
+
+// A FriendlyByteBuf write by name: Mojang first, else the era vocabulary of
+// the member's own spelling. Returns { mojang, type, era } or null.
+function resolveWrite (name) {
+  if (WRITES[name]) return { mojang: name, type: WRITES[name], era: null }
+  const era = eraOfMember(name)
+  const mojang = era && ERA_WRITES[era] ? ERA_WRITES[era].get(name) : null
+  if (!mojang) return null
+  return { mojang, type: WRITES[mojang], era }
 }
 
 const ACC_BRIDGE = 0x0040
@@ -83,6 +97,7 @@ function layoutOfMethod (parsed, codeEntry, depth = 0) {
   const rows = decodeInstructions(codeEntry.code, parsed.cp)
   const fields = []
   const writes = []
+  const eras = new Set()
   for (const row of rows) {
     if (row.target !== undefined || row.op === 0xaa || row.op === 0xab) return { abstain: 'conditional-write' }
     if (row.op === 0xba) return { abstain: 'lambda-in-serializer' }
@@ -90,10 +105,14 @@ function layoutOfMethod (parsed, codeEntry, depth = 0) {
     const { owner, name, desc } = row.ref
     if (!owner) continue
     if (FRIENDLY_BYTE_BUF.test(owner)) {
-      const type = WRITES[name]
-      if (!type) return { abstain: `unmodelled-write:${name}` }
-      fields.push({ name: `${name.replace(/^write/, '').toLowerCase()}${fields.length}`, type })
-      writes.push(name)
+      const w = resolveWrite(name)
+      if (!w) return { abstain: `unmodelled-write:${name}` }
+      fields.push({ name: `${w.mojang.replace(/^write/, '').toLowerCase()}${fields.length}`, type: w.type })
+      // the receipt names the era and the resolved Mojang name for an era-
+      // spelled write (m_130070_ = writeUtf via srg vocab); a Mojang write
+      // stays the bare name (receipts of Mojang-era jars are unchanged)
+      writes.push(w.era ? `${name} = ${w.mojang} via ${w.era} vocab` : name)
+      if (w.era) eras.add(w.era)
       continue
     }
     if (/Codec/.test(owner) || /\/StreamCodec/.test(owner)) return { abstain: `codec-encoded:${owner.split('/').pop()}.${name}` }
@@ -103,10 +122,10 @@ function layoutOfMethod (parsed, codeEntry, depth = 0) {
       if (!target) return { abstain: `delegate-missing:${name}` }
       const sub = layoutOfMethod(parsed, target, depth + 1)
       if (sub.abstain) return sub
-      fields.push(...sub.fields); writes.push(...sub.writes)
+      fields.push(...sub.fields); writes.push(...sub.writes); if (sub.era) eras.add(sub.era)
     }
   }
-  return { fields, writes }
+  return { fields, writes, ...(eras.size ? { era: [...eras].join('+') } : {}) }
 }
 
 // The serializer's layout: the non-bridge serializeToNetwork(T, FriendlyByteBuf).
@@ -273,7 +292,7 @@ function deriveCommandArgumentTypes ({ registry, vanillaNames, vanillaMaxId = nu
     }
     const layout = jar.infos.get(site.infoClass)
     if (!layout || layout.abstain) { abstains.push({ id, name, reason: `serializer-non-derivable:${layout ? layout.abstain : 'unknown'}`, serializer: site.infoClass, jar: jar.jar }); continue }
-    derived.push({ id, name, fields: layout.fields, source: { jar: jar.jar, site: `${site.className}.${site.method}`, serializer: site.infoClass, method: layout.method, writes: layout.writes, evidence } })
+    derived.push({ id, name, fields: layout.fields, source: { jar: jar.jar, site: `${site.className}.${site.method}`, serializer: site.infoClass, method: layout.method, writes: layout.writes, ...(layout.era ? { era: layout.era } : {}), evidence } })
   }
   const ms = Date.now() - t0
   debug(`command argument types: ${vanillaCount} vanilla, ${derived.length} derived, ${abstains.length} abstained from ${out.jars.length} jars in ${ms} ms`)
@@ -289,4 +308,4 @@ function deriveCommandArgumentTypes ({ registry, vanillaNames, vanillaMaxId = nu
   }
 }
 
-module.exports = { deriveCommandArgumentTypes, layoutOfMethod, layoutOfInfoClass, scanJar, WRITES, isVanillaName }
+module.exports = { deriveCommandArgumentTypes, layoutOfMethod, layoutOfInfoClass, scanJar, WRITES, isVanillaName, resolveWrite, _internal: { ERA_WRITES } }
