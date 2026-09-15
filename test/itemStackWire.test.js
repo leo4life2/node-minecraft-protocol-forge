@@ -122,3 +122,125 @@ describe('HF35 r2 - ItemStack wire-shape derivation', function () {
     assert.strictEqual(receipt.walks.outgoing, 1)
   })
 })
+
+// HF49 — the count REPLACE shape. Ground truth: Bigger Stacks 1.20.1-2026.06.17
+// (Forge; sha1 22b4aa9d792413b2597a9aeb6ec55b21b31534cf), whose
+// portb.biggerstacks.mixin.vanilla.FriendlyByteBufMixin @Redirects writeByte
+// in writeItemStack to writeInt(count), @Redirects readByte in readItem to a
+// constant 0 (no buffer read) and @ModifyVariable(STORE, ordinal 0)s the count
+// with readInt(). Wire: bool present, varint id, i32 count (REPLACING the i8),
+// nbt. The trimmed fixture keeps that mixin class + the jar's own refmap /
+// mixin config / manifest. The bent shapes come from a javac fixture
+// (test/fixtures/src/hf49): one class per bend, isolated by dropping the rest.
+const BIGGER = path.join(__dirname, 'fixtures', 'biggerstacks-1.20.1-2026.06.17.trimmed.jar')
+const SHAPES = path.join(__dirname, 'fixtures', 'hf49-count-replace-shapes.jar')
+const { mutateJar } = require('./helpers/jarMutate')
+
+describe('HF49 - ItemStack count REPLACE shape (a widened count in place of the i8)', function () {
+  const only = (cls) => {
+    const { buf } = mutateJar(fs.readFileSync(SHAPES), { drop: (p) => /^fx\/hf49\//.test(p) && p !== `fx/hf49/${cls}.class` })
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf49-shape-'))
+    const jar = path.join(dir, `${cls}.jar`); fs.writeFileSync(jar, buf)
+    return jar
+  }
+  it('derives the i8 -> i32 count replacement from the Bigger Stacks jar (write redirect + read skip + STORE-0 count pin = one pair)', () => {
+    const r = scanItemStackWireExtensions([BIGGER])
+    assert.ok(r.ext, JSON.stringify(r))
+    assert.strictEqual(r.ext.shape, 'replace')
+    assert.strictEqual(r.ext.anchor, 'count')
+    assert.strictEqual(r.ext.replaces, 'i8')
+    assert.deepStrictEqual(r.ext.fields, [{ name: 'itemCount', type: 'i32', source: 'count' }])
+    assert.deepStrictEqual(r.ext.mixin, { className: 'portb/biggerstacks/mixin/vanilla/FriendlyByteBufMixin', jar: 'biggerstacks-1.20.1-2026.06.17.trimmed.jar', nested: null, write: 'writeBiggerStackCount', read: 'readStackItemCount', skip: 'doNothing' })
+    assert.deepStrictEqual(r.mixins.map((m) => [m.writes, m.reads]), [[1, 2]], 'the skip and the pin are two rows but ONE read half')
+  })
+  it('the APPEND shape (stacc-api) is untouched: same anchor, fields and mixin, now labelled shape=append', () => {
+    const r = scanItemStackWireExtensions([STACC])
+    assert.strictEqual(r.ext.shape, 'append')
+    assert.strictEqual(r.ext.anchor, 'beforeNbt')
+    assert.strictEqual(r.ext.replaces, undefined)
+    assert.deepStrictEqual(r.ext.fields, [{ name: 'itemStackWire0', type: 'i32', source: 'count' }])
+  })
+  it('both jars in one folder = two write halves -> the named multiplicity abstain (never a guessed order)', () => {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf49-both-'))
+    fs.copyFileSync(BIGGER, path.join(dir, 'a.jar')); fs.copyFileSync(STACC, path.join(dir, 'b.jar'))
+    const r = scanItemStackWireExtensions([dir])
+    assert.strictEqual(r.ext, null)
+    assert.strictEqual(r.abstain.reason, 'multiple-item-wire-mixins')
+  })
+  it('swaps the slot count primitive in place on 1.20.1 (name and position kept); 1.21.1 carries a varint count -> null (honest unsupported)', () => {
+    const { ext } = scanItemStackWireExtensions([BIGGER])
+    const s = extendSlotType(require('minecraft-data')('1.20.1').protocol.types.slot, ext)
+    assert.deepStrictEqual(s[1][1].type[1].fields.true[1].map((f) => [f.name, f.type]), [['itemId', 'varint'], ['itemCount', 'i32'], ['nbtData', 'optionalNbt']])
+    const t121 = require('minecraft-data')('1.21.1').protocol.types
+    assert.strictEqual(extendSlotType(t121.Slot || t121.slot, ext), null)
+  })
+  it('the compiled play protocol writes the 9-byte set_creative_slot (i32 count where the i8 was) and parses window_items / set_slot with i32 counts above 127', () => {
+    const { ext } = scanItemStackWireExtensions([BIGGER])
+    const p = compileFor('1.20.1', ext)
+    const item = fillOutgoing({ slot: 36, item: { present: true, itemId: 1, itemCount: 1 } }, ext.fields)
+    const buf = p.toServer.createPacketBuffer('packet', { name: 'set_creative_slot', params: item })
+    assert.strictEqual(buf.toString('hex'), '2b0024' + '01' + '01' + '00000001' + '00')
+    assert.strictEqual(buf.length - 1, 9, 'packet id + a 9-byte body for item id 1 (vanilla 6; the field kick read 7 vs 9 with a 2-byte item id)')
+    assert.strictEqual(fillOutgoing({ slot: 36, item: { present: true, itemId: 1, itemCount: 1 } }, ext.fields).item.itemStackWire0, undefined, 'no extra field is ever added')
+    const wi = p.toClient.createPacketBuffer('packet', { name: 'window_items', params: { windowId: 0, stateId: 1, items: [{ present: true, itemId: 5, itemCount: 200 }, { present: false }], carriedItem: { present: true, itemId: 6, itemCount: 100000 } } })
+    const parsed = p.toClient.parsePacketBuffer('packet', wi)
+    reconcileIncoming(parsed.data.params, ext.fields)
+    assert.strictEqual(parsed.data.params.items[0].itemCount, 200)
+    assert.strictEqual(parsed.data.params.items[1].present, false)
+    assert.strictEqual(parsed.data.params.carriedItem.itemCount, 100000)
+    const ss = p.toClient.createPacketBuffer('packet', { name: 'set_slot', params: { windowId: 0, stateId: 1, slot: 36, item: { present: true, itemId: 5, itemCount: 4096 } } })
+    assert.strictEqual(p.toClient.parsePacketBuffer('packet', ss).data.params.item.itemCount, 4096)
+    // the vanilla 7-byte shape is NOT accepted by the replaced parser (exact, not tolerant)
+    const vanilla = require('minecraft-protocol').createDeserializer({ state: 'play', isServer: false, version: '1.20.1' })
+    assert.throws(() => p.toClient.parsePacketBuffer('packet', vanilla.proto.createPacketBuffer('packet', { name: 'window_items', params: { windowId: 0, stateId: 1, items: [{ present: true, itemId: 5, itemCount: 1 }], carriedItem: { present: false } } })))
+  })
+  it('installs per client (receipt shape=replace, the log names the swap), the shared nmp protocol cache untouched; 1.21.1 = slot-shape-unsupported naming the replaced primitive', () => {
+    const { ext } = scanItemStackWireExtensions([BIGGER])
+    const EventEmitter = require('events')
+    const mc = require('minecraft-protocol')
+    const client = new EventEmitter()
+    client.version = '1.20.1'; client.state = 'play'
+    client.serializer = mc.createSerializer({ state: 'play', isServer: false, version: '1.20.1' })
+    client.deserializer = mc.createDeserializer({ state: 'play', isServer: false, version: '1.20.1' })
+    const seen = []
+    client.write = (name, params) => seen.push({ name, params })
+    const logs = []
+    const receipt = installItemStackWireExtension(client, ext, { log: (m) => logs.push(m) })
+    assert.strictEqual(receipt.installed, true)
+    assert.strictEqual(receipt.shape, 'replace')
+    assert.ok(logs.some((l) => /slot itemCount i8 -> i32 \(shape=replace\).*FriendlyByteBufMixin/.test(l)), logs.join('\n'))
+    const vanillaPlay = mc.createSerializer({ state: 'play', isServer: false, version: '1.20.1' })
+    assert.notStrictEqual(client.serializer.proto, vanillaPlay.proto)
+    assert.strictEqual(client.serializer.proto.createPacketBuffer('packet', { name: 'set_creative_slot', params: { slot: 36, item: { present: true, itemId: 1, itemCount: 300 } } }).length - 1, 9)
+    const c2 = new EventEmitter(); c2.version = '1.21.1'; c2.state = 'play'
+    c2.serializer = mc.createSerializer({ state: 'play', isServer: false, version: '1.21.1' }); c2.deserializer = mc.createDeserializer({ state: 'play', isServer: false, version: '1.21.1' }); c2.write = () => {}
+    const r2 = installItemStackWireExtension(c2, ext, { log: () => {} })
+    assert.strictEqual(r2.installed, false)
+    assert.match(r2.reason, /slot-shape-unsupported: 1\.21\.1's slot type does not carry its count as i8/)
+  })
+  const bends = [
+    ['TwoPrimWrite', 'replace-multi-primitive', /writes 2 primitive\(s\) \[i16,i32\] in place of one i8/],
+    ['ReadingRedirect', 'replace-read-not-skipped', /reads still reads the buffer \[i32\]/],
+    ['MismatchedTypes', 'field-mismatch', /write side \[i32\] vs read side \[i16\]/],
+    ['NonCountTarget', 'replace-non-count-target', /redirects a bool buffer write/],
+    ['WriteOnly', 'multiple-item-wire-mixins', /1 write-side injection\(s\), 0 read-side primitive redirect\(s\) and 0 read-side value injection\(s\)/],
+    ['SecondStore', 'replace-non-count-target', /ModifyVariable count \(\(I\)I\) does not pin the stack count/]
+  ]
+  for (const [cls, reason, detail] of bends) {
+    it(`bent shape ${cls} -> honest named abstain ${reason}`, () => {
+      const r = scanItemStackWireExtensions([only(cls)])
+      assert.strictEqual(r.ext, null, JSON.stringify(r))
+      assert.strictEqual(r.abstain.reason, reason, JSON.stringify(r.abstain))
+      assert.match(r.abstain.detail, detail)
+      assert.ok(r.abstain.mixins.every((m) => m.startsWith(`fx/hf49/${cls} in ${cls}.jar`)), r.abstain.mixins.join(','))
+    })
+  }
+  it('the real jar bent by the constant pool (readInt -> readShort on the count pin) -> field-mismatch, never a guessed width', () => {
+    const { buf } = mutateJar(fs.readFileSync(BIGGER), { rewrite: (p, s) => (/FriendlyByteBufMixin\.class$/.test(p) && s === 'readInt' ? 'readShort' : (/FriendlyByteBufMixin\.class$/.test(p) && s === '()I' ? '()S' : undefined)) })
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf49-bent-'))
+    const jar = path.join(dir, 'bent.jar'); fs.writeFileSync(jar, buf)
+    const r = scanItemStackWireExtensions([jar])
+    assert.strictEqual(r.ext, null)
+    assert.strictEqual(r.abstain.reason, 'field-mismatch')
+  })
+})

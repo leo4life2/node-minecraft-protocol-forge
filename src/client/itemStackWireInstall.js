@@ -19,6 +19,13 @@ const { extendSlotType } = require('./itemStackWireDerivation')
 // fields from its own itemCount before serialization. Incoming: a wide count
 // that disagrees with the i8 count (a stack above 127) replaces it, so the
 // inventory truth is the mod's, not the overflowed byte.
+//
+// HF49 — the REPLACE shape (ext.shape 'replace', ext.replaces 'i8'): the slot's
+// count field keeps its name and position and only its primitive is swapped
+// (i8 -> the derived i32), so outgoing items write their itemCount with the
+// wider type and incoming slots parse it directly — no extra field, nothing
+// to fill or reconcile. The same per-client compile-and-swap, never
+// process-wide.
 
 const compiled = new Map() // `${version}|${specKey}` -> { toServer, toClient }
 
@@ -130,7 +137,7 @@ function reconcileIncoming (value, fields, depth = 0) {
 function installItemStackWireExtension (client, ext, { log = debug } = {}) {
   if (!client || !ext) return { installed: false, reason: 'no-extension' }
   if (client.minepalItemStackWire) return client.minepalItemStackWire
-  const receipt = { installed: false, ext, version: client.version, swaps: 0, walks: { outgoing: 0, incoming: 0 } }
+  const receipt = { installed: false, ext, shape: ext.shape || 'append', version: client.version, swaps: 0, walks: { outgoing: 0, incoming: 0 } }
   client.minepalItemStackWire = receipt
   let protos
   try { protos = compileFor(client.version, ext) } catch (err) {
@@ -139,7 +146,9 @@ function installItemStackWireExtension (client, ext, { log = debug } = {}) {
     return receipt
   }
   if (!protos) {
-    receipt.reason = `slot-shape-unsupported: ${client.version}'s slot type has no nbt field to anchor the ${ext.anchor} extension`
+    receipt.reason = ext.shape === 'replace'
+      ? `slot-shape-unsupported: ${client.version}'s slot type does not carry its count as ${ext.replaces} (the primitive the mod replaces)`
+      : `slot-shape-unsupported: ${client.version}'s slot type has no nbt field to anchor the ${ext.anchor} extension`
     log(`[item-wire] extension from ${ext.mixin?.className} (${ext.mixin?.jar}) NOT installed: ${receipt.reason}`)
     return receipt
   }
@@ -150,7 +159,10 @@ function installItemStackWireExtension (client, ext, { log = debug } = {}) {
     client.deserializer.proto = protos.toClient
     receipt.swaps += 1
     receipt.installed = true
-    log(`[item-wire] play protocol extended: slot += ${ext.fields.map((f) => `${f.type}(${f.source})`).join(',')} ${ext.anchor} ` +
+    const what = ext.shape === 'replace'
+      ? `slot ${ext.fields[0].name} ${ext.replaces} -> ${ext.fields[0].type} (shape=replace)`
+      : `slot += ${ext.fields.map((f) => `${f.type}(${f.source})`).join(',')} ${ext.anchor} (shape=append)`
+    log(`[item-wire] play protocol extended: ${what} ` +
       `(derived from ${ext.mixin?.className} in ${ext.mixin?.jar}${ext.mixin?.nested ? ` nested ${ext.mixin.nested}` : ''})`)
   }
   client.on('state', swap)

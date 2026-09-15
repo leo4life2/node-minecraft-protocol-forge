@@ -201,9 +201,12 @@ function readAnnotationsAttr (b, start, cp, { rich = false } = {}) {
         p += 2
         return v
       }
-      case 'B': case 'C': case 'D': case 'F': case 'I': case 'J': case 'S': case 'Z':
+      case 'B': case 'C': case 'D': case 'F': case 'I': case 'J': case 'S': case 'Z': {
+        // rich: an int-family constant (an injector's `ordinal`) is the cp Integer's value
+        const c = rich ? cp[b.readUInt16BE(p)] : null
         p += 2
-        return null
+        return c && c.tag === 3 ? c.int : null
+      }
       case '[': {
         const count = b.readUInt16BE(p); p += 2
         const arr = []

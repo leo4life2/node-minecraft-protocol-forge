@@ -33,6 +33,23 @@ const { zipCentralEntries, zipEntryData, parseClassFile, readAnnotationsAttr, de
 //          readItemStack at the same anchor reading the same primitives.
 // The write field list and the read field list must agree type-for-type and
 // position-for-position; a lone i32 count read pins the write field's source.
+//
+// HF49 — the REPLACE shape (a mod that WIDENS the count in place instead of
+// appending a second copy; e.g. a stack-size mod's FriendlyByteBuf mixin):
+//   write: a @Redirect inside writeItemStack whose target is a buffer
+//          primitive call (writeByte) and whose handler writes exactly one
+//          primitive (writeInt) -> the count's i8 is REPLACED by an i32;
+//   read:  a @Redirect on the matching primitive (readByte) in readItem whose
+//          handler returns a constant and performs NO buffer read = that
+//          primitive is SKIPPED; plus a @ModifyVariable(STORE, ordinal 0)
+//          (I)I handler in readItem reading exactly one primitive = the
+//          count's new source (the same count pin as the ctor @ModifyArg).
+// The skip and the value read together are ONE read half. Pairing: the write
+// side's replaced primitive == the read side's skipped primitive, and the
+// handler primitives agree type-for-type -> ext { anchor: 'count', shape:
+// 'replace', replaces: 'i8', fields: [{ i32, source count }] }. A handler with
+// more than one primitive, a redirect on a non-count primitive, a read
+// redirect that still reads the buffer, or an unpaired half = named abstain.
 
 const MIXIN_ANN = 'Lorg/spongepowered/asm/mixin/Mixin;'
 const INJECTOR_RE = /^L(?:org\/spongepowered\/asm\/mixin\/injection|com\/llamalad7\/mixinextras\/injector(?:\/v1)?)\/([A-Za-z]+);$/
@@ -40,6 +57,13 @@ const WRITE_ITEM_RE = /^(?:writeItemStack|writeItem)(?:\(|$)/
 const READ_ITEM_RE = /^(?:readItemStack|readItem)(?:\(|$)/
 const NBT_TARGET_RE = /;(?:writeNbt|readNbt|writeCompoundTag|readCompoundTag|writeCompoundNbt|readCompoundNbt)\(/
 const ITEMSTACK_CTOR_RE = /(?:item\/ItemStack|world\/item\/ItemStack|class_1799);<init>\(/
+// the integer-shaped buffer primitives a stack count can travel as (a redirect
+// replacing any other primitive is not a count replacement -> abstain)
+const COUNT_PRIMS = new Set(['i8', 'i16', 'i32', 'varint'])
+// opcodes a constant-returning handler may consist of: const pushes + ireturn
+// (iconst_m1..iconst_5 0x02-0x08, bipush 0x10, sipush 0x11, ldc 0x12-0x14,
+// ireturn 0xac); anything else (a load of the buffer, an invoke) = not a skip
+const CONST_RETURN_OPS = new Set([0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x10, 0x11, 0x12, 0x13, 0x14, 0xac])
 
 // buffer primitive name/descriptor -> protodef type (netty ByteBuf + the
 // Minecraft varint helpers; owner-agnostic because mixins call them through a
@@ -117,6 +141,25 @@ function anchorOf (elements) {
   return { anchor: null, value, target }
 }
 
+// An @At(INVOKE) target naming a buffer primitive call -> its protodef type
+// (the HF49 replace shape's redirected primitive), else null.
+function primTargetOf (target, table) {
+  const m = String(target || '').match(/;([A-Za-z_$][\w$]*)(\(.*)$/)
+  if (!m) return null
+  const key = `${m[1]}:${m[2]}`
+  const hit = Object.keys(table).find((k) => key.startsWith(k))
+  return hit ? table[hit] : null
+}
+
+// true when the handler body is nothing but constant pushes and a return: a
+// read-side redirect of this shape consumes NO bytes (the primitive is skipped)
+function returnsConstant (parsed, methodName, methodDesc) {
+  const code = parsed.codes.find((c) => c.method === methodName && c.desc === methodDesc)
+  if (!code) return false
+  const rows = decodeInstructions(code.code, parsed.cp)
+  return rows.length > 0 && rows.every((row) => CONST_RETURN_OPS.has(row.op))
+}
+
 function primsIn (parsed, methodName, methodDesc, table) {
   const code = parsed.codes.find((c) => c.method === methodName && c.desc === methodDesc)
   if (!code) return null
@@ -158,8 +201,24 @@ function scanClass (parsed, aliases, source) {
       if (!isWrite && !isRead) continue
       const { anchor, value, target } = anchorOf(a.elements)
       const row = { injector: inj[1], handler: m.name, desc: m.desc, anchor, at: value, target, targetMethods: names }
-      if (isWrite) found.writes.push({ ...row, fields: primsIn(parsed, m.name, m.desc, WRITE_PRIMS) })
-      if (isRead) found.reads.push({ ...row, fields: primsIn(parsed, m.name, m.desc, READ_PRIMS) })
+      if (isWrite) {
+        const w = { ...row, fields: primsIn(parsed, m.name, m.desc, WRITE_PRIMS) }
+        // HF49 replace shape, write half: a redirect of a buffer primitive call
+        const replaces = row.injector === 'Redirect' && value === 'INVOKE' ? primTargetOf(target, WRITE_PRIMS) : null
+        if (replaces) { w.anchor = 'count'; w.replaces = replaces }
+        found.writes.push(w)
+      }
+      if (isRead) {
+        const r = { ...row, fields: primsIn(parsed, m.name, m.desc, READ_PRIMS) }
+        // HF49 replace shape, read half: the skip (a redirect of the primitive
+        // whose handler returns a constant) and the count pin (a STORE-ordinal-0
+        // int variable modifier reading exactly one primitive)
+        const skips = row.injector === 'Redirect' && value === 'INVOKE' ? primTargetOf(target, READ_PRIMS) : null
+        if (skips) { r.anchor = 'count'; r.skips = skips; r.readsBuffer = !returnsConstant(parsed, m.name, m.desc) }
+        const ordinal = a.elements.ordinal
+        if (row.injector === 'ModifyVariable' && value === 'STORE' && (ordinal == null || Number(ordinal) === 0) && /\(I\)I$/.test(m.desc) && r.fields && r.fields.length === 1) { r.anchor = 'count'; r.countPin = true }
+        found.reads.push(r)
+      }
     }
   }
   return found.writes.length || found.reads.length ? found : null
@@ -200,6 +259,7 @@ function deriveSpec (mixins) {
   if (!writes.length && !reads.length) return { ext: null }
   const where = (r) => `${r.className} in ${path.basename(r.source.jarPath)}${r.source.nested ? ` (nested ${r.source.nested})` : ''}`
   const abstain = (reason, detail, rows) => ({ ext: null, abstain: { reason, detail, mixins: rows.map(where) } })
+  if (writes.some((w) => w.replaces) || reads.some((r) => r.skips)) return deriveReplaceSpec(writes, reads, abstain)
   if (writes.length !== 1 || reads.length !== 1) return abstain('multiple-item-wire-mixins', `${writes.length} write-side and ${reads.length} read-side item (de)serializer injections — their order on the wire is not derivable`, writes.concat(reads))
   const [w] = writes; const [r] = reads
   if (!w.anchor || !r.anchor) return abstain('unknown-anchor', `injection point not understood (write at ${w.at || '?'} ${w.target || ''}; read at ${r.at || '?'} ${r.target || ''})`, [w, r])
@@ -212,7 +272,30 @@ function deriveSpec (mixins) {
   const fields = w.fields.map((type, i) => ({ name: `itemStackWire${i}`, type, source: countPinned ? 'count' : 'unknown' }))
   if (fields.some((f) => f.source === 'unknown')) return abstain('unknown-field-source', `the extension's ${fields.map((f) => f.type).join(',')} value(s) cannot be produced from an item this client holds`, [w, r])
   return {
-    ext: { anchor: w.anchor, fields, mixin: { className: w.className, jar: path.basename(w.source.jarPath), nested: w.source.nested || null, write: w.handler, read: r.handler } }
+    ext: { anchor: w.anchor, shape: 'append', fields, mixin: { className: w.className, jar: path.basename(w.source.jarPath), nested: w.source.nested || null, write: w.handler, read: r.handler } }
+  }
+}
+
+// HF49 — the REPLACE shape's pairing law (see the header). One write redirect
+// + one read skip + one count pin = the count's primitive replaced in place.
+function deriveReplaceSpec (writes, reads, abstain) {
+  const all = writes.concat(reads)
+  const skips = reads.filter((r) => r.skips)
+  const values = reads.filter((r) => !r.skips)
+  if (writes.length !== 1 || skips.length !== 1 || values.length !== 1) {
+    return abstain('multiple-item-wire-mixins', `${writes.length} write-side injection(s), ${skips.length} read-side primitive redirect(s) and ${values.length} read-side value injection(s) on the item (de)serializer — a count replacement pairs exactly one of each; their order on the wire is not derivable`, all)
+  }
+  const [w] = writes; const [s] = skips; const [r] = values
+  if (!w.replaces) return abstain('unpaired-replace', `the read side redirects ${s.skips} (${s.handler}) but the write side (${w.injector} at ${w.at || '?'} ${w.target || ''}) replaces no buffer primitive`, all)
+  if (!COUNT_PRIMS.has(w.replaces)) return abstain('replace-non-count-target', `the write side redirects a ${w.replaces} buffer write (${w.target}) — not a stack-count primitive`, all)
+  if (!w.fields || w.fields.length !== 1) return abstain('replace-multi-primitive', `the redirect handler ${w.handler} writes ${w.fields ? w.fields.length : 0} primitive(s) [${(w.fields || []).join(',')}] in place of one ${w.replaces} — only a one-for-one replacement is derivable`, all)
+  if (s.skips !== w.replaces) return abstain('replace-target-mismatch', `the write side replaces ${w.replaces} (${w.target}) but the read side skips ${s.skips} (${s.target})`, all)
+  if (s.readsBuffer) return abstain('replace-read-not-skipped', `the read-side redirect handler ${s.handler} still reads the buffer [${(s.fields || []).join(',') || 'no recognised primitive'}] — it does not skip the ${s.skips}, so the read shape is not derivable`, all)
+  if (!r.countPin) return abstain('replace-non-count-target', `the read-side value injection ${r.injector} ${r.handler} (${r.desc}) does not pin the stack count (a STORE-ordinal-0 int variable modifier or the ItemStack ctor's int argument reading exactly one primitive)`, all)
+  if (w.fields.join(',') !== r.fields.join(',')) return abstain('field-mismatch', `write side [${w.fields.join(',')}] vs read side [${r.fields.join(',')}]`, all)
+  const fields = [{ name: 'itemCount', type: w.fields[0], source: 'count' }]
+  return {
+    ext: { anchor: 'count', shape: 'replace', replaces: w.replaces, fields, mixin: { className: w.className, jar: path.basename(w.source.jarPath), nested: w.source.nested || null, write: w.handler, read: r.handler, skip: s.handler } }
   }
 }
 
@@ -236,6 +319,15 @@ function extendSlotType (slotType, ext) {
   const visit = (node) => {
     if (Array.isArray(node) && node[0] === 'container' && Array.isArray(node[1])) {
       const fields = node[1]
+      if (ext.shape === 'replace') {
+        // HF49: the count field keeps its name and position; only its
+        // primitive changes — and only when the version's slot really carries
+        // the replaced primitive there (the mod redirected THAT call)
+        const count = fields.find((f) => f && /^(?:itemCount|count)$/i.test(f.name || ''))
+        if (count && count.type === ext.replaces) { count.type = ext.fields[0].type; return true }
+        for (const f of fields) if (f && f.type && visit(f.type)) return true
+        return false
+      }
       const nbtIdx = fields.findIndex((f) => f && /^nbt/i.test(f.name || ''))
       if (nbtIdx >= 0 && ext.anchor !== 'head') {
         const add = ext.fields.map((f) => ({ name: f.name, type: f.type }))
