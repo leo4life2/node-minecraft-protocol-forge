@@ -131,7 +131,8 @@ describe('HF35 r2 - ItemStack wire-shape derivation', function () {
 // with readInt(). Wire: bool present, varint id, i32 count (REPLACING the i8),
 // nbt. The trimmed fixture keeps that mixin class + the jar's own refmap /
 // mixin config / manifest. The bent shapes come from a javac fixture
-// (test/fixtures/src/hf49): one class per bend, isolated by dropping the rest.
+// (test/fixtures/src/hf49): one class per bend, isolated by dropping the rest;
+// CtorPin (HF49-r) is the one green javac shape: the ctor-@ModifyArg count pin.
 const BIGGER = path.join(__dirname, 'fixtures', 'biggerstacks-1.20.1-2026.06.17.trimmed.jar')
 const SHAPES = path.join(__dirname, 'fixtures', 'hf49-count-replace-shapes.jar')
 const { mutateJar } = require('./helpers/jarMutate')
@@ -220,12 +221,23 @@ describe('HF49 - ItemStack count REPLACE shape (a widened count in place of the 
   })
   const bends = [
     ['TwoPrimWrite', 'replace-multi-primitive', /writes 2 primitive\(s\) \[i16,i32\] in place of one i8/],
-    ['ReadingRedirect', 'replace-read-not-skipped', /reads still reads the buffer \[i32\]/],
+    ['ReadingRedirect', 'replace-read-not-skipped', /reads is not a provable skip of the i8 — its body is not a constant return \(reads \[i32\]\)/],
+    ['HelperRedirect', 'replace-read-not-skipped', /skip is not a provable skip of the i8 — its body is not a constant return \(no recognised primitive read; other ops present\)/],
     ['MismatchedTypes', 'field-mismatch', /write side \[i32\] vs read side \[i16\]/],
     ['NonCountTarget', 'replace-non-count-target', /redirects a bool buffer write/],
     ['WriteOnly', 'multiple-item-wire-mixins', /1 write-side injection\(s\), 0 read-side primitive redirect\(s\) and 0 read-side value injection\(s\)/],
-    ['SecondStore', 'replace-non-count-target', /ModifyVariable count \(\(I\)I\) does not pin the stack count/]
+    ['SecondStore', 'replace-non-count-target', /ModifyVariable count \(\(I\)I\) does not pin the stack count \(accepted pins: a @ModifyVariable STORE ordinal-0 \(I\)I handler, or a @ModifyArg on the ItemStack ctor's int argument/]
   ]
+  it('HF49-r: the ItemStack ctor @ModifyArg count pin (the HF35 pin) closes the replace pair too -> derives i8 -> i32 (CtorPin)', () => {
+    const r = scanItemStackWireExtensions([only('CtorPin')])
+    assert.ok(r.ext, JSON.stringify(r))
+    assert.strictEqual(r.ext.shape, 'replace')
+    assert.strictEqual(r.ext.replaces, 'i8')
+    assert.deepStrictEqual(r.ext.fields, [{ name: 'itemCount', type: 'i32', source: 'count' }])
+    assert.deepStrictEqual(r.ext.mixin, { className: 'fx/hf49/CtorPin', jar: 'CtorPin.jar', nested: null, write: 'wide', read: 'count', skip: 'skip' })
+    const slot = extendSlotType(require('minecraft-data')('1.20.1').protocol.types.slot, r.ext)
+    assert.deepStrictEqual(slot[1][1].type[1].fields.true[1].map((f) => [f.name, f.type]), [['itemId', 'varint'], ['itemCount', 'i32'], ['nbtData', 'optionalNbt']])
+  })
   for (const [cls, reason, detail] of bends) {
     it(`bent shape ${cls} -> honest named abstain ${reason}`, () => {
       const r = scanItemStackWireExtensions([only(cls)])

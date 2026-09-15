@@ -1,7 +1,8 @@
 #!/bin/sh
 # Rebuilds the HF49 javac fixture: the count-REPLACE mixin shapes the item-wire derivation must abstain on
 # (two primitives in the write redirect, a read redirect that still reads, mismatched types, a non-count
-# primitive, an unpaired write, a second-store variable pin). Real javac bytecode, RUNTIME injector annotations.
+# primitive, an unpaired write, a second-store variable pin, a helper-call read redirect) plus the ctor-@ModifyArg count pin
+# it must DERIVE (HF49-r). Real javac bytecode, RUNTIME injector annotations.
 # usage: sh test/fixtures/src/hf49/build.sh   (needs /usr/local/opt/openjdk@17/bin/{javac,jar})
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd); OUT=$HERE/../../; JDK=/usr/local/opt/openjdk@17/bin

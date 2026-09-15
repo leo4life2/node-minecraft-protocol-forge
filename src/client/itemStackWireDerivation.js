@@ -41,9 +41,10 @@ const { zipCentralEntries, zipEntryData, parseClassFile, readAnnotationsAttr, de
 //          primitive (writeInt) -> the count's i8 is REPLACED by an i32;
 //   read:  a @Redirect on the matching primitive (readByte) in readItem whose
 //          handler returns a constant and performs NO buffer read = that
-//          primitive is SKIPPED; plus a @ModifyVariable(STORE, ordinal 0)
-//          (I)I handler in readItem reading exactly one primitive = the
-//          count's new source (the same count pin as the ctor @ModifyArg).
+//          primitive is SKIPPED; plus a count pin = the count's new source:
+//          a @ModifyVariable(STORE, ordinal 0) (I)I handler in readItem, or
+//          the ItemStack ctor @ModifyArg (the HF35 pin, accepted here since
+//          HF49-r), either reading exactly one primitive.
 // The skip and the value read together are ONE read half. Pairing: the write
 // side's replaced primitive == the read side's skipped primitive, and the
 // handler primitives agree type-for-type -> ext { anchor: 'count', shape:
@@ -153,6 +154,13 @@ function primTargetOf (target, table) {
 
 // true when the handler body is nothing but constant pushes and a return: a
 // read-side redirect of this shape consumes NO bytes (the primitive is skipped)
+// The ItemStack-ctor count pin (HF35): a @ModifyArg on the ctor's int (count)
+// argument whose (I)I handler reads exactly one buffer primitive. Shared by the
+// append and the replace shapes so the accepted pins are one list.
+function isCtorCountPin (injector, target, desc, fields) {
+  return injector === 'ModifyArg' && ITEMSTACK_CTOR_RE.test(target || '') && /\(I\)I$/.test(desc) && Array.isArray(fields) && fields.length === 1
+}
+
 function returnsConstant (parsed, methodName, methodDesc) {
   const code = parsed.codes.find((c) => c.method === methodName && c.desc === methodDesc)
   if (!code) return false
@@ -212,11 +220,13 @@ function scanClass (parsed, aliases, source) {
         const r = { ...row, fields: primsIn(parsed, m.name, m.desc, READ_PRIMS) }
         // HF49 replace shape, read half: the skip (a redirect of the primitive
         // whose handler returns a constant) and the count pin (a STORE-ordinal-0
-        // int variable modifier reading exactly one primitive)
+        // int variable modifier, or the ItemStack ctor's int argument, reading
+        // exactly one primitive — HF49-r accepts the ctor pin here as HF35 does)
         const skips = row.injector === 'Redirect' && value === 'INVOKE' ? primTargetOf(target, READ_PRIMS) : null
         if (skips) { r.anchor = 'count'; r.skips = skips; r.readsBuffer = !returnsConstant(parsed, m.name, m.desc) }
         const ordinal = a.elements.ordinal
         if (row.injector === 'ModifyVariable' && value === 'STORE' && (ordinal == null || Number(ordinal) === 0) && /\(I\)I$/.test(m.desc) && r.fields && r.fields.length === 1) { r.anchor = 'count'; r.countPin = true }
+        if (isCtorCountPin(row.injector, target, m.desc, r.fields)) r.countPin = true // anchor stays beforeNbt: the append shape (HF35) still pairs on it
         found.reads.push(r)
       }
     }
@@ -268,7 +278,7 @@ function deriveSpec (mixins) {
   if (w.fields.join(',') !== r.fields.join(',')) return abstain('field-mismatch', `write side [${w.fields.join(',')}] vs read side [${r.fields.join(',')}]`, [w, r])
   // sources: the read-side @ModifyArg on the ItemStack ctor int returning the
   // one primitive it reads pins that field as the stack count
-  const countPinned = r.injector === 'ModifyArg' && ITEMSTACK_CTOR_RE.test(r.target) && /\(I\)I$/.test(r.desc) && r.fields.length === 1
+  const countPinned = isCtorCountPin(r.injector, r.target, r.desc, r.fields)
   const fields = w.fields.map((type, i) => ({ name: `itemStackWire${i}`, type, source: countPinned ? 'count' : 'unknown' }))
   if (fields.some((f) => f.source === 'unknown')) return abstain('unknown-field-source', `the extension's ${fields.map((f) => f.type).join(',')} value(s) cannot be produced from an item this client holds`, [w, r])
   return {
@@ -290,8 +300,8 @@ function deriveReplaceSpec (writes, reads, abstain) {
   if (!COUNT_PRIMS.has(w.replaces)) return abstain('replace-non-count-target', `the write side redirects a ${w.replaces} buffer write (${w.target}) — not a stack-count primitive`, all)
   if (!w.fields || w.fields.length !== 1) return abstain('replace-multi-primitive', `the redirect handler ${w.handler} writes ${w.fields ? w.fields.length : 0} primitive(s) [${(w.fields || []).join(',')}] in place of one ${w.replaces} — only a one-for-one replacement is derivable`, all)
   if (s.skips !== w.replaces) return abstain('replace-target-mismatch', `the write side replaces ${w.replaces} (${w.target}) but the read side skips ${s.skips} (${s.target})`, all)
-  if (s.readsBuffer) return abstain('replace-read-not-skipped', `the read-side redirect handler ${s.handler} still reads the buffer [${(s.fields || []).join(',') || 'no recognised primitive'}] — it does not skip the ${s.skips}, so the read shape is not derivable`, all)
-  if (!r.countPin) return abstain('replace-non-count-target', `the read-side value injection ${r.injector} ${r.handler} (${r.desc}) does not pin the stack count (a STORE-ordinal-0 int variable modifier or the ItemStack ctor's int argument reading exactly one primitive)`, all)
+  if (s.readsBuffer) return abstain('replace-read-not-skipped', `the read-side redirect handler ${s.handler} is not a provable skip of the ${s.skips} — its body is not a constant return (${s.fields && s.fields.length ? `reads [${s.fields.join(',')}]` : 'no recognised primitive read; other ops present'}), so the read shape is not derivable`, all)
+  if (!r.countPin) return abstain('replace-non-count-target', `the read-side value injection ${r.injector} ${r.handler} (${r.desc}) does not pin the stack count (accepted pins: a @ModifyVariable STORE ordinal-0 (I)I handler, or a @ModifyArg on the ItemStack ctor's int argument, each reading exactly one buffer primitive)`, all)
   if (w.fields.join(',') !== r.fields.join(',')) return abstain('field-mismatch', `write side [${w.fields.join(',')}] vs read side [${r.fields.join(',')}]`, all)
   const fields = [{ name: 'itemCount', type: w.fields[0], source: 'count' }]
   return {
