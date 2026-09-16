@@ -427,6 +427,9 @@ function simulate (index, classInfo, method, state, opts = {}) {
   const push = (v) => stack.push(v)
 
   walkLinear(code, cp, (op, pc) => {
+    // HF51: the linear walk decides no branch — an `.optional()` met past a
+    // conditional is not a proven optional (see the registrar model)
+    if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) { opts.walk = opts.walk || {}; opts.walk.undecided = true }
     switch (op) {
       case 0x01: push(UNKNOWN); break // aconst_null
       case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
@@ -512,8 +515,8 @@ function simulate (index, classInfo, method, state, opts = {}) {
         push({ k: 'new', cls })
         break
       }
-      case 0xbd: pop(1); push({ k: 'arr' }); break // anewarray
-      case 0x53: pop(3); break // aastore
+      case 0xbd: { pop(1); push({ k: 'varr', items: [] }); break } // anewarray — HF51: a real array (reflection argument lists)
+      case 0x53: { const v = stack.pop(); const i = stack.pop(); const a = stack.pop(); if (a && a.k === 'varr' && i && i.k === 'int') a.items[i.v] = v; break } // aastore
       case 0xb6: case 0xb7: case 0xb9: { // invokevirtual/special/interface
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         if (!ref) break
@@ -560,10 +563,200 @@ function simulate (index, classInfo, method, state, opts = {}) {
   })
 }
 
+// HF51 — JDK / loader-value semantics shared by BOTH evaluators (the linear
+// walk and the branch-following one), so a registration shape reads the same
+// wherever it is met:
+//   keyed stores   Map.get/put/putIfAbsent/computeIfAbsent/containsKey,
+//                  Set.contains, guava Table.get/put/row, entrySet/keySet/
+//                  Map$Entry — by OBJECT IDENTITY on a universe-constructed
+//                  object (a registration object keyed by mod id is the
+//                  same object at the listener that iterates it); a key this
+//                  universe cannot decide makes the store opaque (never a
+//                  false "known null")
+//   reflection     Class.getConstructor(..).newInstance(..) / Class.newInstance
+//                  on a class constant constructs the object for real (the
+//                  registration-object factory and the reflective packet
+//                  instance both live here)
+//   payload type   CustomPacketPayload$Type.id() on a resolved Type, the
+//                  Identifier accessors on a resolved id
+//   equals         two constants of one kind decide
+//   active mod     ModLoadingContext.get().getActiveNamespace()/
+//                  getActiveContainer() = the mod root being walked
+let objSeq = 0
+function keyIdOf (v) {
+  if (!v) return null
+  if (v.k === 'str' || v.k === 'int' || v.k === 'cls' || v.k === 'resloc' || v.k === 'type') return `${v.k}:${v.v}`
+  if (v.k === 'enumconst') return `enum:${v.cls}.${v.name}`
+  if (v.k === 'obj') { if (!v.__id) v.__id = ++objSeq; return `obj:${v.__id}` }
+  return null
+}
+const STORE_OWNER = (owner) => typeof owner === 'string' && (owner.startsWith('java/util/') || owner.startsWith('com/google/common/collect/'))
+function storeUpsert (recv, keyId, key, value) {
+  recv.entries = recv.entries || []
+  if (keyId === null) { recv.opaqueKeys = true; recv.entries.push({ keyId: null, key: UNKNOWN, value }); return }
+  const e = recv.entries.find((x) => x.keyId === keyId)
+  if (e) e.value = value
+  else recv.entries.push({ keyId, key, value })
+}
+// Absence is KNOWN only on a store whose WRITER lives in this universe: the
+// class holding the field (heldBy, tagged at putfield / putstatic) mutates
+// it somewhere in its own code (a getfield/getstatic of the field and a
+// put/add on a collection type in one method). A store no local class ever
+// writes is filled by the loader (a mod-bus map the platform populates) and
+// reads UNKNOWN, so presence-gated paths (Optional.ifPresent) still run.
+const STORE_MUTATORS = new Set(['put', 'putIfAbsent', 'computeIfAbsent', 'putAll', 'add', 'addAll', 'offer', 'offerFirst', 'offerLast', 'push', 'addFirst', 'addLast'])
+function storeWriterKnown (index, state, recv) {
+  const h = recv && recv.heldBy
+  if (!h || !h.cls) return false
+  state.storeWriters = state.storeWriters || new Map()
+  const key = `${h.cls}.${h.field}`
+  if (state.storeWriters.has(key)) return state.storeWriters.get(key)
+  let writer = false
+  const info = index.get(h.cls)
+  for (const m of (info ? info.codes : [])) {
+    let touches = false; let mutates = false
+    try {
+      walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+        if (op === 0xb2 || op === 0xb4) {
+          const r = cpRef(cp, code.readUInt16BE(pc + 1))
+          if (r && r.name === h.field && (r.owner === h.cls || isSubclassOf(index, h.cls, r.owner))) touches = true
+        } else if ((op === 0xb6 || op === 0xb9) && touches) {
+          const r = cpRef(cp, code.readUInt16BE(pc + 1))
+          if (r && STORE_OWNER(r.owner) && STORE_MUTATORS.has(r.name)) mutates = true
+        }
+      })
+    } catch { /* an unreadable method gives no verdict */ }
+    if (touches && mutates) { writer = true; break }
+  }
+  state.storeWriters.set(key, writer)
+  return writer
+}
+function storeLookup (index, state, recv, keyId) {
+  if (keyId === null) return UNKNOWN
+  const e = (recv.entries || []).find((x) => x.keyId === keyId)
+  if (e) return e.value
+  if (recv.opaqueKeys) return UNKNOWN
+  const populatedHere = recv.entries && recv.entries.length > 0
+  return populatedHere || storeWriterKnown(index, state, recv) ? { k: 'null' } : UNKNOWN
+}
+function storeInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}) {
+  if (!recv || !STORE_OWNER(ref.owner)) return false
+  if (recv.k === 'entry') {
+    if (ref.name === 'getKey' && argVals.length === 0) { push(recv.key ?? UNKNOWN); return true }
+    if (ref.name === 'getValue' && argVals.length === 0) { push(recv.value ?? UNKNOWN); return true }
+    return false
+  }
+  if (recv.k === 'collection') {
+    if ((ref.name === 'values' || ref.name === 'stream') && argVals.length === 0) { push(recv); return true }
+    if (ref.name === 'size' && argVals.length === 0) { push(recv.opaqueItems ? UNKNOWN : vInt(recv.items.length)); return true }
+    if (ref.name === 'isEmpty' && argVals.length === 0) { push(recv.opaqueItems ? UNKNOWN : vInt(recv.items.length === 0 ? 1 : 0)); return true }
+    return false
+  }
+  if (recv.k !== 'obj') return false
+  const objArg = (n) => ref.desc === `(${'Ljava/lang/Object;'.repeat(n)})Ljava/lang/Object;`
+  if (ref.name === 'get' && objArg(1)) { push(storeLookup(index, state, recv, keyIdOf(argVals[0]))); return true }
+  if (ref.name === 'get' && objArg(2)) { const a = keyIdOf(argVals[0]); const b = keyIdOf(argVals[1]); push(storeLookup(index, state, recv, a === null || b === null ? null : `${a}|${b}`)); return true }
+  if (ref.name === 'getOrDefault' && ref.desc === '(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;') { const v = storeLookup(index, state, recv, keyIdOf(argVals[0])); push(v && v.k === 'null' ? argVals[1] : v); return true }
+  if (ref.name === 'put' && objArg(2)) { materializeElement(recv, argVals[1], false); storeUpsert(recv, keyIdOf(argVals[0]), argVals[0], argVals[1]); push(UNKNOWN); return true }
+  if (ref.name === 'put' && objArg(3)) {
+    const a = keyIdOf(argVals[0]); const b = keyIdOf(argVals[1])
+    materializeElement(recv, argVals[2], false)
+    storeUpsert(recv, a === null || b === null ? null : `${a}|${b}`, argVals[0], argVals[2])
+    push(UNKNOWN); return true
+  }
+  if (ref.name === 'putIfAbsent' && objArg(2)) {
+    const have = storeLookup(index, state, recv, keyIdOf(argVals[0]))
+    if (have && have.k !== 'null') { push(have); return true }
+    materializeElement(recv, argVals[1], false); storeUpsert(recv, keyIdOf(argVals[0]), argVals[0], argVals[1]); push({ k: 'null' }); return true
+  }
+  if (ref.name === 'computeIfAbsent' && ref.desc === '(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;') {
+    const have = storeLookup(index, state, recv, keyIdOf(argVals[0]))
+    if (have && have.k !== 'null') { push(have); return true }
+    let made = UNKNOWN
+    if (argVals[1] && argVals[1].k === 'lambda') invokeLambda(index, state, opts, argVals[1], [argVals[0]], (v) => { made = v }, hooks)
+    if (made) { materializeElement(recv, made, false); storeUpsert(recv, keyIdOf(argVals[0]), argVals[0], made) }
+    push(made ?? UNKNOWN); return true
+  }
+  if ((ref.name === 'containsKey' || ref.name === 'contains') && ref.desc === '(Ljava/lang/Object;)Z') {
+    const keyId = keyIdOf(argVals[0])
+    if (keyId === null) { push(UNKNOWN); return true }
+    const hit = (recv.entries || []).some((e) => e.keyId === keyId) || (recv.items || []).some((it) => keyIdOf(it) === keyId)
+    const populatedHere = (recv.entries && recv.entries.length > 0) || (recv.items && recv.items.length > 0)
+    push(hit ? vInt(1) : (recv.opaqueKeys || recv.opaqueItems || !(populatedHere || storeWriterKnown(index, state, recv)) ? UNKNOWN : vInt(0)))
+    return true
+  }
+  if (ref.name === 'row' && ref.desc === '(Ljava/lang/Object;)Ljava/util/Map;') {
+    const keyId = keyIdOf(argVals[0])
+    if (keyId === null || recv.opaqueKeys) { push(UNKNOWN); return true }
+    push({ k: 'collection', items: (recv.entries || []).filter((e) => typeof e.keyId === 'string' && e.keyId.startsWith(`${keyId}|`)).map((e) => e.value) })
+    return true
+  }
+  if (ref.name === 'entrySet' && ref.desc === '()Ljava/util/Set;') { push({ k: 'collection', items: (recv.entries || []).map((e) => ({ k: 'entry', key: e.key, value: e.value })), opaqueItems: !!recv.opaqueKeys }); return true }
+  if (ref.name === 'keySet' && ref.desc === '()Ljava/util/Set;') { push({ k: 'collection', items: (recv.entries || []).filter((e) => e.keyId !== null).map((e) => e.key), opaqueItems: !!recv.opaqueKeys }); return true }
+  if (ref.name === 'size' && ref.desc === '()I') { push(recv.opaqueItems || recv.opaqueKeys ? UNKNOWN : vInt((recv.items || []).length)); return true }
+  if (ref.name === 'isEmpty' && ref.desc === '()Z') { push(recv.opaqueItems || recv.opaqueKeys ? UNKNOWN : vInt((recv.items || []).length === 0 ? 1 : 0)); return true }
+  return false
+}
+// Reflective construction: the constructor is chosen by arity (and by the
+// Class[] parameter types when the site spelled them); ambiguity abstains
+// to UNKNOWN, never a guess.
+function constructReflected (index, state, cls, args, argTypes) {
+  const info = index.get(cls)
+  if (!info) return UNKNOWN
+  let ctors = info.codes.filter((c) => c.method === '<init>' && argSlots(c.desc).length === args.length)
+  if (argTypes && argTypes.every((t) => t && t.k === 'cls')) {
+    const want = `(${argTypes.map((t) => `L${t.v};`).join('')})V`
+    const exact = ctors.filter((c) => c.desc === want)
+    if (exact.length > 0) ctors = exact
+  }
+  if (ctors.length !== 1) return UNKNOWN
+  const obj = { k: 'obj', cls, ctorArgs: args, ctorDesc: ctors[0].desc, fields: {} }
+  bindCtorFields(index, state, obj)
+  return obj
+}
+function jdkModelInvoke (index, state, opts, ref, recv, argVals, push, kind) {
+  if (recv && recv.k === 'type' && ref.name === 'id' && ref.desc.startsWith('()L') && typeof recv.v === 'string') { push(vResloc(recv.v)); return true }
+  if (recv && recv.k === 'resloc' && ref.desc === '()Ljava/lang/String;') {
+    const [ns, ...rest] = String(recv.v).split(':')
+    if (ref.name === 'getNamespace') { push(vStr(ns)); return true }
+    if (ref.name === 'getPath') { push(vStr(rest.join(':'))); return true }
+    if (ref.name === 'toString') { push(vStr(recv.v)); return true }
+  }
+  if (ref.name === 'equals' && ref.desc === '(Ljava/lang/Object;)Z' && recv && argVals[0]) {
+    const a = recv; const b = argVals[0]
+    if (a.k === 'enumconst' && b.k === 'enumconst') { push(vInt(a.cls === b.cls && a.name === b.name ? 1 : 0)); return true }
+    if ((a.k === 'str' && b.k === 'str') || (a.k === 'resloc' && b.k === 'resloc') || (a.k === 'int' && b.k === 'int')) { push(vInt(a.v === b.v ? 1 : 0)); return true }
+    if (a.k === 'obj' && b.k === 'obj') { push(vInt(a === b ? 1 : 0)); return true }
+  }
+  if (ref.owner === CLASS_TYPE && (ref.name === 'getConstructor' || ref.name === 'getDeclaredConstructor') && ref.desc === '([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;' && recv && recv.k === 'cls') {
+    push({ k: 'ctorref', cls: recv.v, argTypes: argVals[0] && argVals[0].k === 'varr' ? argVals[0].items : null })
+    return true
+  }
+  if (ref.owner === 'java/lang/reflect/Constructor' && ref.name === 'newInstance' && ref.desc === '([Ljava/lang/Object;)Ljava/lang/Object;' && recv && recv.k === 'ctorref') {
+    const args = argVals[0] && argVals[0].k === 'varr' ? argVals[0].items.slice() : null
+    push(args ? constructReflected(index, state, recv.cls, args, recv.argTypes) : UNKNOWN)
+    return true
+  }
+  if (ref.owner === CLASS_TYPE && ref.name === 'newInstance' && ref.desc === '()Ljava/lang/Object;' && recv && recv.k === 'cls') {
+    push(constructReflected(index, state, recv.v, [], null))
+    return true
+  }
+  if (kind === 'static' && ref.owner === 'net/neoforged/fml/ModLoadingContext' && ref.name === 'get' && ref.desc === '()Lnet/neoforged/fml/ModLoadingContext;') { push({ k: 'modctx' }); return true }
+  if (recv && recv.k === 'modctx') {
+    if (ref.name === 'getActiveNamespace' && state.activeModId) { push(vStr(state.activeModId)); return true }
+    if (ref.name === 'getActiveContainer' && state.activeModId) { push({ k: 'modref', id: state.activeModId }); return true }
+    if (!returnsVoid(ref.desc)) push(UNKNOWN)
+    return true
+  }
+  return false
+}
+
 function handleInvoke (index, classInfo, state, opts, call) {
   const { ref, recv, argVals, push } = call
   const retVoid = returnsVoid(ref.desc)
   if (opts.onInvoke) opts.onInvoke(call, classInfo)
+  if (jdkModelInvoke(index, state, opts, ref, recv, argVals, push, call.kind)) return
+  if (storeInvoke(index, state, opts, ref, recv, argVals, push, {})) return
 
   // <init>: bind constructor args onto the aliased 'new' object
   if (ref.name === '<init>') {
@@ -617,7 +810,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
     // `.versioned(modVersion)` means — kept for the mods.toml fallback, which
     // must read THAT mod's jar, not the jar hosting the registration site
     // (a library-hosted site — ldtteam blockui — carries the library's version).
-    push({ k: 'registrar', version, namespace: version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam })
+    push({ k: 'registrar', version, namespace: version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'registrar-argument' })
     return
   }
   // HF37: the FML mod-list version idiom, resolved from the jar index —
@@ -645,10 +838,13 @@ function handleInvoke (index, classInfo, state, opts, call) {
     if (ref.name === 'versioned') {
       const version = asStr(argVals[0]) ?? resolveStringValue(index, argVals[0], state)
       const fromParam = version === null && !!argVals[0] && argVals[0].k === 'param'
-      push({ ...recv, version, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam })
+      push({ ...recv, version, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'versioned-argument', versioned: true })
       return
     }
-    if (ref.name === 'optional') { push({ ...recv, optional: true }); return }
+    // HF51: `.optional()` reached under a condition this walk could not decide
+    // (`if (isClientOnly(modId)) registrar = registrar.optional()`) is NOT a
+    // proven optional — the abstain downstream labels it unresolved-required.
+    if (ref.name === 'optional') { push({ ...recv, optional: true, optionalUndecided: !!(opts.walk && opts.walk.undecided) }); return }
     if (ref.name === 'executesOn') { push(recv); return }
     if (REGISTRATION_METHODS[ref.name]) {
       const typeId = resolveTypeValue(index, argVals[0], state) ??
@@ -785,7 +981,10 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // the (String)->Identifier helper's body only ever saw UNKNOWN here because
   // no branch simulated a String-returning helper. Same bounds as the
   // resloc helper chain (frame budget + re-entrancy guard); UNKNOWN on miss.
-  if (call.kind === 'static' && ref.desc.endsWith(')Ljava/lang/String;') && argVals.length > 0 && argVals.every((a) => a && (a.k === 'str' || a.k === 'int')) && index.get(ref.owner)) {
+  // HF51: a ZERO-argument String helper (`SecurityCraft.getVersion()` = the
+  // ModList version idiom + a "v" concat) is a constant too — it was never
+  // simulated, so `.versioned(getVersion())` fell to the mods.toml version.
+  if (call.kind === 'static' && ref.desc.endsWith(')Ljava/lang/String;') && argVals.every((a) => a && (a.k === 'str' || a.k === 'int')) && index.get(ref.owner)) {
     const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'str')
     push(chained && chained.k === 'str' ? chained : UNKNOWN)
     return
@@ -1324,7 +1523,16 @@ const AGG_TOTAL_STEP_BUDGET = 2400000
 // (class init included), THEN the loader fires RegisterPayloadHandlersEvent
 // at each listener the constructors registered. Its own step budget: a pack
 // whose constructors are heavy must not starve the entry passes below.
-const MOD_ROOT_STEP_BUDGET = 1600000
+// HF51 (A3): the mod-root walk's budget is PROPORTIONAL — one budget per
+// unit (a root's constructor, a listener) and a hard total cap — never one
+// shared pool a single heavy constructor drains before the first listener
+// runs (26.3 pack: 29 roots exhausted 1.6M steps in the constructor phase,
+// 0 of 7 listeners ran, and the loud line said "ran out after 7 listeners"
+// as if they had). A unit that blows its budget is abstained BY NAME (its
+// root / site) and the walk continues with the next unit.
+const MOD_ROOT_UNIT_STEP_BUDGET = 2000000
+const MOD_ROOT_TOTAL_STEP_BUDGET = 24000000
+const MOD_ROOT_STEP_BUDGET = MOD_ROOT_UNIT_STEP_BUDGET // the per-unit limit the evaluator sees
 const MOD_ROOT_MAX_LISTENERS = 256
 const PLATFORM_MODELED_TYPES = new Set([REGISTRAR_TYPE, EVENT_TYPE]) // modeled by handleInvoke, never inlined from the loader jar
 const COUNTER_TYPES = new Set(['java/util/concurrent/atomic/AtomicInteger', 'java/util/concurrent/atomic/AtomicLong'])
@@ -1681,6 +1889,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         return
       }
       // unknown condition: avoid an immediately-throwing arm
+      if (opts.walk) opts.walk.undecided = true // HF51: an `.optional()` met past here is not proven
       if (armThrowsImmediately(code, next, cp) && !armThrowsImmediately(code, target, cp)) jump(target)
       // else fall through
     }
@@ -1799,8 +2008,16 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       }
       case 0xb3: { // putstatic — keyed by the DECLARER, symmetric with getstatic (HF16-R rider)
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-        const val = stack.pop()
+        let val = stack.pop()
         if (ref && state.lazyClinit && opts.methodCtx && opts.methodCtx.name !== '<clinit>') lazyClassInit(index, state, staticFieldDeclarer(index, ref)) // JVMS §5.5: putstatic initializes the class
+        // HF51: a static COLLECTION / registry table a class initializer fills
+        // from a library factory (`HashBasedTable.create()`, `Tables.synchronizedTable`)
+        // is an object with IDENTITY — the keyed store every later get/put on
+        // it addresses — never an unknown that forgets what was put.
+        if (ref && !val && state.modRootPass && opts.methodCtx && opts.methodCtx.name === '<clinit>' && /^L(java\/util\/|com\/google\/common\/collect\/)[^;]+;$/.test(ref.desc) && index.get(staticFieldDeclarer(index, ref))) {
+          val = { k: 'obj', cls: ref.desc.slice(1, -1), fields: {}, fieldsBound: true, opaqueFactory: true }
+        }
+        if (ref && val && val.k === 'obj' && !val.heldBy) val.heldBy = { cls: staticFieldDeclarer(index, ref), field: ref.name } // HF51: the store's holder (its writer scan)
         if (ref && val && (opts.recordPutstatic || val.k === 'registrar' || state.modRootPass)) state.fieldValues[staticFieldKey(index, ref)] = val // HF43-r: under the mod-root walk every static store is JVM state (a channel built in a setup lambda is read back by getstatic); registrar statics: see the linear walk
         break
       }
@@ -1840,6 +2057,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
           const prev = obj.fields[ref.name]
           if (state.modRootPass && val && val.k === 'int' && prev && prev.k === 'int' && prev.v !== val.v) counterHolder(state, obj, ref.name).mutated = true
           obj.fields[ref.name] = val
+          if (val && val.k === 'obj' && !val.heldBy) val.heldBy = { cls: obj.cls, field: ref.name } // HF51: the store's holder (its writer scan)
         }
         break
       }
@@ -1849,8 +2067,8 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         push({ k: 'new', cls })
         break
       }
-      case 0xbd: pop(1); push({ k: 'arr' }); break
-      case 0x53: pop(3); break
+      case 0xbd: pop(1); push({ k: 'varr', items: [] }); break // HF51: a real array
+      case 0x53: { const v = stack.pop(); const i = stack.pop(); const a = stack.pop(); if (a && a.k === 'varr' && i && i.k === 'int') a.items[i.v] = v; break } // aastore
       case 0xb6: case 0xb7: case 0xb9: {
         const ref = cpRef(cp, code.readUInt16BE(pc + 1))
         if (!ref) break
@@ -1913,11 +2131,19 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         if (opts.onReturn) opts.onReturn(v)
         return
       }
-      case 0xac: case 0xad: case 0xae: case 0xaf: pop(); return // ireturn family
+      case 0xac: { const v = stack.pop(); if (opts.onReturn) opts.onReturn(v); return } // ireturn — HF51: a boolean / int result (Set.contains) reaches the caller's branch
+      case 0xad: case 0xae: case 0xaf: pop(); return // lreturn / freturn / dreturn
       case 0xb1: return // return
       case 0xbf: return // athrow: path ends
       case 0xc0: break // checkcast
-      case 0xc1: pop(); push(UNKNOWN); break // instanceof
+      case 0xc1: { // instanceof — HF51: decided for a universe-constructed object of an indexed class
+        const v = stack.pop()
+        const target = cpClassName(cp, code.readUInt16BE(pc + 1))
+        if (v && v.k === 'obj' && target && index.get(v.cls)) push(vInt(v.cls === target || isSubclassOf(index, v.cls, target) ? 1 : 0))
+        else if (v && v.k === 'null') push(vInt(0))
+        else push(UNKNOWN)
+        break
+      }
       case 0xa7: jump(pc + code.readInt16BE(pc + 1)); break // goto
       case 0xc8: jump(pc + code.readInt32BE(pc + 1)); break // goto_w
       case 0x99: { // ifeq
@@ -2005,6 +2231,7 @@ const MATERIALIZING_ADDS = { add: 'last', addLast: 'last', offer: 'last', offerL
 // more when a context climb inlines it.
 function materializeElement (recv, v, first) {
   recv.items = recv.items || []
+  if (!isConcreteish(v)) recv.opaqueItems = true // HF51: a contains()/size() on this store can no longer say "absent"
   const dup = !!v && v.k === 'lambda' && recv.items.some((it) => it && it.k === 'lambda' && it.impl.owner === v.impl.owner &&
     it.impl.name === v.impl.name && it.impl.desc === v.impl.desc && it.captured.length === v.captured.length && it.captured.every((c, i) => c === v.captured[i]))
   if (!isConcreteish(v) || dup || recv.items.length >= AGG_MAX_ITEMS) return
@@ -2051,6 +2278,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // offerLast append, addFirst/offerFirst/push prepend (a Deque used as a
   // stack replays LIFO), Map.put keeps the VALUE (a values() walk replays
   // them). One rule, one element cap, one identity dedupe.
+  if (storeInvoke(index, state, opts, ref, recv, argVals, push, hooks)) return true // HF51 keyed stores (shared with the linear walk)
   if (recv && recv.k === 'obj' && MATERIALIZING_ADDS[ref.name] && (ref.desc === '(Ljava/lang/Object;)Z' || ref.desc === '(Ljava/lang/Object;)V')) {
     materializeElement(recv, argVals[0], MATERIALIZING_ADDS[ref.name] === 'first')
     if (ref.desc.endsWith('Z')) push(vInt(1))
@@ -2837,6 +3065,8 @@ function resolveAggregatedRegistrations (index, state, pending) {
             id: r.id,
             version: r.registrar ? r.registrar.version : null,
             versionSource: 'aggregated',
+            versionFrom: r.registrar ? (r.registrar.versionFrom || null) : null,
+            versioned: r.registrar ? !!r.registrar.versioned : false,
             versionFromParam: r.registrar ? !!r.registrar.versionFromParam : false,
             namespace: r.registrar ? r.registrar.namespace : null,
             optional: r.registrar ? r.registrar.optional : false,
@@ -3134,7 +3364,7 @@ function deriveModPresenceGates (index, state) {
 // classloads or executes jar code.
 function deriveModRootRegistrations (index, state, record) {
   const diagnostics = state.diagnostics
-  const summary = { roots: 0, listeners: 0, registrations: 0, resolvedIds: 0, unresolvedIds: 0, droppedUnprovenOrder: 0, budgetExhausted: false, listenerSites: [], rows: [] }
+  const summary = { roots: 0, listeners: 0, registrations: 0, resolvedIds: 0, unresolvedIds: 0, droppedUnprovenOrder: 0, budgetExhausted: false, listenerSites: [], rows: [], steps: 0, unitBudget: MOD_ROOT_UNIT_STEP_BUDGET, totalBudget: MOD_ROOT_TOTAL_STEP_BUDGET, exhaustedUnits: [] }
   diagnostics.modRoot = summary
   const roots = []
   for (const name of state.allClassNames) {
@@ -3167,6 +3397,31 @@ function deriveModRootRegistrations (index, state, record) {
     onCall: (ref, kind, recv, argVals) => {
       if (trace) trace(ref, kind, recv, argVals)
       if (!LISTENER_REGISTRATION_METHODS.has(ref.name) || index.get(ref.owner)) return // the loader's bus API lives outside the jars
+      // HF51: `bus.register(object)` / `bus.register(Class)` subscribe every
+      // @SubscribeEvent method of that object (instance) or class (static)
+      // whose one parameter is a lifecycle event — a registration OBJECT
+      // created per mod by a library and handed to the mod's own bus.
+      if (ref.name === 'register' && argVals.length === 1 && argVals[0] && (argVals[0].k === 'obj' || argVals[0].k === 'cls')) {
+        const sub = argVals[0]
+        const cls = sub.k === 'obj' ? sub.cls : sub.v
+        const info = index.get(cls)
+        const raw = info ? index.rawBytes(cls) : null
+        if (!info || !raw || !raw.includes('SubscribeEvent')) return
+        for (const m of info.codes) {
+          const isStatic = (m.flags & 0x0008) !== 0
+          if (isStatic !== (sub.k === 'cls')) continue
+          const pm = String(m.desc).match(/^\(L([^;]+);\)V$/)
+          if (!pm) continue
+          const phase = LIFECYCLE_PHASES.indexOf(pm[1])
+          if (phase < 0) continue
+          const lam = { impl: { owner: cls, name: m.method, desc: m.desc, refKind: isStatic ? 6 : 5 }, captured: isStatic ? [] : [sub] }
+          const key = `${cls}.${m.method}${m.desc}#${isStatic ? 'static' : `obj:${keyIdOf(sub)}`}`
+          if (seenListeners.has(key) || listeners.length >= MOD_ROOT_MAX_LISTENERS) continue
+          seenListeners.add(key)
+          listeners.push({ lam, root: state.currentRoot, phase, order: listeners.length, subscriber: true })
+        }
+        return
+      }
       for (const a of argVals) {
         if (!a || a.k !== 'lambda') continue
         const phase = LIFECYCLE_PHASES.findIndex((ev) => String(a.impl.desc).includes(`L${ev};`))
@@ -3178,11 +3433,28 @@ function deriveModRootRegistrations (index, state, record) {
       }
     }
   }
+  // HF51 (A3): one budget per unit; the total is a hard cap. Returns false
+  // when the total is spent (the caller stops and abstains by name).
+  const beginUnit = () => {
+    state.aggSteps = 0
+    state.aggBudgetBlown = false
+    state.aggStepLimit = Math.max(0, Math.min(MOD_ROOT_UNIT_STEP_BUDGET, MOD_ROOT_TOTAL_STEP_BUDGET - summary.steps))
+    return state.aggStepLimit > 0
+  }
+  const endUnit = (what) => {
+    summary.steps += state.aggSteps || 0
+    if (!state.aggBudgetBlown) return
+    summary.exhaustedUnits.push(what)
+    diagnostics.abstains.push(`mod-root walk: ${what} exhausted its ${MOD_ROOT_UNIT_STEP_BUDGET}-step budget — registrations past that point are not derived here (the entry passes still run)`)
+    state.aggBudgetBlown = false
+  }
+  let totalSpent = false
   try {
     state.rootHooks = listenerHooks // static initializers run on first touch register listeners too
     for (const { info, modId } of roots) {
-      if (state.aggBudgetBlown) break
+      if (!beginUnit()) { totalSpent = true; break }
       state.currentRoot = `root:${modId}`
+      state.activeModId = modId // HF51: ModLoadingContext.get().getActiveNamespace() while this root loads
       try {
         lazyClassInit(index, state, info.className)
         for (const m of info.codes) {
@@ -3193,14 +3465,16 @@ function deriveModRootRegistrations (index, state, record) {
       } catch (err) {
         diagnostics.errors.push(`mod-root walk of ${info.className} failed (${err.message})`)
       }
+      endUnit(`the constructor of ${modId} (${info.className})`)
     }
     listeners.sort((a, b) => (a.phase - b.phase) || (a.order - b.order))
     summary.listeners = listeners.length
     summary.phases = LIFECYCLE_PHASES.map((ev, i) => ({ event: ev.split('/').pop(), listeners: listeners.filter((l) => l.phase === i).length }))
     for (let i = 0; i < listeners.length; i++) {
-      if (state.aggBudgetBlown) break
+      if (totalSpent || !beginUnit()) { totalSpent = true; break }
       const { lam, root } = listeners[i]
       state.currentRoot = `listener:${i}:${lam.impl.owner}.${lam.impl.name}`
+      state.activeModId = typeof root === 'string' && root.startsWith('root:') ? root.slice(5) : null
       const site = `${lam.impl.owner}.${lam.impl.name}`
       const opts = {
         onRegistration: (r) => {
@@ -3225,10 +3499,11 @@ function deriveModRootRegistrations (index, state, record) {
       if (resolvedHere) for (const k of state.rootVisited) state.modRootResolved.add(k)
       state.rootVisited = null
       summary.listenerSites.push(site)
+      endUnit(`listener ${site} (${root})`)
     }
-    if (state.aggBudgetBlown) {
+    if (totalSpent) {
       summary.budgetExhausted = true
-      diagnostics.abstains.push(`mod-root walk: the step budget ran out after ${summary.listeners} listener(s) — registrations past that point are not derived here (the entry passes still run)`)
+      diagnostics.abstains.push(`mod-root walk: the total step budget (${MOD_ROOT_TOTAL_STEP_BUDGET}) ran out after ${summary.listenerSites.length} of ${summary.listeners} listener(s) — registrations past that point are not derived here (the entry passes still run)`)
     }
   } finally {
     state.aggBudgetBlown = false
@@ -3240,6 +3515,7 @@ function deriveModRootRegistrations (index, state, record) {
     state.currentRoot = prev.root
     state.rootStack = prev.stack
     state.rootHooks = null
+    state.activeModId = null
   }
   // the order law: an id built from a counter that more than one root or
   // listener advanced is refused by name
@@ -3447,19 +3723,19 @@ function deriveNeoForgeComponents (jarPaths) {
   // an honest miss).
   const CONSTANT_VERSION_SOURCES = new Set(['constant', 'enum-registry', 'annotation-registry'])
   const droppedConflicts = new Set()
-  const add = (id, version, flow, optional, protocols, source, versionSource) => {
+  const add = (id, version, flow, optional, protocols, source, versionSource, versionFrom = null) => {
     for (const proto of protocols) {
       if (!byProtocol[proto]) continue
       if (droppedConflicts.has(`${proto}:${id}`)) continue
       const prev = byProtocol[proto].get(id)
       if (!prev) {
-        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource })
+        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource, versionFrom })
         continue
       }
       const prevConst = CONSTANT_VERSION_SOURCES.has(prev.versionSource)
       const newConst = CONSTANT_VERSION_SOURCES.has(versionSource)
       if (newConst && !prevConst) {
-        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource })
+        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource, versionFrom })
         continue
       }
       if (newConst && prevConst && (prev.version !== version || prev.flow !== flow || prev.optional !== optional)) {
@@ -3481,6 +3757,7 @@ function deriveNeoForgeComponents (jarPaths) {
     diagnostics.registrations++
     let version = reg.registrar ? reg.registrar.version : null
     let versionSource = reg.registrar ? reg.registrar.versionSource : 'unresolved'
+    let versionFrom = reg.registrar ? (reg.registrar.versionFrom || null) : null // HF51: the receipt names where the version came from
     const optional = reg.registrar ? reg.registrar.optional : false
     if (!reg.id) {
       // HF11: don't abstain yet — the AGGREGATOR pass may resolve this site
@@ -3510,13 +3787,14 @@ function deriveNeoForgeComponents (jarPaths) {
       if (metaVersion) {
         version = metaVersion
         versionSource = 'mods.toml'
+        versionFrom = reg.registrar && reg.registrar.versioned ? 'mods.toml-fallback (versioned argument unresolved)' : 'mods.toml-fallback (registrar unversioned)'
       } else {
         diagnostics.abstains.push(`${reg.id}: required channel with no derivable version — join will be refused by the server`)
         listenOnlyNamed.push(reg.id)
         continue
       }
     }
-    add(reg.id, version, reg.flow, optional, reg.protocols, reg.site, versionSource)
+    add(reg.id, version, reg.flow, optional, reg.protocols, reg.site, versionSource, versionFrom)
   }
   for (const c of enumComponents) {
     add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, 'enum-registry')
@@ -3529,6 +3807,7 @@ function deriveNeoForgeComponents (jarPaths) {
   for (const row of agg.rows) {
     let version = row.version
     let versionSource = row.versionSource
+    let versionFrom = row.versionFrom || null
     if (version === null) {
       const metaVersion = metaVersionFor(row.namespace, row.jar)
       if (row.optional) {
@@ -3545,25 +3824,33 @@ function deriveNeoForgeComponents (jarPaths) {
       if (metaVersion) {
         version = metaVersion
         versionSource = 'mods.toml'
+        versionFrom = row.versioned ? 'mods.toml-fallback (versioned argument unresolved)' : 'mods.toml-fallback (registrar unversioned)'
       } else {
         diagnostics.abstains.push(`${row.id}: aggregated required channel with no derivable version — join will be refused by the server`)
         listenOnlyNamed.push(row.id)
         continue
       }
     }
-    add(row.id, version, row.flow, row.optional, row.protocols, row.source, versionSource)
+    add(row.id, version, row.flow, row.optional, row.protocols, row.source, versionSource, versionFrom)
   }
   const abstainedSiteKeys = new Set()
   for (const reg of pendingAgg) {
     const sk = reg.methodCtx ? `${reg.methodCtx.cls}.${reg.methodCtx.name}${reg.methodCtx.desc}` : reg.site
     if (agg.resolvedSites.has(sk) && !agg.partialSites.has(sk)) continue
+    // HF51: a site the mod-root walk resolved (its registration object
+    // iterated with the real elements) is derived, not abstained — the entry
+    // pass met it with an empty registration object
+    if (state.modRootResolved && state.modRootResolved.has(sk)) { (diagnostics.modRootCovered = diagnostics.modRootCovered || []).push(sk); continue }
     if (abstainedSiteKeys.has(`${sk}#${reg.method}`)) continue
     abstainedSiteKeys.add(`${sk}#${reg.method}`)
-    const opt = reg.registrar && reg.registrar.optional
+    const opt = reg.registrar && reg.registrar.optional && !reg.registrar.optionalUndecided
+    const undecided = reg.registrar && reg.registrar.optional && reg.registrar.optionalUndecided
     const partially = agg.resolvedSites.has(sk) ? ' (partially aggregated — remainder unresolved)' : ''
     diagnostics.abstains.push(opt
       ? `${reg.site}: ${reg.method} optional registration with unresolved payload type id — safely unclaimed${partially}`
-      : `${reg.site}: ${reg.method} with unresolved payload type id${partially}`)
+      : undecided
+        ? `${reg.site}: ${reg.method} with unresolved payload type id — unresolved-required (its .optional() sits under a condition this walk could not decide, so it is NOT safely unclaimed; the server names it in its refusal)${partially}`
+        : `${reg.site}: ${reg.method} with unresolved payload type id${partially}`)
   }
   if (state.aggBudgetBlown) {
     diagnostics.abstains.push('aggregation budget exhausted — remaining aggregated registrations abstained')

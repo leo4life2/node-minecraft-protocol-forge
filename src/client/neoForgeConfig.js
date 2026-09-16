@@ -667,10 +667,30 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   // Built-ins and ids already derived never enter here.
   const learnedIds = new Set()
   const learnedRows = { configuration: [], play: [] }
+  // HF51: a lesson the server taught about a channel the jars DID derive
+  // (its version / flow) overrides the derived tuple on the retry — the
+  // server's own refusal is the primary source; the row is stamped
+  // learned-over-derived and the receipt lists it (the derived claim used
+  // to win forever: SecurityCraft's "v"-prefixed version, 47 channels, 5 kicks).
+  const learnedOverDerived = { configuration: [], play: [] }
   for (const protocol of ['configuration', 'play']) {
     for (const row of ((options.learnedComponents || {})[protocol] || [])) {
       if (!row || typeof row.id !== 'string' || !/^[a-z0-9_.-]+:[a-z0-9_./-]+$/.test(row.id) || row.id.startsWith('neoforge:') || row.id.startsWith('minecraft:')) continue
-      if (components[protocol].some((c) => c.id === row.id) || learnedIds.has(`${protocol}/${row.id}`)) continue
+      const derived = components[protocol].find((c) => c.id === row.id)
+      if (derived) {
+        const lFlow = row.flow === 'serverbound' || row.flow === 'clientbound' ? row.flow : null
+        const lVersion = typeof row.version === 'string' && row.version !== '' ? row.version : null
+        const changes = []
+        if (lVersion !== null && derived.version !== lVersion) { changes.push(`version ${derived.version} -> ${lVersion}`); derived.version = lVersion }
+        if (lFlow !== null && derived.flow !== lFlow) { changes.push(`flow ${derived.flow} -> ${lFlow}`); derived.flow = lFlow }
+        if (changes.length > 0) {
+          derived.learnedOverDerived = true
+          derived.source = `learned-over-derived:${row.learnedFrom || 'server'} (${changes.join(', ')}; was ${derived.source || 'derived'})`
+          learnedOverDerived[protocol].push({ id: row.id, changes })
+        }
+        continue
+      }
+      if (learnedIds.has(`${protocol}/${row.id}`)) continue
       const flow = row.flow === 'serverbound' || row.flow === 'clientbound' ? row.flow : null
       // optional unless the learner says otherwise: an optional client row
       // the server lacks is dropped by the negotiator, a required one fails it
@@ -723,6 +743,8 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     serverQuery: null, // HF43: the server's own component sets from its neoforge:register query
     serverDelta: null, // HF43: {missingOnClient, extraOnClient} — the rows the negotiator would fail on
     learned: { configuration: learnedRows.configuration.map((r) => r.id), play: learnedRows.play.map((r) => r.id) }, // HF43 receipt: claimed-as-learned ids
+    learnedOverDerived, // HF51 receipt: derived rows whose version / flow the server's own refusal corrected
+    claimed: { configuration: components.configuration.map((c) => ({ id: c.id, version: c.version, flow: c.flow, optional: c.optional, learned: !!c.learned })), play: components.play.map((c) => ({ id: c.id, version: c.version, flow: c.flow, optional: c.optional, learned: !!c.learned })) }, // HF51: the belt reads OUR side of every refusal row from here
     learnedDropped: {}, // HF43: payloads received on learned channels and dropped, by id
     setupFailed: null, // HF8: the server's per-channel failure reasons
     pongHold: null, // HF37: {id, heldMs, outcome} — the configuration pong held until the negotiation verdict

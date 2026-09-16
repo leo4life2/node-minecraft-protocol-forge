@@ -9,7 +9,7 @@ const { zipCentralEntries, zipEntryData } = require('../src/client/jarAnalysis')
 const { buildJar } = require('../test/helpers/synthJar')
 const [inPath, outPath, keepRe] = process.argv.slice(2)
 const KEEP = new RegExp(keepRe)
-const META = /(^|\/)(META-INF\/MANIFEST\.MF|fabric\.mod\.json|META-INF\/mods\.toml|META-INF\/neoforge\.mods\.toml|META-INF\/jarjar\/metadata\.json|[^/]*mixins?[^/]*\.json|[^/]*refmap[^/]*\.json)$/
+const META = /(^|\/)(META-INF\/MANIFEST\.MF|fabric\.mod\.json|META-INF\/mods\.toml|META-INF\/neoforge\.mods\.toml|META-INF\/jarjar\/metadata\.json|META-INF\/services\/[^/]+|[^/]*mixins?[^/]*\.json|[^/]*refmap[^/]*\.json)$/
 function trim (buf, depth) {
   const out = []
   for (const e of zipCentralEntries(buf)) {
