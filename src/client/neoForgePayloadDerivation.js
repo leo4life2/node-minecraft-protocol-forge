@@ -426,10 +426,17 @@ function simulate (index, classInfo, method, state, opts = {}) {
   const pop = (n = 1) => { for (let i = 0; i < n; i++) stack.pop() }
   const push = (v) => stack.push(v)
 
+  // HF51-rider: the undecided flag is PER METHOD — a callee inherits its
+  // caller's (a helper reached past a conditional is under it) but its own
+  // conditionals never leak back into the caller's later `.optional()` calls
+  // (a walk that throws leaves the flag raised — the safe direction: an
+  // `.optional()` is then unproven, never a false optional)
+  opts.walk = opts.walk || {}
+  const undecidedOnEntry = !!opts.walk.undecided
   walkLinear(code, cp, (op, pc) => {
     // HF51: the linear walk decides no branch — an `.optional()` met past a
     // conditional is not a proven optional (see the registrar model)
-    if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) { opts.walk = opts.walk || {}; opts.walk.undecided = true }
+    if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) opts.walk.undecided = true
     switch (op) {
       case 0x01: push(UNKNOWN); break // aconst_null
       case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
@@ -561,6 +568,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
       default: break
     }
   })
+  opts.walk.undecided = undecidedOnEntry
 }
 
 // HF51 — JDK / loader-value semantics shared by BOTH evaluators (the linear
@@ -693,9 +701,19 @@ function storeInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}) 
   }
   if (ref.name === 'entrySet' && ref.desc === '()Ljava/util/Set;') { push({ k: 'collection', items: (recv.entries || []).map((e) => ({ k: 'entry', key: e.key, value: e.value })), opaqueItems: !!recv.opaqueKeys }); return true }
   if (ref.name === 'keySet' && ref.desc === '()Ljava/util/Set;') { push({ k: 'collection', items: (recv.entries || []).filter((e) => e.keyId !== null).map((e) => e.key), opaqueItems: !!recv.opaqueKeys }); return true }
-  if (ref.name === 'size' && ref.desc === '()I') { push(recv.opaqueItems || recv.opaqueKeys ? UNKNOWN : vInt((recv.items || []).length)); return true }
-  if (ref.name === 'isEmpty' && ref.desc === '()Z') { push(recv.opaqueItems || recv.opaqueKeys ? UNKNOWN : vInt((recv.items || []).length === 0 ? 1 : 0)); return true }
+  if (ref.name === 'size' && ref.desc === '()I') { const n = storeCountOf(recv); push(n === null ? UNKNOWN : vInt(n)); return true }
+  if (ref.name === 'isEmpty' && ref.desc === '()Z') { const n = storeCountOf(recv); push(n === null ? UNKNOWN : vInt(n === 0 ? 1 : 0)); return true }
   return false
+}
+// HF51-rider: a KEYED store (filled by put) is its entries — an upsert under
+// one key is one element, so size()/values() read the entries, never the
+// per-put items; a collection is its items; an opaque store reads UNKNOWN
+function storeValuesOf (recv) {
+  return recv.entries && recv.entries.length > 0 ? recv.entries.map((e) => e.value) : (recv.items || [])
+}
+function storeCountOf (recv) {
+  if (recv.opaqueItems || recv.opaqueKeys) return null
+  return storeValuesOf(recv).length
 }
 // Reflective construction: the constructor is chosen by arity (and by the
 // Class[] parameter types when the site spelled them); ambiguity abstains
@@ -810,7 +828,10 @@ function handleInvoke (index, classInfo, state, opts, call) {
     // `.versioned(modVersion)` means — kept for the mods.toml fallback, which
     // must read THAT mod's jar, not the jar hosting the registration site
     // (a library-hosted site — ldtteam blockui — carries the library's version).
-    push({ k: 'registrar', version, namespace: version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'registrar-argument' })
+    // HF51-rider: the registrar(x) ARGUMENT is its version — an argument the
+    // walk cannot fold is an unresolved version, never an "unversioned"
+    // registrar (the receipt names which argument went unresolved)
+    push({ k: 'registrar', version, namespace: version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'registrar-argument', versioned: true })
     return
   }
   // HF37: the FML mod-list version idiom, resolved from the jar index —
@@ -1247,13 +1268,33 @@ function dispatchVirtual (index, ref, argVals, state, opts) {
   }
 }
 
+// HF51-rider: the mods.toml fallback receipt names WHICH version argument
+// the walk could not fold — `.versioned(x)` or `registrar(x)` — and says
+// "unversioned" only for a registrar that carries no version argument at all
+function fallbackReceiptOf (registrar) {
+  if (!registrar || !registrar.versioned) return 'mods.toml-fallback (registrar unversioned)'
+  return registrar.versionFrom === 'registrar-argument' ? 'mods.toml-fallback (registrar argument unresolved)' : 'mods.toml-fallback (versioned argument unresolved)'
+}
+
+// TRI-STATE (HF51-rider): true when `ancestor` is on the chain, false when the
+// whole chain up to java/lang/Object is indexed and never names it, UNKNOWN
+// (null) when a class on the chain is not indexed (a library base the jar
+// does not carry may implement the tested interface) or the depth bound cut
+// the climb. Boolean readers treat UNKNOWN as "not proven"; instanceof /
+// isAssignableFrom push UNKNOWN so the walk keeps the productive arm.
 function isSubclassOf (index, name, ancestor, depth = 0) {
-  if (depth > 8 || !name || name === 'java/lang/Object') return false
+  if (!name || name === 'java/lang/Object') return false
+  if (depth > 8) return UNKNOWN
   const info = index.get(name)
-  if (!info) return false
+  if (!info) return UNKNOWN
   if (info.superName === ancestor || (info.interfaces || []).includes(ancestor)) return true
-  return isSubclassOf(index, info.superName, ancestor, depth + 1) ||
-    (info.interfaces || []).some((i) => isSubclassOf(index, i, ancestor, depth + 1))
+  let unknown = false
+  for (const up of [info.superName, ...(info.interfaces || [])]) {
+    const r = isSubclassOf(index, up, ancestor, depth + 1)
+    if (r === true) return true
+    if (r === UNKNOWN) unknown = true
+  }
+  return unknown ? UNKNOWN : false
 }
 
 // WRAPPER shape: read which PayloadRegistrar method each boolean branch of a
@@ -1694,6 +1735,11 @@ function bindCtorFields (index, state, obj) {
 // before branching away? (Guard-clause idiom: `if (!valid(x)) throw ...` —
 // with the condition unknown, prefer the arm that does not immediately
 // throw, so validation guards don't silently kill the harvest.)
+// the arm's first instruction ends the path (a return) or jumps away (goto)
+function armLeavesAtOnce (code, startPc) {
+  const op = code[startPc]
+  return op === 0xb1 || op === 0xb0 || op === 0xac || op === 0xad || op === 0xae || op === 0xaf || op === 0xa7 || op === 0xc8
+}
 function armThrowsImmediately (code, startPc, cp) {
   let pc = startPc
   let steps = 0
@@ -1888,9 +1934,13 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         if (takeJump) jump(target)
         return
       }
-      // unknown condition: avoid an immediately-throwing arm
+      // unknown condition: avoid an immediately-throwing arm; HF51-rider: and
+      // an arm that leaves at once (a guard's `return` / a loop's `continue`
+      // goto) when the other arm does work — `if (!(e instanceof I)) continue;
+      // register(e)` walks the registration instead of skipping it silently
       if (opts.walk) opts.walk.undecided = true // HF51: an `.optional()` met past here is not proven
       if (armThrowsImmediately(code, next, cp) && !armThrowsImmediately(code, target, cp)) jump(target)
+      else if (armLeavesAtOnce(code, next) && !armLeavesAtOnce(code, target) && !armThrowsImmediately(code, target, cp)) jump(target)
       // else fall through
     }
 
@@ -2139,8 +2189,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       case 0xc1: { // instanceof — HF51: decided for a universe-constructed object of an indexed class
         const v = stack.pop()
         const target = cpClassName(cp, code.readUInt16BE(pc + 1))
-        if (v && v.k === 'obj' && target && index.get(v.cls)) push(vInt(v.cls === target || isSubclassOf(index, v.cls, target) ? 1 : 0))
-        else if (v && v.k === 'null') push(vInt(0))
+        if (v && v.k === 'obj' && target && index.get(v.cls)) { const r = v.cls === target ? true : isSubclassOf(index, v.cls, target); push(r === UNKNOWN ? UNKNOWN : vInt(r ? 1 : 0)) } else if (v && v.k === 'null') push(vInt(0))
         else push(UNKNOWN)
         break
       }
@@ -2290,7 +2339,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
     return true
   }
   if (recv && recv.k === 'obj' && ref.name === 'values' && ref.desc === '()Ljava/util/Collection;') {
-    push({ k: 'collection', items: recv.items || [] })
+    push({ k: 'collection', items: storeValuesOf(recv), opaqueItems: !!recv.opaqueItems })
     return true
   }
   // NOTE: every {k:'obj'} was CONSTRUCTED inside this evaluation universe
@@ -2300,7 +2349,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // aeronautics manager's empty clientbound set killed its serverbound
   // harvest exactly that way).
   if (recv && (recv.k === 'collection' || recv.k === 'obj') && ref.name === 'iterator' && argVals.length === 0) {
-    push({ k: 'iter', items: recv.items || [], i: 0 })
+    push({ k: 'iter', items: recv.k === 'obj' ? storeValuesOf(recv) : (recv.items || []), i: 0 })
     return true
   }
   if (recv && recv.k === 'iter') {
@@ -2314,7 +2363,8 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // Class.isAssignableFrom over the scanned hierarchy
   if (ref.owner === CLASS_TYPE && ref.name === 'isAssignableFrom' && recv && recv.k === 'cls' && argVals[0] && argVals[0].k === 'cls') {
     const a = recv.v; const b = argVals[0].v
-    push(vInt(a === b || isSubclassOf(index, b, a) ? 1 : 0))
+    const r = a === b ? true : isSubclassOf(index, b, a)
+    push(r === UNKNOWN ? UNKNOWN : vInt(r ? 1 : 0))
     return true
   }
   // Enum.ordinal() on a known constant
@@ -3787,7 +3837,7 @@ function deriveNeoForgeComponents (jarPaths) {
       if (metaVersion) {
         version = metaVersion
         versionSource = 'mods.toml'
-        versionFrom = reg.registrar && reg.registrar.versioned ? 'mods.toml-fallback (versioned argument unresolved)' : 'mods.toml-fallback (registrar unversioned)'
+        versionFrom = fallbackReceiptOf(reg.registrar)
       } else {
         diagnostics.abstains.push(`${reg.id}: required channel with no derivable version — join will be refused by the server`)
         listenOnlyNamed.push(reg.id)
@@ -3824,7 +3874,7 @@ function deriveNeoForgeComponents (jarPaths) {
       if (metaVersion) {
         version = metaVersion
         versionSource = 'mods.toml'
-        versionFrom = row.versioned ? 'mods.toml-fallback (versioned argument unresolved)' : 'mods.toml-fallback (registrar unversioned)'
+        versionFrom = fallbackReceiptOf(row)
       } else {
         diagnostics.abstains.push(`${row.id}: aggregated required channel with no derivable version — join will be refused by the server`)
         listenOnlyNamed.push(row.id)

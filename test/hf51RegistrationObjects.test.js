@@ -11,7 +11,8 @@
 //   * instanceof / equals / Set.contains decided on universe values
 //   * the version claim = the registrar(...) / versioned(...) ARGUMENT (a
 //     zero-argument String helper such as "v" + ModList version is a
-//     constant), the mods.toml version only when the registrar is unversioned
+//     constant), the mods.toml fallback when that argument is unresolved,
+//     receipted as such (registrar argument / versioned argument unresolved)
 //   * the walk's budget is per unit (root constructor / listener), named
 //     when exhausted, never a silent stop
 // Fixtures are the REAL jars of the 26.3 NeoForge pack trimmed to their
