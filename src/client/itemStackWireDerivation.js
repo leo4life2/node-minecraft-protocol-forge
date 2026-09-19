@@ -4,6 +4,7 @@ const fs = require('fs')
 const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, readAnnotationsAttr, decodeInstructions } = require('./jarAnalysis')
+const { nestedJarEntriesOf, MAX_NESTED_DEPTH } = require('./nestedJars') // HF53 rider: the one nested-jar rule
 
 // HF35 r2 — jar-derived ItemStack WIRE-SHAPE extensions.
 //
@@ -237,8 +238,9 @@ function scanClass (parsed, aliases, source) {
 function scanJar (buf, source, out, depth) {
   const entries = zipCentralEntries(buf)
   const aliases = refmapAliases(entries, buf)
+  const nested = new Set(nestedJarEntriesOf(buf, entries).map((n) => n.entry.name))
   for (const entry of entries) {
-    if (entry.name.endsWith('.jar') && entry.name.startsWith('META-INF/jars/') && depth < 2) {
+    if (nested.has(entry.name) && depth < MAX_NESTED_DEPTH) {
       try { scanJar(zipEntryData(buf, entry), { jarPath: source.jarPath, nested: entry.name }, out, depth + 1) } catch (err) { debug(`item-wire scan: unreadable nested jar ${entry.name} in ${source.jarPath} (${err.message})`) }
       continue
     }

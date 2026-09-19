@@ -162,8 +162,8 @@ function scanJarBuffer (buf, jarLabel, out, nesting) {
   const parsedByName = new Map()
   // HF53: nested jars through the one shared rule (this deriver reads one
   // level of nesting, as before)
-  forEachNestedJar(buf, entries, nesting, ({ entry, data }) => {
-    try { scanJarBuffer(data, `${jarLabel}!${entry.name.split('/').pop()}`, out, nesting + 1) } catch {}
+  forEachNestedJar(buf, entries, nesting, ({ data, relPath }) => {
+    try { scanJarBuffer(data, `${jarLabel}!${relPath}`, out, nesting + 1) } catch {}
   }, 1)
   for (const e of entries) {
     if (NESTED_JAR_RE.test(e.name)) continue

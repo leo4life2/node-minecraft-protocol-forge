@@ -5,6 +5,7 @@ const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, readAnnotationsAttr, decodeInstructions } = require('./jarAnalysis')
 const { WRITE_PRIMS, READ_PRIMS } = require('./itemStackWireDerivation')
+const { nestedJarEntriesOf } = require('./nestedJars') // HF53 rider: the one nested-jar rule
 
 // HF41 — jar-derived PACKET-BODY wire extensions (the HF35 item-stack walker
 // generalised to whole vanilla packets).
@@ -23,9 +24,9 @@ const { WRITE_PRIMS, READ_PRIMS } = require('./itemStackWireDerivation')
 //
 // This module DERIVES the extension from the local jars (mixin annotations +
 // injection bytecode read as class-file data; nothing is loaded or run):
-//   * every jar AND its nested jars are walked (Fabric jar-in-jar under
-//     META-INF/jars/ + fabric.mod.json "jars"; Forge JarJar under
-//     META-INF/jarjar/ + metadata.json);
+//   * every jar AND its nested jars are walked through the one nested-jar
+//     rule (nestedJars.js: both loader roots, subfolders included, plus the
+//     jars the loader manifests name);
 //   * the target law: an @Inject at RETURN/TAIL (or HEAD) of a vanilla
 //     packet class's read(FriendlyByteBuf) / write(FriendlyByteBuf) /
 //     <init>(FriendlyByteBuf); Mojang names on Forge, intermediary targets
@@ -134,18 +135,10 @@ function listJars (paths) {
 
 function entryText (buf, entry) { try { return zipEntryData(buf, entry).toString('utf8') } catch { return '' } }
 
-// Nested jar entries a loader would load: fabric.mod.json "jars" / Forge
-// META-INF/jarjar/metadata.json "jars", plus every *.jar under the two
-// conventional folders (a manifest that forgot one is still walked).
-function nestedJarEntries (entries, buf) {
-  const named = new Set()
-  const byName = new Map(entries.map((e) => [e.name, e]))
-  const fmj = byName.get('fabric.mod.json')
-  if (fmj) { try { for (const j of JSON.parse(entryText(buf, fmj)).jars || []) if (j && j.file) named.add(String(j.file)) } catch { /* not json */ } }
-  const jj = byName.get('META-INF/jarjar/metadata.json')
-  if (jj) { try { for (const j of JSON.parse(entryText(buf, jj)).jars || []) if (j && j.path) named.add(String(j.path)) } catch { /* not json */ } }
-  return entries.filter((e) => e.name.endsWith('.jar') && (named.has(e.name) || /^META-INF\/(?:jars|jarjar)\//.test(e.name)))
-}
+// Nested jar entries a loader would load: the one shared rule (nestedJars.js
+// — the loader manifests' rows plus every *.jar under the two roots, a
+// manifest that forgot one is still walked). This deriver keeps its own
+// nesting bound (MAX_NESTED_DEPTH) and its own unreadable-jar diagnostics.
 
 // The mod identity a jar declares (data for receipts and copy; never a switch).
 // Mod identity from the jar's OWN descriptors, loader-aware: a Forge/NeoForge
@@ -190,7 +183,7 @@ function collectUnits (jarPath) {
     }
     units.push(unit)
     if (depth >= MAX_NESTED_DEPTH) return
-    for (const e of nestedJarEntries(entries, buf)) {
+    for (const { entry: e } of nestedJarEntriesOf(buf, entries)) {
       try { walk(zipEntryData(buf, e), nested ? `${nested}!${e.name}` : e.name, depth + 1) } catch (err) { debug(`packet-wire scan: unreadable nested jar ${e.name} in ${jarPath} (${err.message})`) }
     }
   }

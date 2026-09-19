@@ -192,7 +192,7 @@ function indexJar (buf, source, facts, depth, nsNeedle, pathNeedle, hot) {
     debug(`login-ack scan: unreadable jar ${source.jarPath} (${err.message})`)
     return
   }
-  // HF53: nested jars (META-INF/jars/ AND META-INF/jarjar/) are indexed
+  // HF53: nested jars (both loader spellings, subfolders, manifest-named) are indexed
   // through the one shared rule; the chain remembers the nesting so the
   // receipt can name the parent that carried the owner (a JarJar-nested
   // login channel is corroborated by the PARENT jar the local folder holds).

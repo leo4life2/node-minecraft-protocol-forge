@@ -11,6 +11,7 @@ const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, javaStringHash } = require('./jarAnalysis')
 const { writeVarInt, writeString } = require('./loginBytes')
+const { nestedJarEntriesOf, MAX_NESTED_DEPTH } = require('./nestedJars') // HF53 rider: the one nested-jar rule
 
 // --- owo-lib login fingerprints (owo:handshake) ---
 //
@@ -49,7 +50,7 @@ const { writeVarInt, writeString } = require('./loginBytes')
 // source is the mod jars themselves. scanOwoFingerprints() below derives every
 // owo channel/controller fingerprint statically from the modpack's mods folder
 // (options.owoModsPaths or the MINEPAL_FORGE_MODS_DIR env var) - no per-pack
-// or per-mod constants. It reads each jar (plus META-INF/jars/*.jar nested
+// or per-mod constants. It reads each jar (plus its nested jars, both loader spellings,
 // mods), parses the classes that reference owo, and replays the registration
 // bytecode patterns javac emits for OwoNetChannel.create/createOptional,
 // registerServerbound/registerClientbound(Deferred) and
@@ -191,16 +192,17 @@ function scanOwoClass (parsed, facts) {
 }
 
 // Scans one jar buffer: classes referencing owo are parsed and scanned, every
-// class is indexed for lazy resolution, nested META-INF/jars/*.jar (Fabric
-// jar-in-jar) recurse.
+// class is indexed for lazy resolution, nested jars (the one shared rule:
+// both loader spellings, subfolders, manifest-named) recurse.
 function scanOwoJar (buf, source, facts, depth) {
   let entries
   try { entries = zipCentralEntries(buf) } catch (err) {
     debug(`owo scan: unreadable jar ${source.jarPath} (${err.message})`)
     return
   }
+  const nested = new Set(nestedJarEntriesOf(buf, entries).map((n) => n.entry.name))
   for (const entry of entries) {
-    if (entry.name.endsWith('.jar') && entry.name.startsWith('META-INF/jars/') && depth < 2) {
+    if (nested.has(entry.name) && depth < MAX_NESTED_DEPTH) {
       try {
         scanOwoJar(zipEntryData(buf, entry), { jarPath: source.jarPath, chain: [...source.chain, entry.name] }, facts, depth + 1)
       } catch (err) {

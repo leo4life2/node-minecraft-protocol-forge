@@ -74,6 +74,7 @@ const fs = require('fs')
 const path = require('path')
 const debug = require('../../debug')
 const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
+const { nestedJarEntriesOf } = require('./nestedJars') // HF53 rider: the one nested-jar rule
 const { deriveAnnotationRegistries } = require('./annotationRegistryDerivation')
 const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveContainerCarriedListenChannels, assembleListenOnly } = require('./listenOnlyDerivation')
 
@@ -120,10 +121,15 @@ function collectJarClasses (jarPath, out, diagnostics, jarLabel) {
     diagnostics.errors.push(`${jarLabel}: unreadable (${err.message})`)
     return
   }
-  collectBufferClasses(buf, out, diagnostics, jarLabel)
+  collectBufferClasses(buf, out, diagnostics, jarLabel, 0)
 }
 
-function collectBufferClasses (buf, out, diagnostics, jarLabel) {
+// HF53 rider: nested jars through the one shared rule; the nesting bound
+// (NESTED_JAR_DEPTH_BOUND) is this deriver's — a jar nested that deep is
+// still read, one deeper is not (the walk used to have no floor).
+const NESTED_JAR_DEPTH_BOUND = 3
+
+function collectBufferClasses (buf, out, diagnostics, jarLabel, depth) {
   let entries
   try {
     entries = zipCentralEntries(buf)
@@ -133,6 +139,7 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel) {
   }
   let modVersion = null
   const modIds = [] // HF37: the jar's declared mod ids (a version lookup key — ModList.getModContainerById("id") / event.registrar("id"))
+  const nested = new Map(nestedJarEntriesOf(buf, entries).map((n) => [n.entry.name, n]))
   for (const e of entries) {
     if (e.name === 'META-INF/neoforge.mods.toml' || e.name === 'META-INF/mods.toml') {
       try {
@@ -181,9 +188,10 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel) {
           out.services.set(iface, list.concat(impls))
         }
       } catch { /* tolerated: services are an optional resolution aid */ }
-    } else if ((e.name.startsWith('META-INF/jars/') || e.name.startsWith('META-INF/jarjar/')) && e.name.endsWith('.jar')) {
+    } else if (nested.has(e.name)) {
+      if (depth >= NESTED_JAR_DEPTH_BOUND) continue
       try {
-        collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${e.name.split('/').pop()}`)
+        collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${nested.get(e.name).relPath}`, depth + 1)
       } catch (err) {
         diagnostics.errors.push(`${jarLabel}!${e.name}: nested jar unreadable (${err.message})`)
       }
