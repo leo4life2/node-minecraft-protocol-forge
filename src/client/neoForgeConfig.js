@@ -654,10 +654,14 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   // source stamp on the row) or the embedder's stamp (contract-cache /
   // acquired-jar); receipts and copy read it, the ack itself is the same.
   const contractSources = new Map()
+  // HF55-R MED-2: the host key a remembered (contract-cache) row was proven
+  // for — the refusal receipt names it.
+  const contractHosts = new Map()
   for (const row of options.ackContracts || []) {
     if (row && typeof row.trigger === 'string' && typeof row.ack === 'string') {
       ackContracts.set(row.trigger, row.ack)
       if (typeof row.source === 'string' && row.source) contractSources.set(row.trigger, row.source)
+      if (typeof row.host === 'string' && row.host) contractHosts.set(row.trigger, row.host)
     }
   }
   const proveAckContract = typeof options.proveAckContract === 'function' ? options.proveAckContract : null
@@ -786,6 +790,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     acked: [], // HF11: {trigger, ack} rows actually answered this phase (+ source when not the local jar — HF55)
     proofs: {}, // HF55: per-channel acquire-to-prove receipts {status, namespace, source, owner, reason, ms, payloads, parked}
     unprovable: [], // HF55: the channels the phase parked on with no provable contract (the honest stop's facts)
+    cacheRefused: [], // HF55-R: remembered (contract-cache) rows refused at the trigger because this server did not declare their ack {trigger, ack, host, reason}
     holds: [], // HF55: {channel, since, until} — how long each proof held the phase
     configInboundSeq: 0, // HF55: non-keep-alive configuration packets seen (the parked read)
     unclaimedBuiltins,
@@ -829,6 +834,29 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   // HF11 / HF55 — ONE answer path for a proven blocking-task trigger: the
   // proven empty ack, receipted with its source (a local-jar row keeps the
   // exact pre-HF55 shape).
+  // HF55-R MED-2 — the cache re-check at the trigger: a remembered
+  // (contract-cache) row is answered only when its ack channel is among the
+  // ids this server declared in its own query (the same serverDeclaredIds()
+  // read settleProof applies to a fresh row). A host that swapped the mod
+  // build so the ack differs gets the row REFUSED (receipted with the host
+  // and the channel) and the trigger falls to proveOrPark exactly as if no
+  // row existed. An unknown query (none / empty) has nothing to check
+  // against: the row answers as before.
+  const refuseStaleCachedRow = (channel) => {
+    if (contractSources.get(channel) !== 'contract-cache') return false
+    const declared = serverDeclaredIds()
+    const ack = ackContracts.get(channel)
+    if (!declared || declared.has(ack)) return false
+    const host = contractHosts.get(channel) || null
+    ackContracts.delete(channel)
+    contractSources.delete(channel)
+    contractHosts.delete(channel)
+    const row = { trigger: channel, ack, host, reason: 'ack-not-declared' }
+    state.cacheRefused.push(row)
+    debug(`neoforge config: the contract remembered for ${host || 'this host'} on ${channel} names ack ${ack}, a channel this server did not declare — the remembered row is refused, proving afresh`)
+    client.emit('neoForgeConfigCacheRefused', { ...row })
+    return true
+  }
   const answerProvenTrigger = (channel, bytes) => {
     const ack = ackContracts.get(channel)
     const source = contractSources.get(channel) || null
@@ -845,10 +873,17 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     if (meta.state !== 'configuration' || meta.name === 'keep_alive' || meta.name === 'ping') return
     state.configInboundSeq++
   })
+  // The channels THIS server declared, in precedence: its own network query
+  // when it lists any; else (HF55-R — a 1.20.5+ NeoForge server's query is
+  // usually EMPTY, nf211 live) the channels the server itself NAMED through
+  // its refusals (the learn belt's rows, HF43: a named_missing refusal is
+  // the server's own declaration of the ids it requires); null when neither
+  // names anything (nothing to corroborate against).
   const serverDeclaredIds = () => {
     const q = state.serverQuery
-    if (!q || !Array.isArray(q.configuration) || q.configuration.length === 0) return null // unknown query: nothing to corroborate against
-    return new Set(q.configuration.map((r) => r && r.id).filter((id) => typeof id === 'string'))
+    if (q && Array.isArray(q.configuration) && q.configuration.length > 0) return new Set(q.configuration.map((r) => r && r.id).filter((id) => typeof id === 'string'))
+    if (learnedChannelIds.size > 0) return new Set(learnedChannelIds)
+    return null
   }
   const startHold = (channel) => {
     const hold = { channel, since: Date.now(), until: null }
@@ -868,7 +903,11 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     const receipt = state.proofs[channel]
     receipt.ms = Date.now() - receipt.startedAt
     receipt.source = (result && typeof result.source === 'string') ? result.source : null
-    receipt.owner = (result && result.owner && typeof result.owner === 'object') ? { modId: result.owner.modId || null, version: result.owner.version || null } : null
+    // HF55-R MED-1: the owner carries HOW it was corroborated (census /
+    // server-query / channel-only) so the fact and the copy read it.
+    receipt.owner = (result && result.owner && typeof result.owner === 'object')
+      ? { modId: result.owner.modId || null, version: result.owner.version || null, ...(typeof result.owner.corroboration === 'string' && result.owner.corroboration ? { corroboration: result.owner.corroboration } : {}) }
+      : null
     const rows = (result && Array.isArray(result.contracts) ? result.contracts : []).filter((r) => r && typeof r.trigger === 'string' && typeof r.ack === 'string')
     const declared = serverDeclaredIds()
     const uncorroborated = []
@@ -1242,7 +1281,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           // by its own finish ack, never a blind empty one. HF55: a contract
           // proven this phase or cached from an earlier join answers a
           // LEARNED channel too, so this sits BEFORE the learned drop.
-          if (typeof channel === 'string' && ackContracts.has(channel)) {
+          if (typeof channel === 'string' && ackContracts.has(channel) && !refuseStaleCachedRow(channel)) {
             answerProvenTrigger(channel, data.length)
             break
           }

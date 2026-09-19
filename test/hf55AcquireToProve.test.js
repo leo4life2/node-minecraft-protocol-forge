@@ -184,7 +184,7 @@ describe('HF55 acquire-to-prove: the blocking-task contract from an obtained jar
     let asked = 0
     installNeoForgeConfigNegotiation(c, {
       components: { configuration: [], play: [] },
-      learnedComponents: { configuration: [{ id: TRIGGER, version: '1.0.5', flow: 'clientbound', optional: false, learnedFrom: 'named_missing' }, { id: 'tacz:other_task', version: '1.0.5', flow: 'clientbound', optional: false, learnedFrom: 'named_missing' }], play: [] },
+      learnedComponents: { configuration: [{ id: TRIGGER, version: '1.0.5', flow: 'clientbound', optional: false, learnedFrom: 'named_missing' }, { id: 'tacz:other_task', version: '1.0.5', flow: 'clientbound', optional: false, learnedFrom: 'named_missing' }, { id: ACK, version: '1.0.5', flow: 'serverbound', optional: false, learnedFrom: 'named_missing' }, { id: 'tacz:other_ack', version: '1.0.5', flow: 'serverbound', optional: false, learnedFrom: 'named_missing' }], play: [] }, // HF55-R: the server names its serverbound acks too (nf211 live: configuration:tacz:acknowledge@1.0.5 in the named list)
       pongHoldMs: 20,
       proveAckContract: async () => { asked++; await sleep(20); return { contracts: [{ trigger: TRIGGER, ack: ACK }, { trigger: 'tacz:other_task', ack: 'tacz:other_ack' }], source: 'contract-cache' } }
     })
@@ -201,7 +201,7 @@ describe('HF55 acquire-to-prove: the blocking-task contract from an obtained jar
     const c = makeClient()
     const events = []
     c.on('neoForgeConfigAck', (e) => events.push(e))
-    installNeoForgeConfigNegotiation(c, { components: { configuration: [{ id: TRIGGER, version: '1.0.5', flow: 'clientbound', optional: false }], play: [] }, ackContracts: [{ trigger: TRIGGER, ack: ACK }, { trigger: 'x:cached', ack: 'x:cached_ack', source: 'contract-cache' }], learnedComponents: { configuration: [{ id: 'x:cached', version: '', flow: null, optional: true, learnedFrom: 'named_missing' }, { id: 'x:plain', version: '', flow: null, optional: true, learnedFrom: 'named_missing' }], play: [] }, pongHoldMs: 20 })
+    installNeoForgeConfigNegotiation(c, { components: { configuration: [{ id: TRIGGER, version: '1.0.5', flow: 'clientbound', optional: false }], play: [] }, ackContracts: [{ trigger: TRIGGER, ack: ACK }, { trigger: 'x:cached', ack: 'x:cached_ack', source: 'contract-cache' }], learnedComponents: { configuration: [{ id: 'x:cached', version: '', flow: null, optional: true, learnedFrom: 'named_missing' }, { id: 'x:cached_ack', version: '', flow: null, optional: true, learnedFrom: 'named_missing' }, { id: 'x:plain', version: '', flow: null, optional: true, learnedFrom: 'named_missing' }], play: [] }, pongHoldMs: 20 })
     c.emit('packet', { channel: TRIGGER, data: Buffer.alloc(3) }, meta)
     assert.deepStrictEqual(events, [{ trigger: TRIGGER, ack: ACK }])
     assert.deepStrictEqual(c.neoForgeConfig.acked, [{ trigger: TRIGGER, ack: ACK }])
@@ -212,5 +212,51 @@ describe('HF55 acquire-to-prove: the blocking-task contract from an obtained jar
     assert.strictEqual(c.neoForgeConfig.learnedDropped['x:plain'], 1)
     assert.deepStrictEqual(c.neoForgeConfig.proofs, {}, 'no prover wired: no proof receipt, the pre-HF55 posture')
     assert.strictEqual(c.writes.filter((w) => w.name === 'custom_payload').length, 2)
+  })
+  it('P9 (HF55-R MED-2) a remembered row whose ack this server did not declare is refused at the trigger — receipted with host + channel, no ack sent, proveOrPark reached; a declared one answers as before; the fact carries the owner corroboration', async () => {
+    const c = makeClient()
+    const refused = []
+    c.on('neoForgeConfigCacheRefused', (e) => refused.push(e))
+    const asked = []
+    installNeoForgeConfigNegotiation(c, {
+      components: { configuration: [], play: [] },
+      learnedComponents: learnedTrigger,
+      pongHoldMs: 20,
+      ackContracts: [{ trigger: TRIGGER, ack: 'tacz:stale_ack', source: 'contract-cache', host: 'rig:swap' }, { trigger: 'tacz:other_trigger', ack: ACK, source: 'contract-cache', host: 'rig:swap' }],
+      proveAckContract: async (req) => { asked.push(req); await sleep(20); return { contracts: proven().ackContracts, source: 'acquired-jar', owner: { modId: 'tacz', version: null, corroboration: 'channel-only' } } }
+    })
+    c.emit('packet', { channel: 'neoforge:register', data: serverQueryWith([TRIGGER, ACK, 'tacz:other_trigger']) }, meta)
+    c.emit('packet', { channel: TRIGGER, data: Buffer.alloc(5) }, meta)
+    assert.strictEqual(c.writes.filter((w) => w.name === 'custom_payload' && w.params.channel === 'tacz:stale_ack').length, 0, 'the remembered ack is never sent')
+    assert.deepStrictEqual(refused, [{ trigger: TRIGGER, ack: 'tacz:stale_ack', host: 'rig:swap', reason: 'ack-not-declared' }])
+    assert.deepStrictEqual(c.neoForgeConfig.cacheRefused, refused)
+    assert.strictEqual(asked.length, 1, 'proveOrPark reached exactly as if no row existed')
+    assert.strictEqual(c.neoForgeConfig.proofs[TRIGGER].status, 'pending')
+    assert.strictEqual(c.neoForgeConfig.learnedDropped[TRIGGER], 1)
+    // a remembered row whose ack the server DID declare answers as before
+    c.emit('packet', { channel: 'tacz:other_trigger', data: Buffer.alloc(5) }, meta)
+    assert.deepStrictEqual(c.neoForgeConfig.acked, [{ trigger: 'tacz:other_trigger', ack: ACK, source: 'contract-cache' }])
+    assert.strictEqual(refused.length, 1)
+    await sleep(60)
+    assert.strictEqual(c.neoForgeConfig.proofs[TRIGGER].status, 'proven')
+    assert.deepStrictEqual(c.neoForgeConfig.proofs[TRIGGER].owner, { modId: 'tacz', version: null, corroboration: 'channel-only' })
+    assert.deepStrictEqual(c.neoForgeConfig.acked[1], { trigger: TRIGGER, ack: ACK, source: 'acquired-jar' })
+    // an UNKNOWN query (none) has nothing to check against: the remembered row answers as before (P8's posture)
+    const u = makeClient()
+    installNeoForgeConfigNegotiation(u, { components: { configuration: [], play: [] }, ackContracts: [{ trigger: 'x:cached', ack: 'x:cached_ack', source: 'contract-cache', host: 'rig:u' }] })
+    u.emit('packet', { channel: 'x:cached', data: Buffer.alloc(3) }, meta)
+    assert.deepStrictEqual(u.neoForgeConfig.acked, [{ trigger: 'x:cached', ack: 'x:cached_ack', source: 'contract-cache' }])
+    assert.deepStrictEqual(u.neoForgeConfig.cacheRefused, [])
+    // the live wire (nf211): the server's query is EMPTY and its declaration is the rows it NAMED through refusals (the learn belt) — a stale remembered ack is refused against THOSE, a named one answers
+    const named = { configuration: [{ id: TRIGGER, version: '1.0.5', flow: 'clientbound', optional: false, learnedFrom: 'named_missing' }, { id: ACK, version: '1.0.5', flow: 'serverbound', optional: false, learnedFrom: 'named_missing' }, { id: 'tacz:other_trigger', version: '1.0.5', flow: 'clientbound', optional: false, learnedFrom: 'named_missing' }], play: [] }
+    const l = makeClient()
+    const askedL = []
+    installNeoForgeConfigNegotiation(l, { components: { configuration: [], play: [] }, learnedComponents: named, pongHoldMs: 20, ackContracts: [{ trigger: TRIGGER, ack: 'tacz:stale_ack', source: 'contract-cache', host: 'rig:swap' }, { trigger: 'tacz:other_trigger', ack: ACK, source: 'contract-cache', host: 'rig:swap' }], proveAckContract: async (req) => { askedL.push(req); return { contracts: [], source: null, owner: null, reason: 'x' } } })
+    l.emit('packet', { channel: 'neoforge:register', data: encodeNetworkQuery({ configuration: [], play: [] }) }, meta)
+    l.emit('packet', { channel: TRIGGER, data: Buffer.alloc(5) }, meta)
+    l.emit('packet', { channel: 'tacz:other_trigger', data: Buffer.alloc(5) }, meta)
+    assert.deepStrictEqual(l.neoForgeConfig.cacheRefused, [{ trigger: TRIGGER, ack: 'tacz:stale_ack', host: 'rig:swap', reason: 'ack-not-declared' }])
+    assert.strictEqual(askedL.length, 1)
+    assert.deepStrictEqual(l.neoForgeConfig.acked, [{ trigger: 'tacz:other_trigger', ack: ACK, source: 'contract-cache' }])
   })
 })
