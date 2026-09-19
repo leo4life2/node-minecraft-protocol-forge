@@ -4,6 +4,7 @@ const fs = require('fs')
 const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions, resolveLambdaImpl } = require('./jarAnalysis')
+const { NESTED_JAR_RE, forEachNestedJar } = require('./nestedJars')
 
 // HF45 — derives THIS server's command argument-type parser table for the
 // ids the vanilla schema does not know, from two truths and nothing else:
@@ -159,11 +160,13 @@ function scanJarBuffer (buf, jarLabel, out, nesting) {
   const jar = { jar: jarLabel, modIds: [...modIds], classes: 0, infos: new Map(), sites: [] }
   out.jars.push(jar)
   const parsedByName = new Map()
+  // HF53: nested jars through the one shared rule (this deriver reads one
+  // level of nesting, as before)
+  forEachNestedJar(buf, entries, nesting, ({ entry, data }) => {
+    try { scanJarBuffer(data, `${jarLabel}!${entry.name.split('/').pop()}`, out, nesting + 1) } catch {}
+  }, 1)
   for (const e of entries) {
-    if (nesting === 0 && /^META-INF\/(jars|jarjar)\/.+\.jar$/.test(e.name)) {
-      try { scanJarBuffer(zipEntryData(buf, e), `${jarLabel}!${e.name.split('/').pop()}`, out, 1) } catch {}
-      continue
-    }
+    if (NESTED_JAR_RE.test(e.name)) continue
     if (!e.name.endsWith('.class')) continue
     let data
     try { data = zipEntryData(buf, e) } catch { continue }

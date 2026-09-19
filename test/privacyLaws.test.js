@@ -25,7 +25,7 @@ const dgram = require('dgram')
 
 const { buildClass, buildJar } = require('./helpers/synthJar')
 
-const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js',
+const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js', 'nestedJars.js',
   'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js',
   'loginReplyBoundary.js', 'annotationRegistryDerivation.js', 'listenOnlyDerivation.js',
   // HF38: the login-window ledger/budget (requires only debug + the reply boundary, lazily)
@@ -325,6 +325,8 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
       // bytecode-walk parser (requires only ../../debug + ./jarAnalysis) —
       // audited by these laws itself via MODULES above
       const allowed = new Set(['fs', 'path', 'zlib', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation',
+        // HF53: the one nested-jar rule (zip entry reads only)
+        './nestedJars',
         './loginReplyBoundary', './annotationRegistryDerivation', './listenOnlyDerivation', './data/blockShapeTables.json',
         // D3: loader-spawn codec derivation (jar bytes → codec spec) + its decoder + the loader-jar locator (local fs walk)
         './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator',

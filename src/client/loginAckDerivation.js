@@ -48,6 +48,7 @@ const fs = require('fs')
 const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, cpUtf8, cpRef } = require('./jarAnalysis')
+const { NESTED_JAR_RE, forEachNestedJar } = require('./nestedJars')
 
 // HF38 MED-3 — THE DERIVATION VERSION. Every embedder that persists this
 // module's verdicts (exportLoginAssessments -> a cache keyed on the jar
@@ -191,15 +192,15 @@ function indexJar (buf, source, facts, depth, nsNeedle, pathNeedle, hot) {
     debug(`login-ack scan: unreadable jar ${source.jarPath} (${err.message})`)
     return
   }
+  // HF53: nested jars (META-INF/jars/ AND META-INF/jarjar/) are indexed
+  // through the one shared rule; the chain remembers the nesting so the
+  // receipt can name the parent that carried the owner (a JarJar-nested
+  // login channel is corroborated by the PARENT jar the local folder holds).
+  forEachNestedJar(buf, entries, depth, ({ entry, data, artifact }) => {
+    indexJar(data, { jarPath: source.jarPath, chain: [...source.chain, entry.name], artifacts: [...(source.artifacts || []), artifact] }, facts, depth + 1, nsNeedle, pathNeedle, hot)
+  })
   for (const entry of entries) {
-    if (entry.name.endsWith('.jar') && entry.name.startsWith('META-INF/jars/') && depth < 2) {
-      try {
-        indexJar(zipEntryData(buf, entry), { jarPath: source.jarPath, chain: [...source.chain, entry.name] }, facts, depth + 1, nsNeedle, pathNeedle, hot)
-      } catch (err) {
-        debug(`login-ack scan: unreadable nested jar ${entry.name} (${err.message})`)
-      }
-      continue
-    }
+    if (NESTED_JAR_RE.test(entry.name)) continue
     if (!entry.name.endsWith('.class') || entry.name.startsWith('META-INF/')) continue
     const className = entry.name.slice(0, -6)
     if (!facts.classIndex.has(className)) facts.classIndex.set(className, { ...source, entryName: entry.name })
@@ -1021,7 +1022,7 @@ function assessUncached (channelId, paths) {
     }
     for (const jar of jars) {
       try {
-        indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [] }, facts, 0, nsNeedle, pathNeedle, hot)
+        indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [], artifacts: [] }, facts, 0, nsNeedle, pathNeedle, hot)
       } catch (err) {
         debug(`login-ack scan: skipping ${jar} (${err.message})`)
       }
@@ -1052,7 +1053,8 @@ function assessUncached (channelId, paths) {
     // An index above 255 cannot be represented distinctly on the wire (Forge
     // itself truncates), so it is unprovable — abstain into 'underivable'.
     if (r && r.index != null && r.index >= 0 && r.index <= 255) {
-      return { verdict: 'ack', ...r, reply: Buffer.from([r.index]) }
+      const where = corroborationOf(facts, creation.className)
+      return { verdict: 'ack', ...r, ...where, evidence: `${r.evidence}${where.nestedChain.length ? ` (${where.corroboration}: ${where.jarName} -> ${where.nestedArtifact})` : ''}`, reply: Buffer.from([r.index]) }
     }
   }
 
@@ -1072,11 +1074,30 @@ function assessUncached (channelId, paths) {
       }
     }
   }
+  const where = corroborationOf(facts, channelCreations[0].className)
   return {
     verdict: 'underivable',
     reason: substantive ? 'substantive-reply' : 'no-derivable-ack',
     msgClass: substantive || undefined,
-    evidence: `channel is created by a local jar (${channelCreations[0].className}) but no provable login-ack reply exists`
+    ...where,
+    evidence: `channel is created by a local jar (${channelCreations[0].className}${where.nestedChain.length ? `, nested in ${where.jarName} -> ${where.nestedArtifact}` : ''}) but no provable login-ack reply exists`
+  }
+}
+
+// HF53: WHERE the channel's creating class was read — the receipt names the
+// jar and, for a nested owner, the parent -> nested artifact chain, so an
+// answer derived through JarJar nesting is receipted as
+// 'corroborated-by-nested-jar' (the local folder holds the parent, not the
+// owner) and a stripped parent shows the absence honestly.
+function corroborationOf (facts, className) {
+  const loc = facts.classIndex.get(className) || null
+  const chain = loc && Array.isArray(loc.chain) ? loc.chain : []
+  const artifacts = loc && Array.isArray(loc.artifacts) ? loc.artifacts : []
+  return {
+    jarName: loc ? path.basename(loc.jarPath) : null,
+    nestedChain: chain,
+    nestedArtifact: artifacts.length ? artifacts[artifacts.length - 1] : null,
+    corroboration: chain.length ? 'corroborated-by-nested-jar' : 'corroborated-by-local-jar'
   }
 }
 

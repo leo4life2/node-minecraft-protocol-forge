@@ -44,8 +44,7 @@ const debug = require('debug')('minecraft-protocol-forge')
 
 const TABLES = require('./data/blockShapeTables.json')
 
-const NESTED_JAR_RE = /^META-INF\/(?:jars|jarjar)\/[^/]+\.jar$/
-const MAX_NESTED_DEPTH = 2
+const { forEachNestedJar } = require('./nestedJars') // HF53: the one nested-jar rule
 const DR_CLS = 'net/minecraftforge/registries/DeferredRegister'
 const DR_REGISTER_DESC = '(Ljava/lang/String;Ljava/util/function/Supplier;)Lnet/minecraftforge/registries/RegistryObject;'
 
@@ -84,12 +83,13 @@ function buildUniverse (jarPaths) {
     let entries
     try { entries = zipCentralEntries(buf) } catch { return }
     const classes = new Map()
+    forEachNestedJar(buf, entries, depth, ({ entry, data }) => {
+      try { addUnit(data, `${source}!${entry.name}`, depth + 1) } catch { /* unreadable nested jar */ }
+    })
     for (const e of entries) {
       if (e.name.endsWith('.class')) {
         const cls = e.name.slice(0, -6)
         if (!classes.has(cls)) classes.set(cls, e)
-      } else if (depth < MAX_NESTED_DEPTH && NESTED_JAR_RE.test(e.name)) {
-        try { addUnit(zipEntryData(buf, e), `${source}!${e.name}`, depth + 1) } catch { /* unreadable nested jar */ }
       }
     }
     units.push({ source, buf, classes })

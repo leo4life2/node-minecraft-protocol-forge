@@ -485,9 +485,11 @@ function resolveWrappedModLogin (client, channel, disc, body, options, era) {
           jarEvidence: assessed.evidence,
           announcedChannel: attribution.announcedChannel,
           ownerMod: attribution.ownerMod,
-          ownerVersion: attribution.ownerVersion
+          ownerVersion: attribution.ownerVersion,
+          ...nestingFacts(assessed)
         })
       }
+      noteNestedAnswer(channel, assessed)
     } catch { /* receipts never break the reply path */ }
     return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}` }
   }
@@ -537,7 +539,7 @@ function resolveWrappedModLogin (client, channel, disc, body, options, era) {
       return { pending: acquireThenResolve(client, channel, options, attribution, acq, era) }
     }
     if (isFml2Era(era)) return conventionAckOnFml2(client, channel, null, attribution, null)
-    declineUncorroboratedLogin(client, channel, attribution)
+    declineUncorroboratedLogin(client, channel, attribution, null, modsPathsFor(options).length > 0)
     return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution } }
   }
   return null
@@ -570,6 +572,8 @@ function acquisitionOutcomeWords (outcome) {
     case 'download-failed': return 'the download failed'
     case 'download-tries-exhausted': return 'the download attempts were used up'
     case 'acquired-jar-holds-no-channel': return 'the obtained jar does not create that login channel'
+    case 'nested-in-announced-parent': return 'a server-announced mod\'s jar on this machine nests it'
+    case 'nested-in-local-parent': return 'a local mod jar nests it'
     case 'disabled': return 'automatic acquisition is disabled in this environment'
     case 'acquisition-error': return 'the acquisition step failed'
     default: return o || 'unknown outcome'
@@ -606,6 +610,10 @@ async function acquireThenResolve (client, channel, options, attribution, acq, e
     projectId: receipt ? receipt.projectId : null,
     versionId: receipt ? receipt.versionId : null,
     cached: !!(receipt && receipt.cached),
+    // HF53: the announced PARENT that nests the owner (a jar-in-jar mod is
+    // not published on its own) — or how far the parent search looked
+    parent: (receipt && receipt.parent) || null,
+    nestedSearch: (receipt && receipt.nestedSearch) || null,
     ms: Date.now() - started
   }
   if (result && result.ok && Array.isArray(result.jarPaths) && result.jarPaths.length > 0) {
@@ -620,9 +628,12 @@ async function acquireThenResolve (client, channel, options, attribution, acq, e
       if (receipt) receipt.derived = `ack-index-${assessed.index}`
       try {
         if (!Array.isArray(client.forgeLoginCorroboration)) client.forgeLoginCorroboration = []
-        client.forgeLoginCorroboration.push({ channel, via: 'jar-derived-ack (acquired)', index: assessed.index, jarEvidence: assessed.evidence, announcedChannel: attribution.announcedChannel, ownerMod: modId, ownerVersion: version, acquisition })
+        client.forgeLoginCorroboration.push({ channel, via: 'jar-derived-ack (acquired)', index: assessed.index, jarEvidence: assessed.evidence, announcedChannel: attribution.announcedChannel, ownerMod: modId, ownerVersion: version, acquisition, ...nestingFacts(assessed) })
       } catch { /* receipts never break the reply path */ }
-      console.log(`[forge] answering the modded login check on channel "${channel}" from the ACQUIRED ${modId}@${version} jar: derived ack index ${assessed.index} (${assessed.msgClass}; ${assessed.evidence}; acquisition ${acquisition.outcome} in ${acquisition.ms}ms)`)
+      const from = acquisition.parent
+        ? `the announced parent ${acquisition.parent.fileName} (${acquisition.parent.modId || 'unknown mod'}@${acquisition.parent.version || '?'}) that nests ${modId}@${version}`
+        : `the ACQUIRED ${modId}@${version} jar`
+      console.log(`[forge] answering the modded login check on channel "${channel}" from ${from}: derived ack index ${assessed.index} (${assessed.msgClass}; ${assessed.evidence}; acquisition ${acquisition.outcome} in ${acquisition.ms}ms)`)
       return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index} (acquired ${modId}@${version})`, acquired: true }
     }
     if (assessed.verdict === 'underivable') {
@@ -667,7 +678,7 @@ async function acquireThenResolve (client, channel, options, attribution, acq, e
     return { silent: true }
   }
   if (isFml2Era(era)) return Object.assign(conventionAckOnFml2(client, channel, null, attribution, acquisition), { acquired: true })
-  declineUncorroboratedLogin(client, channel, attribution, acquisition)
+  declineUncorroboratedLogin(client, channel, attribution, acquisition, modsPathsFor(options).length > 0)
   return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution, acquisition }, acquired: true }
 }
 
@@ -701,13 +712,64 @@ function failWrappedLoginHonestly (client, channel, assessed) {
 // the rest — either way the outcome is the SERVER's decision, recorded here
 // so a following kick is classified with this channel attached.
 function declineWrappedLoginHonestly (client, channel, assessed) {
+  const nested = assessed.nestedChain && assessed.nestedChain.length ? ` (the channel is created by ${assessed.nestedArtifact}, nested inside ${assessed.jarName})` : ''
   const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline: ` +
-    'no provable acknowledgement reply exists in the local mod jars, and a decline (unlike a guessed acknowledgement) is not a claim. ' +
+    `no provable acknowledgement reply exists in the local mod jars${nested}, and a decline (unlike a guessed acknowledgement) is not a claim. ` +
+    `${KNOWN_FATAL_ON_FML3} ` +
     'The server now decides — mods that tolerate a vanilla-shaped answer continue the login; mods that require the reply will kick with their own message.'
   console.warn(`[forge] ${message}`)
+  const knownFatalDecline = { basis: KNOWN_FATAL_BASIS, why: assessed.reason }
   if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
-  client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null })
-  client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null })
+  client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null, knownFatalDecline, ...nestingFacts(assessed) })
+  client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null, knownFatalDecline })
+}
+
+// HF53 — THE KNOWN-FATAL TRUTH. On FML3 (Forge 1.18-1.20.1) a decline of a
+// login message that needs a response is a deterministic kick (the comment
+// on the acquisition rung above cites the code path); Forge's login
+// messages need a response by DEFAULT (SimpleChannel.markAsLoginPacket sets
+// needsResponse=true; only an explicit noResponse() clears it), so an
+// uncorroborated decline is, in the common case, the kick the player then
+// sees. The copy says so — naming the channel, the owner mod, and WHY no
+// answer existed — instead of a socket story or a mod list.
+const KNOWN_FATAL_BASIS = 'fml3-login-message-needs-response'
+const KNOWN_FATAL_ON_FML3 = 'On this Forge 1.18-1.20.1 server that decline ENDS THE LOGIN whenever the message needs a reply (Forge\'s default for login messages: the unanswered query is kicked as multiplayer.disconnect.unexpected_query_response).'
+
+// HF53: why no answer existed, as a typed code + plain words. Order: a
+// parent that nests the owner but yielded no reply; the acquisition's own
+// outcome (a registry miss says how far the parent search looked); no jar
+// given at all; jars given but none creates the channel.
+function whyUnanswered (acquisition, jarsSeen) {
+  if (acquisition && acquisition.parent) {
+    const p = acquisition.parent
+    return { code: 'nested-and-unread', words: `${p.fileName}${p.modId ? ` (mod ${p.modId}${p.version ? `@${p.version}` : ''})` : ''} nests it as ${p.nestedPath || 'a nested jar'}, but no provable reply could be derived from that nested jar` }
+  }
+  if (acquisition) {
+    if (acquisition.outcome === 'registry-miss') {
+      const scanned = acquisition.nestedSearch ? Number(acquisition.nestedSearch.scanned) || 0 : null
+      return { code: 'registry-miss', words: `the public registry has no project by that mod id (a mod that ships nested inside another mod's jar is not listed on its own)${scanned != null ? ` and none of the ${scanned} local or cached jar(s) on this machine nests it` : ''}` }
+    }
+    return { code: String(acquisition.outcome || 'acquisition-error'), words: `the announced mod could not be obtained: ${acquisitionOutcomeWords(acquisition.outcome)}` }
+  }
+  if (!jarsSeen) return { code: 'no-jar-seen', words: 'no local mod jar was given to read (no mods folder is attached for this server)' }
+  return { code: 'not-in-local-jars', words: 'none of the local mod jars, nested jars included, creates this channel' }
+}
+
+// HF53: the receipt facts naming WHERE an answer came from (the parent jar
+// and the nested artifact for a JarJar-nested owner); empty for a bare jar.
+function nestingFacts (assessed) {
+  if (!assessed) return {}
+  return {
+    jar: assessed.jarName || null,
+    nestedChain: Array.isArray(assessed.nestedChain) ? assessed.nestedChain : [],
+    nestedArtifact: assessed.nestedArtifact || null,
+    corroboration: assessed.corroboration || null
+  }
+}
+
+function noteNestedAnswer (channel, assessed) {
+  if (!assessed || !Array.isArray(assessed.nestedChain) || assessed.nestedChain.length === 0) return
+  console.log(`[forge] the modded login check on channel "${channel}" is answered from a NESTED jar: ${assessed.jarName} carries ${assessed.nestedArtifact} (${assessed.corroboration})`)
 }
 
 // The HF13 decline: same wire bytes as the HF8 decline (the vanilla
@@ -725,26 +787,24 @@ function declineWrappedLoginHonestly (client, channel, assessed) {
 // never worse than no instance at all, and join-viable on every server whose
 // message tolerates the vanilla-shaped answer (proven live: tacztweaks
 // accepts it).
-function declineUncorroboratedLogin (client, channel, attribution, acquisition) {
+function declineUncorroboratedLogin (client, channel, attribution, acquisition, jarsSeen = true) {
   const owner = attribution.ownerMod
-    ? `mod "${attribution.ownerMod}"${attribution.ownerVersion ? ` (announced version ${attribution.ownerVersion})` : ''}`
+    ? `mod "${attribution.ownerMod}"${attribution.ownerVersion ? ` (announced as ${attribution.ownerMod}@${attribution.ownerVersion})` : ''}`
     : 'one of its mods'
-  // HF23: the acquisition outcome rides the receipt AND the copy — the
-  // honest stop names the announced mod@version and why it could not be
-  // obtained (P5), so even the RST variant of the kill names the mod.
-  const acquired = acquisition
-    ? ` MinePal tried to obtain ${attribution.ownerMod}@${attribution.ownerVersion} (announced by the server for this channel) from ${acquisition.registry || 'the public registry'}: ${acquisitionOutcomeWords(acquisition.outcome)}; the answer could not be derived, so`
-    : ''
-  const evidence = `server-announced channel${attribution.announcedChannel ? ' (in the FML ModList)' : ''} attributed to ${owner}; no local jar carries it${acquisition ? `; acquisition ${acquisition.outcome}` : ''}`
-  const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline: ` +
-    `the server itself announced this channel belongs to ${owner}, and the local mod jars carry no knowledge of it${acquired ? ` —${acquired}` : ' —'} ` +
-    'the legacy FML convention acknowledgement (index 99) would be an uncorroborated claim in that mod\'s own message space ' +
-    '(live receipt: the server dispatches it, finds no message registered at 99, logs "Unexpected custom data from client" ' +
-    'and kicks with multiplayer.disconnect.unexpected_query_response). A decline is not a claim — it is byte-identical to ' +
-    'what a real Forge client without this mod answers. The server now decides: mods that tolerate a vanilla-shaped answer ' +
-    'continue the login; mods that require the reply kick with their own message. If this join fails, pointing MinePal at ' +
-    'the server\'s own modpack instance (its mods folder) gives the derivation the jars it needs for a real answer.'
+  // HF53: the decline is KNOWN to be fatal on FML3 when the message needs a
+  // reply — the copy says so and names the channel, the owner, and why no
+  // answer existed (HF23's acquisition outcome rides inside the why).
+  const why = whyUnanswered(acquisition, jarsSeen)
+  const evidence = `server-announced channel${attribution.announcedChannel ? ' (in the FML ModList)' : ''} attributed to ${owner}; no local jar carries it${acquisition ? `; acquisition ${acquisition.outcome}` : ''}; why ${why.code}`
+  const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline. ` +
+    `${KNOWN_FATAL_ON_FML3} ` +
+    `The server itself announced this channel belongs to ${owner}; MinePal could not answer because ${why.words}. ` +
+    'A guessed acknowledgement (the legacy FML convention index 99) would be an uncorroborated claim in that mod\'s own message space ' +
+    '(live receipt: "Unexpected custom data from client" and the same kick), and this decline is byte-identical to what a real ' +
+    'Forge client without the mod answers. Putting the server\'s own mod jars (the pack\'s jars, nested jars included) in ' +
+    'MinePal\'s mods folder lets the answer be derived from the real classes.'
   console.warn(`[forge] ${message}`)
+  const knownFatalDecline = { basis: KNOWN_FATAL_BASIS, why: why.code }
   if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
   client.forgeDeclinedLoginChannels.push({
     channel,
@@ -754,9 +814,11 @@ function declineUncorroboratedLogin (client, channel, attribution, acquisition) 
     ownerMod: attribution.ownerMod,
     ownerVersion: attribution.ownerVersion,
     announcedChannel: attribution.announcedChannel,
-    acquisition: acquisition || null
+    acquisition: acquisition || null,
+    knownFatalDecline,
+    parent: (acquisition && acquisition.parent) || null
   })
-  client.emit('forgeLoginDeclined', { channel, reason: 'uncorroborated-by-local-jars', evidence, acquisition: acquisition || null })
+  client.emit('forgeLoginDeclined', { channel, reason: 'uncorroborated-by-local-jars', evidence, acquisition: acquisition || null, knownFatalDecline })
 }
 
 /**
