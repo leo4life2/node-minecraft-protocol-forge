@@ -3199,7 +3199,12 @@ function classTypeId (index, state, cls) {
   return null
 }
 
-function deriveAckContracts (index, state) {
+// HF55: `collect.unprovable` (optional) receives the rows the proof REFUSES —
+// a finish handler whose ack codec is NOT unit (the reply has a body this
+// responder cannot invent) — so the acquire-to-prove path can say WHY a
+// channel stays unanswered instead of guessing. The returned contracts are
+// unchanged.
+function deriveAckContracts (index, state, collect = null) {
   const contracts = []
   for (const cls of state.allClassNames) {
     const bytes = index.rawBytes(cls)
@@ -3232,9 +3237,7 @@ function deriveAckContracts (index, state) {
         }
       })
     }
-    if (!unitCodec) continue
     const ackId = classTypeId(index, state, cls)
-    if (!ackId) continue
     // proof 3: the task's run() constructs the triggering payload
     const taskInfo = index.get(taskOwner)
     if (!taskInfo) continue
@@ -3249,9 +3252,16 @@ function deriveAckContracts (index, state) {
     })
     for (const triggerCls of constructed) {
       const triggerId = classTypeId(index, state, triggerCls)
-      if (triggerId && triggerId !== ackId) {
-        contracts.push({ trigger: triggerId, ack: ackId, task: taskOwner, source: cls })
+      if (!triggerId || triggerId === ackId) continue
+      if (!unitCodec || !ackId) {
+        // HF55: the task is real (proof 1 + 3) but its ack is not an empty
+        // body (or its id is unresolved) — refused, and SAID so.
+        if (collect && Array.isArray(collect.unprovable)) {
+          collect.unprovable.push({ trigger: triggerId, ack: ackId, task: taskOwner, source: cls, reason: !unitCodec ? 'ack-has-body' : 'ack-id-unresolved' })
+        }
+        continue
       }
+      contracts.push({ trigger: triggerId, ack: ackId, task: taskOwner, source: cls })
     }
   }
   return contracts
@@ -3918,8 +3928,9 @@ function deriveNeoForgeComponents (jarPaths) {
   // responder answers each proven trigger with its proven empty ack so a
   // claimed mod config channel cannot park the phase forever.
   let ackContracts = []
+  const ackCollect = { unprovable: [] } // HF55: refused rows, named
   try {
-    ackContracts = deriveAckContracts(index, state)
+    ackContracts = deriveAckContracts(index, state, ackCollect)
   } catch (err) {
     diagnostics.errors.push(`ack-contract derivation failed (${err.message}) — no contracts emitted`)
   }
@@ -3971,7 +3982,7 @@ function deriveNeoForgeComponents (jarPaths) {
   }
 
   debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components + ${listenOnly.length} listen-only ids from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${ackContracts.length} ack contracts, ${Date.now() - started}ms)`)
-  return { components, diagnostics, ackContracts, syncContracts: annotationRun.syncContracts, listenOnly }
+  return { components, diagnostics, ackContracts, ackUnprovable: ackCollect.unprovable, syncContracts: annotationRun.syncContracts, listenOnly }
 }
 
 module.exports = { deriveNeoForgeComponents, deriveAckContracts, resolveAggregatedRegistrations }

@@ -598,8 +598,35 @@ function encodeKnownDataMapsReply (maps) {
  *     // the ack's codec is StreamCodec.unit and its handler is what calls
  *     // finishCurrentTask server-side). Never guessed, receipted in
  *     // state.acked + the neoForgeConfigAck event.
+ *   proveAckContract: (async ({channel, namespace, bytes, serverQuery, claimed, learned}) =>
+ *     {contracts: Array<{trigger, ack}>, source, owner, reason, unprovable}) | undefined,
+ *     // HF55 ACQUIRE-TO-PROVE: asked ONCE per configuration-phase mod
+ *     // payload that no proven contract covers (a learned channel's payload
+ *     // included — on a bare client that is exactly the blocking task the
+ *     // server parked the phase on). The embedder proves the contract from
+ *     // a jar it OBTAINS (registry acquisition, its own caps) or from its
+ *     // per-host contract cache; the responder answers a proven trigger with
+ *     // the proven empty ack, corroborated against the server's own query
+ *     // (the ack must be a channel the server declared), and a miss that
+ *     // leaves the phase parked is emitted as neoForgeConfigTaskUnprovable
+ *     // — never a silent stall. While a proof is in flight the responder
+ *     // holds the join watchdogs (minepalConfigProgress + the join window).
+ *   configProofBudgetMs: number | undefined, // HF55: how long one proof may hold the phase (default CONFIG_PROOF_BUDGET_MS)
+ *   parkedGraceMs: number | undefined, // HF55: the parked read's grace after a proof settles without a contract (default PARKED_GRACE_MS)
  * }} options
  */
+// HF55: one proof may hold the configuration phase this long (the server
+// keeps the phase open on keep-alives — measured on the rig, no server-side
+// deadline; the bound is OUR patience: a registry download + one derivation).
+const CONFIG_PROOF_BUDGET_MS = 150000
+// HF55: after a proof settles without a contract, the phase is read as PARKED
+// when no further non-keep-alive configuration packet arrives inside this
+// grace — a fire-and-forget payload the server sent and moved past is never
+// called a blocking task.
+const PARKED_GRACE_MS = 3000
+// HF55: the hold tick — the fabric registry-sync watchdog (20 s) and the join
+// window are restarted this often while a proof is in flight.
+const HOLD_TICK_MS = 5000
 // HF37: how long the configuration pong may wait for the negotiation verdict
 // before the fallback release (the vanilla login window is 30 s; a 40 KB
 // verdict on a slow uplink is well inside this).
@@ -623,11 +650,19 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   // nothing here is guessed, and a channel without a proven contract is
   // never acked (it surfaces instead).
   const ackContracts = new Map()
+  // HF55: where each contract came from — 'local-jar' (the HF11 rows, no
+  // source stamp on the row) or the embedder's stamp (contract-cache /
+  // acquired-jar); receipts and copy read it, the ack itself is the same.
+  const contractSources = new Map()
   for (const row of options.ackContracts || []) {
     if (row && typeof row.trigger === 'string' && typeof row.ack === 'string') {
       ackContracts.set(row.trigger, row.ack)
+      if (typeof row.source === 'string' && row.source) contractSources.set(row.trigger, row.source)
     }
   }
+  const proveAckContract = typeof options.proveAckContract === 'function' ? options.proveAckContract : null
+  const configProofBudgetMs = Number.isFinite(options.configProofBudgetMs) ? options.configProofBudgetMs : CONFIG_PROOF_BUDGET_MS
+  const parkedGraceMs = Number.isFinite(options.parkedGraceMs) ? options.parkedGraceMs : PARKED_GRACE_MS
   // HF6 intersection law (header §1): a clientbound/bidirectional neoforge:*
   // built-in outside the phase's contract must never be claimed — a
   // configuration task may block on a reply we cannot give, and an unknown
@@ -748,7 +783,11 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     learnedDropped: {}, // HF43: payloads received on learned channels and dropped, by id
     setupFailed: null, // HF8: the server's per-channel failure reasons
     pongHold: null, // HF37: {id, heldMs, outcome} — the configuration pong held until the negotiation verdict
-    acked: [], // HF11: {trigger, ack} rows actually answered this phase
+    acked: [], // HF11: {trigger, ack} rows actually answered this phase (+ source when not the local jar — HF55)
+    proofs: {}, // HF55: per-channel acquire-to-prove receipts {status, namespace, source, owner, reason, ms, payloads, parked}
+    unprovable: [], // HF55: the channels the phase parked on with no provable contract (the honest stop's facts)
+    holds: [], // HF55: {channel, since, until} — how long each proof held the phase
+    configInboundSeq: 0, // HF55: non-keep-alive configuration packets seen (the parked read)
     unclaimedBuiltins,
     toleratedDerived, // HF43 receipt
     unhandled: [],
@@ -786,6 +825,125 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   const send = (channel, data) => {
     debug(`neoforge config: sending ${channel} (${data.length} bytes)`)
     client.write('custom_payload', { channel, data })
+  }
+  // HF11 / HF55 — ONE answer path for a proven blocking-task trigger: the
+  // proven empty ack, receipted with its source (a local-jar row keeps the
+  // exact pre-HF55 shape).
+  const answerProvenTrigger = (channel, bytes) => {
+    const ack = ackContracts.get(channel)
+    const source = contractSources.get(channel) || null
+    debug(`neoforge config: blocking-task trigger ${channel} (${bytes} bytes) — sending its ${source ? source + '-proven' : 'jar-proven'} empty ack ${ack}`)
+    const row = source ? { trigger: channel, ack, source } : { trigger: channel, ack }
+    state.acked.push(row)
+    send(ack, Buffer.alloc(0))
+    client.emit('neoForgeConfigAck', { ...row })
+  }
+  // HF55 — the parked read: every non-keep-alive configuration packet bumps
+  // the sequence; a proof that settles with no contract and sees no further
+  // packet inside PARKED_GRACE_MS is the phase parked on that task.
+  client.on('packet', (packet, meta) => {
+    if (meta.state !== 'configuration' || meta.name === 'keep_alive' || meta.name === 'ping') return
+    state.configInboundSeq++
+  })
+  const serverDeclaredIds = () => {
+    const q = state.serverQuery
+    if (!q || !Array.isArray(q.configuration) || q.configuration.length === 0) return null // unknown query: nothing to corroborate against
+    return new Set(q.configuration.map((r) => r && r.id).filter((id) => typeof id === 'string'))
+  }
+  const startHold = (channel) => {
+    const hold = { channel, since: Date.now(), until: null }
+    state.holds.push(hold)
+    const tick = () => {
+      try { client.emit('minepalConfigProgress', `proving the configuration task on ${channel} (a jar is being obtained and read)`) } catch (err) { debug(`hold tick failed (${err.message})`) }
+      try { if (typeof client.minepalJoinWatchdogExtend === 'function') client.minepalJoinWatchdogExtend(`configuration-task proof on ${channel} in flight`) } catch (err) { debug(`join watchdog extend failed (${err.message})`) }
+    }
+    tick()
+    const timer = setInterval(tick, HOLD_TICK_MS)
+    if (timer.unref) timer.unref()
+    return { stop: () => { clearInterval(timer); hold.until = Date.now() } }
+  }
+  const pendingByNamespace = new Map()
+  const settleProof = (channel, result, hold) => {
+    hold.stop()
+    const receipt = state.proofs[channel]
+    receipt.ms = Date.now() - receipt.startedAt
+    receipt.source = (result && typeof result.source === 'string') ? result.source : null
+    receipt.owner = (result && result.owner && typeof result.owner === 'object') ? { modId: result.owner.modId || null, version: result.owner.version || null } : null
+    const rows = (result && Array.isArray(result.contracts) ? result.contracts : []).filter((r) => r && typeof r.trigger === 'string' && typeof r.ack === 'string')
+    const declared = serverDeclaredIds()
+    const uncorroborated = []
+    for (const row of rows) {
+      // corroboration at the wire boundary: an ack the server never declared
+      // is not an ack this server can finish a task on — refused, named.
+      if (declared && !declared.has(row.ack)) { uncorroborated.push(row.ack); continue }
+      if (!ackContracts.has(row.trigger)) {
+        ackContracts.set(row.trigger, row.ack)
+        contractSources.set(row.trigger, receipt.source || 'proven')
+      }
+    }
+    if (uncorroborated.length > 0) receipt.uncorroborated = uncorroborated
+    if (client.state !== 'configuration' || client.ended) { receipt.status = 'late'; return }
+    if (ackContracts.has(channel)) {
+      receipt.status = 'proven'
+      answerProvenTrigger(channel, receipt.bytes)
+      return
+    }
+    const refused = (result && Array.isArray(result.unprovable) ? result.unprovable : []).find((u) => u && u.trigger === channel) || null
+    if (refused) receipt.refused = { ack: refused.ack || null, reason: refused.reason || 'refused' }
+    receipt.status = refused ? 'unprovable' : (rows.length > 0 ? 'no-contract-for-channel' : 'unprovable')
+    receipt.reason = (result && typeof result.reason === 'string' && result.reason) ||
+      (refused ? `the jar proves a blocking task on this channel whose ack ${refused.ack || '(unresolved)'} is not an empty body (${refused.reason}) — a reply this client cannot invent` : null) ||
+      (uncorroborated.length > 0 ? `the proven ack ${uncorroborated.join(', ')} is not a channel this server declared` : null) ||
+      'the jar proves no blocking-task contract for this channel'
+    debug(`neoforge config: no proven contract for ${channel} (${receipt.status}: ${receipt.reason}) — watching whether the phase moved on`)
+    const seq = state.configInboundSeq
+    const parkedTimer = setTimeout(() => {
+      if (client.state !== 'configuration' || client.ended) { receipt.parked = false; return }
+      receipt.parked = state.configInboundSeq === seq
+      if (!receipt.parked) { debug(`neoforge config: the phase moved past ${channel} — not a blocking task`); return }
+      const fact = { channel, namespace: receipt.namespace, owner: receipt.owner, source: receipt.source, status: receipt.status, reason: receipt.reason, refused: receipt.refused || null, ms: receipt.ms }
+      state.unprovable.push(fact)
+      debug(`neoforge config: the configuration phase is PARKED on ${channel} with no provable contract — surfacing (${receipt.reason})`)
+      client.emit('neoForgeConfigTaskUnprovable', fact)
+    }, parkedGraceMs)
+    if (parkedTimer.unref) parkedTimer.unref()
+  }
+  // HF55 — the acquire-to-prove entry: once per channel, one proof per
+  // namespace at a time (one jar proves every contract of its namespace).
+  const proveOrPark = (channel, bytes) => {
+    if (!proveAckContract) return // no prover wired: the pre-HF55 posture (the stall copy names it)
+    if (state.proofs[channel]) { state.proofs[channel].payloads++; return }
+    const namespace = channel.split(':')[0]
+    const receipt = { status: 'pending', namespace, payloads: 1, bytes, startedAt: Date.now(), ms: null, source: null, owner: null, reason: null, learned: learnedChannelIds.has(channel) }
+    state.proofs[channel] = receipt
+    debug(`neoforge config: ${receipt.learned ? 'learned' : 'unproven'} mod payload ${channel} (${bytes} bytes) has no proven contract — asking the embedder to PROVE one (budget ${configProofBudgetMs} ms)`)
+    const hold = startHold(channel)
+    let pending = pendingByNamespace.get(namespace)
+    if (!pending) {
+      // the prover STARTS synchronously (the acquisition clock runs from the trigger, not from the next tick)
+      try {
+        pending = Promise.resolve(proveAckContract({ channel, namespace, bytes, serverQuery: state.serverQuery, claimed: state.claimed, learned: receipt.learned }))
+      } catch (err) {
+        pending = Promise.resolve({ contracts: [], reason: `the prover failed (${err && err.message ? err.message : err})` })
+      }
+      pending = pending.catch((err) => ({ contracts: [], reason: `the prover failed (${err && err.message ? err.message : err})` }))
+      pendingByNamespace.set(namespace, pending)
+      const clear = () => { if (pendingByNamespace.get(namespace) === pending) pendingByNamespace.delete(namespace) }
+      pending.then(clear, clear)
+    }
+    let budgetTimer = null
+    const budget = new Promise((resolve) => {
+      budgetTimer = setTimeout(() => resolve({ contracts: [], reason: `the proof did not finish inside its budget (${configProofBudgetMs} ms)` }), configProofBudgetMs)
+      if (budgetTimer.unref) budgetTimer.unref()
+    })
+    Promise.race([pending, budget]).then((result) => {
+      clearTimeout(budgetTimer)
+      try { settleProof(channel, result, hold) } catch (err) {
+        hold.stop()
+        debug(`neoforge config: proof settle failed for ${channel} (${err.message})`)
+        client.emit('neoForgeConfigError', { channel, error: err })
+      }
+    })
   }
   // HF37 — the configuration pong is HELD until the negotiation verdict.
   // The server sends `neoforge:register` + ping(0) back to back; we answer
@@ -1050,13 +1208,6 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           break
         }
         default:
-          if (typeof channel === 'string' && learnedChannelIds.has(channel)) {
-            // HF43: a learned channel's payload is received and DROPPED —
-            // its protocol is unknown to this client by construction.
-            state.learnedDropped[channel] = (state.learnedDropped[channel] || 0) + 1
-            debug(`neoforge config: payload on learned channel ${channel} (${data.length} bytes) dropped (${state.learnedDropped[channel]} so far)`)
-            break
-          }
           // HF9 — content-mod sync-task payloads (jar-proven contracts): the
           // mod's configuration task sent this and blocks the phase until
           // the mod's own finish ack arrives. Ack once per task id (see the
@@ -1088,13 +1239,27 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
           // FOREVER — keepalives keep the socket up, progress never comes).
           // Composed after HF9's task contracts: the maps are derived
           // disjointly, and a channel with a full sync contract is answered
-          // by its own finish ack, never a blind empty one.
+          // by its own finish ack, never a blind empty one. HF55: a contract
+          // proven this phase or cached from an earlier join answers a
+          // LEARNED channel too, so this sits BEFORE the learned drop.
           if (typeof channel === 'string' && ackContracts.has(channel)) {
-            const ack = ackContracts.get(channel)
-            debug(`neoforge config: blocking-task trigger ${channel} (${data.length} bytes) — sending its jar-proven empty ack ${ack}`)
-            state.acked.push({ trigger: channel, ack })
-            send(ack, Buffer.alloc(0))
-            client.emit('neoForgeConfigAck', { trigger: channel, ack })
+            answerProvenTrigger(channel, data.length)
+            break
+          }
+          if (typeof channel === 'string' && learnedChannelIds.has(channel)) {
+            // HF43: a learned channel's payload is received and DROPPED —
+            // its protocol is unknown to this client by construction.
+            state.learnedDropped[channel] = (state.learnedDropped[channel] || 0) + 1
+            debug(`neoforge config: payload on learned channel ${channel} (${data.length} bytes) dropped (${state.learnedDropped[channel]} so far)`)
+            // HF55: on a bare client this is exactly where a blocking task
+            // parks the phase — prove its contract from an obtained jar.
+            proveOrPark(channel, data.length)
+            break
+          }
+          if (typeof channel === 'string' && !channel.startsWith('neoforge:') && !channel.startsWith('minecraft:') && channel.includes(':')) {
+            // HF55: a mod payload no contract covers (a claimed channel whose
+            // jar proved nothing, or an unclaimed one): prove or surface.
+            proveOrPark(channel, data.length)
             break
           }
           // HF6 boundary honesty: a neoforge:* configuration payload outside
@@ -1120,6 +1285,9 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
 
 module.exports = {
   installNeoForgeConfigNegotiation,
+  CONFIG_PROOF_BUDGET_MS,
+  PARKED_GRACE_MS,
+  HOLD_TICK_MS,
   HANDLED_CLIENTBOUND_CONFIG_CHANNELS,
   TOLERATED_CLIENTBOUND_PLAY_CHANNELS,
   encodeDinnerboneChannels,
