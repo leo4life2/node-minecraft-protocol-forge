@@ -33,12 +33,14 @@
 // Namespaces ('eras'):
 //   srg          - Forge 1.17-1.20.1 jars (mojmap class names, SRG members)
 //   intermediary - Fabric jars (any version; intermediary ids are stable)
-// NeoForge 1.20.5+ jars (full mojmap member names) are not yet in the tables:
-// those jars derive nothing and every block abstains (honest degradation).
+//   mojmap       - Forge 1.20.2+ / NeoForge / 26.x jars (Mojang member names;
+//                  HF58b, generated from a Mojang-named server jar)
+// A jar of an era absent from the tables derives nothing and every block
+// abstains (honest degradation).
 
 const fs = require('fs')
 const {
-  zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions, resolveLambdaImpl
+  zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions, resolveLambdaImpl, cpRef, cpUtf8
 } = require('./jarAnalysis')
 const debug = require('debug')('minecraft-protocol-forge')
 
@@ -65,7 +67,7 @@ function eraVocab (era) {
     gcsNames: new Set(ns.ids.getCollisionShape.filter(Boolean)),
     noColl: ns.ids.propsNoCollission,
     propsOf: new Set(ns.ids.propsOf.filter(Boolean)),
-    propsCopy: ns.ids.propsCopy,
+    propsCopy: new Set([].concat(ns.ids.propsCopy || []).filter(Boolean)), // one name on 1.20.1, ofFullCopy + ofLegacyCopy on 1.21+
     registerNames: new Set((ns.ids.registryRegister || []).map((r) => r.name)),
     // the base-implementation owner is not an "override": collision there
     // respects the hasCollision flag the noCollission signal proves.
@@ -73,7 +75,9 @@ function eraVocab (era) {
     vanillaNonSolid: new Set(TABLES.vanillaNonSolid)
   }
 }
-const VOCABS = { srg: eraVocab('srg'), intermediary: eraVocab('intermediary') }
+// HF58b: every namespace the generated tables carry (srg, intermediary, and
+// mojmap - Forge 1.20.2+ / NeoForge / 26.x jars with Mojang member names)
+const VOCABS = Object.fromEntries(Object.keys(TABLES.namespaces).map((era) => [era, eraVocab(era)]))
 
 // ---------------------------------------------------------------------------
 // class universe across all jars (top-level + nested), lazy parse
@@ -102,9 +106,36 @@ function buildUniverse (jarPaths) {
     for (const [cls, e] of u.classes) if (!where.has(cls)) where.set(cls, { unit: u, entry: e })
   }
   const parsed = new Map()
+  // HF58b: a jar unit's mapping era by the member spellings anywhere in it
+  // (srg ids m_1234_/f_1234_, intermediary class_/method_/field_ ids, else
+  // Mojang names) - the fallback for a class whose own constant pool shows
+  // only class names (registrars, enums)
+  const unitEras = new Map()
+  const unitEra = (unit) => {
+    if (!unit) return null
+    if (unitEras.has(unit)) return unitEras.get(unit)
+    let era = null
+    let sawMoj = false
+    for (const [, e] of unit.classes) {
+      let raw
+      try { raw = zipEntryData(unit.buf, e).toString('latin1') } catch { continue }
+      if (/(?:^|[^A-Za-z0-9_])(?:m|f|p)_\d{3,}_(?![A-Za-z0-9_])/.test(raw)) { era = 'srg'; break }
+      if (raw.includes('net/minecraft/class_')) { era = 'intermediary'; break }
+      if (raw.includes('net/minecraft/')) sawMoj = true
+    }
+    if (!era && sawMoj) era = VOCABS.mojmap ? 'mojmap' : 'srg'
+    unitEras.set(unit, era)
+    return era
+  }
   return {
     units,
     has: (cls) => where.has(cls),
+    eraOf (cls, p) {
+      const own = p ? eraOfClass(p) : null
+      if (own) return own
+      const loc = where.get(cls)
+      return unitEra(loc ? loc.unit : null)
+    },
     get (cls) {
       if (parsed.has(cls)) return parsed.get(cls)
       const loc = where.get(cls)
@@ -116,18 +147,40 @@ function buildUniverse (jarPaths) {
   }
 }
 
-// era of one class file: intermediary if it references intermediary-mapped
-// vanilla classes, srg if it references mojmap-named vanilla classes.
+// era of one class file by the SPELLING of the members it references or
+// declares: srg ids (m_1234_ / f_1234_ / p_1234_) = the Forge 1.17-1.20.1
+// srg era; intermediary ids (class_ / method_ / field_) = Fabric; a class
+// that shows only Mojang-named vanilla classes and no era-spelled member is
+// AMBIGUOUS between srg and mojmap (null - the caller falls back to the jar
+// unit's era; a mojmap-era table absent from the tables resolves to srg).
+const SRG_MEMBER_RE = /^(?:m|f|p)_\d+_$/
+const INTER_MEMBER_RE = /^(?:method|field)_\d+$/
 function eraOfClass (parsed) {
-  let sawIntermediary = false
-  let sawMojmap = false
+  let sawInter = false
+  let sawMoj = false
+  let sawSrg = false
+  let sawMojMember = false // a plainly-spelled member of a Mojang-named vanilla class
   for (const c of parsed.cp) {
-    if (!c || c.tag !== 1 || typeof c.str !== 'string') continue
-    if (c.str.startsWith('net/minecraft/class_')) sawIntermediary = true
-    else if (c.str.startsWith('net/minecraft/world/') || c.str.startsWith('net/minecraft/core/')) sawMojmap = true
+    if (!c) continue
+    if (c.tag === 1 && typeof c.str === 'string') {
+      if (c.str.startsWith('net/minecraft/class_')) sawInter = true
+      else if (c.str.startsWith('net/minecraft/')) sawMoj = true
+    } else if (c.tag === 9 || c.tag === 10 || c.tag === 11) {
+      const ref = cpRef(parsed.cp, parsed.cp.indexOf(c))
+      if (!ref || !ref.owner || !ref.owner.startsWith('net/minecraft/')) continue
+      if (SRG_MEMBER_RE.test(ref.name)) sawSrg = true
+      else if (INTER_MEMBER_RE.test(ref.name) || ref.owner.startsWith('net/minecraft/class_')) sawInter = true
+      else if (ref.name !== '<init>' && ref.name !== '<clinit>') sawMojMember = true
+    }
   }
-  if (sawIntermediary) return 'intermediary'
-  if (sawMojmap) return 'srg'
+  for (const m of parsed.methods || []) {
+    if (SRG_MEMBER_RE.test(m.name)) sawSrg = true
+    else if (INTER_MEMBER_RE.test(m.name)) sawInter = true
+  }
+  if (sawInter) return 'intermediary'
+  if (sawSrg) return 'srg'
+  if (sawMoj && !VOCABS.mojmap) return 'srg'
+  if (sawMojMember) return 'mojmap'
   return null
 }
 
@@ -175,12 +228,23 @@ function statements (rows) {
 }
 
 // classify `putstatic <property field>` statements in a MOD class clinit.
-// Returns {card} | {aliasTo: 'owner#field'} | null (unknown => abstain).
+// Returns a property INFO {name, card, kind, min, values} | {aliasTo:
+// 'owner#field'} | null (unknown => abstain). HF58b: the info carries what
+// the state index needs beside the cardinality - the property name (the
+// create call's string), its kind and the int floor; a mod enum's
+// serialized names are not modelled (values null: the count stays exact,
+// the state name shows that property's value index).
+// HF58b r3: a definition is read ONLY when the era's own property class
+// creates it in ONE straight call - the statement's single invoke is a
+// create owned by a property class of the era vocabulary, and the name is
+// the one string constant feeding it (the create's String parameter). Any
+// other call in the statement (a mod-owned helper returning a property, a
+// name built by a call, a lambda predicate, a collection factory) means the
+// bytes do not carry the definition: abstain, never a guessed exact count.
 function classifyModPropertyStatement (stmt, vocab, universe) {
   if (stmt.some((r) => r.target !== undefined)) return null // branches: not a straight-line definition
-  const creates = stmt.filter((r) => (r.op === 0xb8 || r.op === 0xb6) && r.ref &&
-    vocab.propDescs.has(retDesc(r.ref.desc)))
-  if (creates.length === 0) {
+  const invokes = stmt.filter((r) => r.op >= 0xb6 && r.op <= 0xba) // invokevirtual/special/static/interface/dynamic
+  if (invokes.length === 0) {
     const aliases = stmt.filter((r) => r.op === 0xb2 && r.ref && vocab.propDescs.has(r.ref.desc))
     if (aliases.length) {
       const a = aliases[aliases.length - 1].ref
@@ -188,24 +252,31 @@ function classifyModPropertyStatement (stmt, vocab, universe) {
     }
     return null
   }
-  const create = creates[creates.length - 1]
+  if (invokes.length !== 1) return null // a helper, a name call, a lambda beside the create: abstain
+  const create = invokes[0]
+  if ((create.op !== 0xb8 && create.op !== 0xb6) || !create.ref) return null
+  if (!vocab.propDescs.has(`L${create.ref.owner};`) || !vocab.propDescs.has(retDesc(create.ref.desc))) return null // owned by the era's property class
   const d = create.ref.desc
+  const strs = stmt.filter((r) => r.str !== undefined).map((r) => r.str)
+  if (strs.length !== 1) return null // the name is the one ldc the create takes
+  const name = strs[0]
   if (d.startsWith('(Ljava/lang/String;II)')) {
     const ints = stmt.filter((r) => r.int !== undefined).map((r) => r.int)
     const [lo, hi] = ints.slice(-2)
-    return hi !== undefined ? { card: hi - lo + 1 } : null
+    return hi !== undefined ? { name, card: hi - lo + 1, kind: 'int', min: lo } : null
   }
   if (d.startsWith('(Ljava/lang/String;)')) {
-    return { card: retDesc(d) === `L${vocab.cn.propDirection};` ? 6 : 2 }
+    const isDir = retDesc(d) === `L${vocab.cn.propDirection};`
+    return isDir ? { name, card: 6, kind: 'enum', values: null } : { name, card: 2, kind: 'bool' }
   }
   if (d.startsWith('(Ljava/lang/String;Ljava/lang/Class;)')) {
     const clsRow = [...stmt].reverse().find((r) => (r.op === 0x12 || r.op === 0x13) && r.cls)
     if (!clsRow) return null
     const n = enumConstCount(clsRow.cls, universe, vocab)
-    return n ? { card: n } : null
+    return n ? { name, card: n, kind: 'enum', values: null } : null
   }
   const aastores = stmt.filter((r) => r.op === 0x53).length
-  if (aastores > 0) return { card: aastores }
+  if (aastores > 0) return { name, card: aastores, kind: 'enum', values: null }
   return null
 }
 
@@ -222,13 +293,14 @@ function enumConstCount (cls, universe, vocab) {
   return consts.length || null
 }
 
-// resolve a property field reference to a cardinality (mod fields chase their
-// clinit definition; vanilla fields hit the table, walking the declaring
-// hierarchy because javac may qualify inherited statics with the subclass)
-function propCardOf (propKey, universe, vocab, seen = new Set()) {
+// resolve a property field reference to its info {name, card, kind, min,
+// values} (mod fields chase their clinit definition; vanilla fields hit the
+// table, walking the declaring hierarchy because javac may qualify
+// inherited statics with the subclass). null = unknown => abstain.
+function propInfoOf (propKey, universe, vocab, seen = new Set()) {
   if (seen.has(propKey)) return null
   seen.add(propKey)
-  const direct = vanillaPropCard(propKey, vocab)
+  const direct = vanillaPropInfo(propKey, vocab)
   if (direct != null) return direct
   const [owner, field] = propKey.split('#')
   if (universe.has(owner)) {
@@ -241,8 +313,8 @@ function propCardOf (propKey, universe, vocab, seen = new Set()) {
         if (!put.ref || put.ref.name !== field || !vocab.propDescs.has(put.ref.desc)) continue
         const c = classifyModPropertyStatement(stmt, vocab, universe)
         if (!c) return null
-        if (c.card != null) return c.card
-        if (c.aliasTo) return propCardOf(c.aliasTo, universe, vocab, seen)
+        if (c.card != null) return c
+        if (c.aliasTo) return propInfoOf(c.aliasTo, universe, vocab, seen)
         return null
       }
     }
@@ -250,24 +322,24 @@ function propCardOf (propKey, universe, vocab, seen = new Set()) {
     // then superinterfaces (interface constants - the Create
     // ProperWaterloggedBlock.WATERLOGGED idiom), then the superclass
     for (const iface of p.interfaces || []) {
-      const viaIface = propCardOf(`${iface}#${field}`, universe, vocab, seen)
+      const viaIface = propInfoOf(`${iface}#${field}`, universe, vocab, seen)
       if (viaIface != null) return viaIface
     }
-    if (p.superName) return propCardOf(`${p.superName}#${field}`, universe, vocab, seen)
+    if (p.superName) return propInfoOf(`${p.superName}#${field}`, universe, vocab, seen)
     return null
   }
   return null
 }
 
-function vanillaPropCard (propKey, vocab) {
+function vanillaPropInfo (propKey, vocab) {
   const hit = vocab.ns.propCard[propKey]
-  if (hit && hit.card != null) return hit.card
+  if (hit && hit.card != null) return hit
   let [owner, field] = propKey.split('#')
   while (vocab.ns.hierarchy[owner] !== undefined) {
     owner = vocab.ns.hierarchy[owner]
     if (owner == null) break
     const h = vocab.ns.propCard[`${owner}#${field}`]
-    if (h && h.card != null) return h.card
+    if (h && h.card != null) return h
   }
   return null
 }
@@ -275,41 +347,128 @@ function vanillaPropCard (propKey, vocab) {
 // ---------------------------------------------------------------------------
 // state count: effective createBlockStateDefinition contributions over the
 // chain (mod bodies parsed with abstain-on-any-branch discipline; vanilla
-// classes from the generated table, including its dynamic/abstain flags)
-function modCbsdContrib (parsed, vocab) {
+// classes from the generated table, including its dynamic/abstain flags).
+// HF58b remediation: a mod body is read by ALLOWLIST - the only rows that
+// may appear in an exactly-counted body are the vanilla varargs idiom
+// (aload / int const / anewarray of a property class / dup / aastore /
+// getstatic of a KNOWN property field / Builder.add / pop / checkcast /
+// return) and the super createBlockStateDefinition call. ANY other row -
+// an invoke that is not Builder.add nor the super call (a helper that
+// returns Property, Property[] or nothing while registering on the
+// builder), a getfield, a getstatic of an unknown type or of an array, an
+// invokedynamic, a branch - is DYNAMIC and the whole chain abstains. The
+// old shape recognised helpers only when they RETURNED a single property:
+// a helper returning Property[] read as zero properties and the parent
+// count shipped as exact (the verifier's weird_arr).
+const CBSD_PLAIN_OPS = new Set([
+  0x00, // nop
+  0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, // iconst_m1..5
+  0x10, 0x11, 0x12, 0x13, // bipush, sipush, ldc, ldc_w (array lengths)
+  0x19, 0x2a, 0x2b, 0x2c, 0x2d, // aload, aload_n
+  0x3a, 0x4b, 0x4c, 0x4d, 0x4e, // astore, astore_n (a builder alias)
+  0x53, // aastore
+  0x57, 0x59, // pop, dup
+  0xb1, // return
+  0xc0 // checkcast
+])
+function builderAddOf (vocab) {
+  if (!vocab._builderAdd) vocab._builderAdd = { owner: vocab.cn.builder, desc: `([L${vocab.cn.propBase};)L${vocab.cn.builder};` }
+  return vocab._builderAdd
+}
+// HF58b r3: can a parameter of this type carry the builder reference? The
+// builder's only supertype is Object, so Object, the builder class and
+// arrays of either can hold it; a String, a primitive or any other class
+// (a mod class is never the builder) cannot.
+function paramMayCarryBuilder (t, vocab) {
+  const base = t.replace(/^\[+/, '')
+  return base === 'Ljava/lang/Object;' || base === `L${vocab.cn.builder};`
+}
+function paramIsProperty (t, vocab) { return vocab.propDescs.has(t.replace(/^\[+/, '')) }
+// HF58b r3: a void call in a createBlockStateDefinition body that the
+// builder cannot reach - not on the builder, no property parameter, and
+// either no parameter that can carry the builder at all, or (the Kotlin
+// Intrinsics.checkNotNullParameter(Object, String) idiom) an Object
+// parameter whose callee body is read and is builder-blind: it names no
+// builder or property class, stores nothing (no putfield/putstatic/
+// aastore), has no invokedynamic, and every call it makes takes only
+// parameters that cannot carry the builder (the Object is never forwarded).
+// A callee outside the universe cannot be read: the call stays flagged.
+function builderBlindVoidCall (r, vocab, universe) {
+  if (!r.ref || !r.ref.desc.endsWith(')V')) return false
+  if (r.ref.owner === vocab.cn.builder || vocab.propDescs.has(`L${r.ref.owner};`)) return false
+  const params = descParamTypes(r.ref.desc)
+  if (params.some((t) => paramIsProperty(t, vocab))) return false
+  if (!params.some((t) => paramMayCarryBuilder(t, vocab))) return true
+  if (params.some((t) => t.replace(/^\[+/, '') === `L${vocab.cn.builder};`)) return false
+  if (!universe) return false
+  const callee = universeMethod(universe, r.ref.owner, r.ref.name, r.ref.desc)
+  if (!callee) return false
+  for (const q of callee.rows) {
+    if (q.op === 0xba || q.op === 0xb3 || q.op === 0xb5 || q.op === 0x53) return false
+    if (q.cls && (q.cls === vocab.cn.builder || vocab.propDescs.has(`L${q.cls};`))) return false
+    if (!q.ref) continue
+    if (q.ref.owner === vocab.cn.builder || vocab.propDescs.has(`L${q.ref.owner};`) || paramIsProperty(q.ref.desc, vocab)) return false
+    if (q.op >= 0xb6 && q.op <= 0xb9 &&
+      descParamTypes(q.ref.desc).some((t) => paramMayCarryBuilder(t, vocab) || paramIsProperty(t, vocab))) return false
+  }
+  return true
+}
+function modCbsdContrib (parsed, vocab, universe) {
   const m = parsed.codes.find((c) => vocab.cbsdNames.has(c.method) && c.desc === vocab.builderDesc)
   if (!m) return null // does not define it
   const rows = decodeInstructions(m.code, parsed.cp)
   const props = []
   let dynamic = false
+  let dynamicWhy = null
   let callsSuper = false
+  const add = builderAddOf(vocab)
+  const flag = (why) => { if (!dynamic) { dynamic = true; dynamicWhy = why } }
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i]
-    if (r.target !== undefined) dynamic = true // ANY branch in a mod body
-    else if (r.op === 0xba) dynamic = true
-    else if (r.op === 0xb2 && r.ref && vocab.propDescs.has(r.ref.desc)) props.push(`${r.ref.owner}#${r.ref.name}`)
-    else if (r.op === 0xb2 && r.ref && r.ref.desc.startsWith('[') && vocab.propDescs.has(r.ref.desc.slice(1))) dynamic = true
-    else if (r.op === 0xb9 && r.ref && /^java\/util\//.test(r.ref.owner)) dynamic = true
-    else if ((r.op === 0xb6 || r.op === 0xb7 || r.op === 0xb8) && r.ref && vocab.propDescs.has(retDesc(r.ref.desc))) dynamic = true
-    if (r.op === 0xb7 && r.ref && vocab.cbsdNames.has(r.ref.name) && r.ref.desc === vocab.builderDesc) {
-      callsSuper = true
-      dynamic = dynamic || false
+    if (r.target !== undefined) { flag('branch'); continue } // ANY branch in a mod body
+    if (r.op === 0xb2 && r.ref) {
+      if (vocab.propDescs.has(r.ref.desc)) props.push(`${r.ref.owner}#${r.ref.name}`)
+      else flag(`getstatic ${r.ref.owner}#${r.ref.name}:${r.ref.desc}`) // an array of properties, or a field of a type we cannot read as a property
+      continue
     }
+    if (r.op === 0xbd) { // anewarray: the varargs array of a property class
+      if (r.cls && vocab.propDescs.has(`L${r.cls};`)) continue
+      flag(`anewarray ${r.cls}`)
+      continue
+    }
+    if (r.op === 0xb6 || r.op === 0xb7 || r.op === 0xb8 || r.op === 0xb9) {
+      if (!r.ref) { flag('invoke ?'); continue }
+      if (r.op === 0xb7 && vocab.cbsdNames.has(r.ref.name) && r.ref.desc === vocab.builderDesc) { callsSuper = true; continue }
+      if ((r.op === 0xb6 || r.op === 0xb7) && r.ref.owner === add.owner && r.ref.desc === add.desc) continue // Builder.add(Property...)
+      if (builderBlindVoidCall(r, vocab, universe)) continue // HF58b r3: a void call the builder cannot reach (a null check, a log line)
+      flag(`invoke ${r.ref.owner}.${r.ref.name}${r.ref.desc}`) // a helper: it may add, return or build properties
+      continue
+    }
+    if (CBSD_PLAIN_OPS.has(r.op)) continue
+    flag(`op 0x${r.op.toString(16)}`) // invokedynamic, getfield, arithmetic, locals of other kinds ...
   }
-  // the super call itself is an invokespecial to a props-returning..? no: void.
-  return { props, callsSuper, dynamic }
+  return { props, callsSuper, dynamic, dynamicWhy }
 }
 
-function stateCountOf (cls, universe, vocab) {
+// HF58b: the state INDEX of a block class - its exact state count plus the
+// ordered property list vanilla lays the states out by: properties sorted by
+// NAME (StateDefinition keeps an ImmutableSortedMap; the first name is the
+// slowest-varying), each with its value order (bool [true, false]; ints
+// ascending from the create floor; enums in the vanilla-known order, or null
+// when the order is not derivable - the count stays exact, the name shows
+// the value index). Returns {count, props} | null (UNKNOWN: any unresolved
+// contribution on the chain - never the parent's count as exact).
+function stateIndexOf (cls, universe, vocab) {
   const propKeys = []
   let factor = 1 // solved whole-body contributions of loop-driven vanilla classes
+  let indexed = true // false when a solved factor hides its properties
   let c = cls
   let cap = 24
   while (c && cap-- > 0) {
     if (universe.has(c)) {
       const p = universe.get(c)
       if (!p) return null
-      const contrib = modCbsdContrib(p, vocab)
+      const contrib = modCbsdContrib(p, vocab, universe)
       if (contrib) {
         if (contrib.dynamic) return null
         propKeys.push(...contrib.props)
@@ -321,27 +480,66 @@ function stateCountOf (cls, universe, vocab) {
     const v = vocab.ns.classContrib[c]
     if (v) {
       if (v.dynamic) return null
-      if (v.contribFactor != null) factor *= v.contribFactor
+      if (v.contribFactor != null) { factor *= v.contribFactor; if (v.contribFactor !== 1) indexed = false }
       propKeys.push(...v.props)
       if (!v.callsSuper) break
     }
     if (vocab.ns.hierarchy[c] === undefined) {
       // unknown ancestor: its contributions are unknowable
-      return c === 'java/lang/Object' ? product(propKeys, factor, universe, vocab) : null
+      if (c !== 'java/lang/Object') return null
+      break
     }
     c = vocab.ns.hierarchy[c]
   }
-  return product(propKeys, factor, universe, vocab)
+  let count = factor
+  const props = []
+  for (const pk of propKeys) {
+    const info = propInfoOf(pk, universe, vocab)
+    if (info == null || info.card == null) return null
+    count *= info.card
+    props.push(info)
+  }
+  if (!indexed || props.some((p) => !p.name)) return { count, props: null }
+  const sorted = [...props].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  return {
+    count,
+    props: sorted.map((p) => ({ name: p.name, card: p.card, values: propValuesOf(p) }))
+  }
 }
 
-function product (propKeys, factor, universe, vocab) {
-  let n = factor
-  for (const pk of propKeys) {
-    const card = propCardOf(pk, universe, vocab)
-    if (card == null) return null
-    n *= card
+function propValuesOf (p) {
+  if (p.kind === 'bool') return ['true', 'false']
+  if (p.kind === 'int') return p.min != null ? Array.from({ length: p.card }, (_, i) => String(p.min + i)) : null
+  if (p.kind === 'enum') return Array.isArray(p.values) && p.values.length === p.card ? p.values : null
+  return null
+}
+
+function stateCountOf (cls, universe, vocab) {
+  const idx = stateIndexOf(cls, universe, vocab)
+  return idx ? idx.count : null
+}
+
+// decode a state offset inside a block's span into its property values
+// (the consumer's naming: 'name[face=floor,facing=west,variant=5]'). A
+// property whose value order is unknown reads as its value index ('#3').
+function decodeStateIndex (index, offset) {
+  if (!index || !Array.isArray(index.props)) return null
+  const out = {}
+  let rem = offset
+  const strides = []
+  let stride = 1
+  for (let i = index.props.length - 1; i >= 0; i--) {
+    strides[i] = stride
+    stride *= index.props[i].card ?? (index.props[i].values ? index.props[i].values.length : 1)
   }
-  return n
+  for (let i = 0; i < index.props.length; i++) {
+    const p = index.props[i]
+    const card = p.card ?? (p.values ? p.values.length : 1)
+    const vi = Math.floor(rem / strides[i]) % card
+    rem -= vi * strides[i]
+    out[p.name] = p.values ? p.values[vi] : `#${vi}`
+  }
+  return out
 }
 
 // generic superclass reachability across the mod universe only (for
@@ -396,7 +594,7 @@ function propsSignals (rows, vocab) {
     if ((r.op === 0xb6 || r.op === 0xb8) && r.ref) {
       if (r.ref.name === vocab.noColl) out.noColl = true
       else if (vocab.propsOf.has(r.ref.name)) out.of = true
-      else if (r.ref.name === vocab.propsCopy) {
+      else if (vocab.propsCopy.has(r.ref.name)) {
         // copy source: nearest preceding getstatic of a vanilla Blocks field
         let src = null
         for (let j = i - 1; j >= 0 && j > i - 4; j--) {
@@ -492,52 +690,418 @@ function solidityOf (cls, supplierRows, universe, vocab, ctorDesc) {
 }
 
 // ---------------------------------------------------------------------------
-// registration extraction
-function forgeRegistrations (parsed, universe, vocab, out) {
-  const clinit = parsed.codes.find((m) => m.method === '<clinit>')
-  if (!clinit) return
-  const rows = decodeInstructions(clinit.code, parsed.cp)
-  // modid per DeferredRegister field
-  const drModid = new Map()
-  for (const stmt of statements(rows)) {
-    const put = stmt[stmt.length - 1]
-    if (!put.ref || put.ref.desc !== `L${DR_CLS};`) continue
-    const hasCreate = stmt.some((r) => r.op === 0xb8 && r.ref && r.ref.owner === DR_CLS && r.ref.name === 'create')
-    if (!hasCreate) continue
-    const strs = stmt.filter((r) => r.str !== undefined).map((r) => r.str)
-    if (strs.length) drModid.set(`${put.ref.owner}#${put.ref.name}`, strs[strs.length - 1])
+// HF58b: a symbolic operand-stack walk over ONE method body. Every value
+// the walk pushes is a small description of where it came from (a string
+// literal, a static field, a `new`, a call with its receiver and arguments,
+// an invokedynamic with its captures, an array element, a parameter) so a
+// registration call can be asked "what is your name argument?" even when
+// the name was built by a StringConcatFactory indy from an enum constant's
+// accessor inside a loop, or arrived as a helper's parameter. Anything the
+// walk does not model poisons the stack until the next statement boundary
+// (a poisoned argument never resolves - honest abstention, never a guess).
+const SCF_CLS = 'java/lang/invoke/StringConcatFactory'
+const STRING_CLS = 'java/lang/String'
+
+// local-variable slot -> parameter index for a STATIC method (long/double
+// take two slots)
+function paramSlotsOf (desc) {
+  const slots = new Map()
+  let slot = 0
+  descParamTypes(desc).forEach((t, index) => {
+    slots.set(slot, { index, type: t })
+    slot += (t === 'J' || t === 'D') ? 2 : 1
+  })
+  return slots
+}
+
+// bootstrap-method view of an invokedynamic: a lambda (impl handle), a
+// string concatenation (recipe + constants), or something else
+function indyInfo (parsed, bsmIndex) {
+  const bsm = parsed.bootstrapMethods && parsed.bootstrapMethods[bsmIndex]
+  if (!bsm) return null
+  const mh = parsed.cp[bsm.ref]
+  const mref = mh && mh.tag === 15 ? cpRef(parsed.cp, mh.refIndex) : null
+  const strArg = (i) => { const c = parsed.cp[bsm.args[i]]; return c && c.tag === 8 ? cpUtf8(parsed.cp, c.strIndex) : null }
+  if (mref && mref.owner === SCF_CLS) {
+    return { kind: 'concat', recipe: strArg(0), consts: bsm.args.slice(1).map((_, i) => strArg(i + 1)) }
   }
-  let lastStr = null
-  let lastIndy = null
-  let lastDr = null
-  for (const r of rows) {
-    if (r.str !== undefined) lastStr = r.str
-    else if (r.op === 0xba) lastIndy = r
-    else if (r.op === 0xb2 && r.ref && r.ref.desc === `L${DR_CLS};`) lastDr = `${r.ref.owner}#${r.ref.name}`
-    else if (r.op === 0xb6 && r.ref && r.ref.owner === DR_CLS && r.ref.name === 'register' && r.ref.desc === DR_REGISTER_DESC) {
-      if (lastStr == null || lastIndy == null) continue
-      const impl = resolveLambdaImpl(parsed, lastIndy.bsmIndex)
-      if (!impl) continue
-      let cls = null
-      let supplierRows = null
-      let ctorDesc = null
-      if (impl.refKind === 8) { // Class::new - the handle desc IS the invoked ctor
-        cls = impl.owner
-        ctorDesc = impl.desc
-      } else {
-        const implOwner = impl.owner === parsed.className ? parsed : universe.get(impl.owner)
-        const body = implOwner && implOwner.codes.find((m) => m.method === impl.name && m.desc === impl.desc)
-        if (!body) continue
-        supplierRows = decodeInstructions(body.code, implOwner.cp)
-        for (const b of supplierRows) {
-          if (b.op === 0xbb && b.cls && chainReachesBlock(b.cls, universe, vocab)) { cls = b.cls; break }
-        }
-      }
-      if (!cls || !chainReachesBlock(cls, universe, vocab)) continue
-      const modid = drModid.get(lastDr) ?? (drModid.size === 1 ? [...drModid.values()][0] : null)
-      if (!modid) continue
-      out.push({ name: `${modid}:${lastStr}`, cls, supplierRows, era: vocab.era, ctorDesc })
+  const impl = resolveLambdaImpl(parsed, bsmIndex)
+  return { kind: impl ? 'lambda' : 'other', impl }
+}
+
+const RETURN_OPS = new Set([0xac, 0xad, 0xae, 0xaf, 0xb0])
+function isBinaryArith (op) { return op >= 0x60 && op <= 0x83 && !(op >= 0x74 && op <= 0x77) }
+
+// visit(row, index, recv, args, stmtRows) is called at every invoke row with
+// the symbolic receiver/arguments (before the call's result is pushed)
+function symbolicWalk (parsed, method, visit) {
+  let rows
+  try { rows = decodeInstructions(method.code, parsed.cp) } catch { return [] }
+  const locals = new Map()
+  let stack = []
+  let stmtStart = 0
+  const pop = (n) => {
+    if (!stack) return new Array(n).fill(null)
+    if (stack.length < n) { stack = null; return new Array(n).fill(null) }
+    return stack.splice(stack.length - n, n)
+  }
+  const push = (v) => { if (stack) stack.push(v) }
+  const poison = () => { stack = null }
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]
+    const op = r.op
+    if (op === 0x00) continue
+    else if (op === 0x01 || (op >= 0x02 && op <= 0x0f) || op === 0x10 || op === 0x11 || op === 0x14) push(r.int !== undefined ? { k: 'int', v: r.int } : { k: 'const' })
+    else if (op === 0x12 || op === 0x13) push(r.str !== undefined ? { k: 'str', v: r.str } : r.cls ? { k: 'cls', cls: r.cls } : r.int !== undefined ? { k: 'int', v: r.int } : { k: 'const' })
+    else if (r.aload !== undefined) push(locals.get(r.aload) ?? { k: 'param', n: r.aload })
+    else if ((op >= 0x15 && op <= 0x18) || (op >= 0x1a && op <= 0x29)) push({ k: 'val' })
+    else if (op === 0x32) { const [arr] = pop(2); push({ k: 'elem', arr }) /* aaload */ } else if (op >= 0x2e && op <= 0x35) { pop(2); push({ k: 'val' }) } else if (r.astore !== undefined) { const [v] = pop(1); locals.set(r.astore, v) } else if ((op >= 0x36 && op <= 0x39) || (op >= 0x3b && op <= 0x4a)) pop(1)
+    else if (op >= 0x4f && op <= 0x56) pop(3)
+    else if (op === 0x57) pop(1)
+    else if (op === 0x58) pop(2)
+    else if (op === 0x59) { const [v] = pop(1); push(v); push(v) } else if (op === 0x5a) { const [b, a] = pop(2); push(a); push(b); push(a) } else if (op === 0x5f) { const [b, a] = pop(2); push(a); push(b) } else if (op === 0x5b || op === 0x5c || op === 0x5d || op === 0x5e) poison()
+    else if (isBinaryArith(op) || (op >= 0x94 && op <= 0x98)) { pop(2); push({ k: 'val' }) } else if ((op >= 0x74 && op <= 0x77) || op === 0x84 || (op >= 0x85 && op <= 0x93) || op === 0xc0) { /* unary / iinc / conversions / checkcast: no net change */ } else if ((op >= 0x99 && op <= 0x9e) || op === 0xc6 || op === 0xc7 || op === 0xaa || op === 0xab) pop(1)
+    else if (op >= 0x9f && op <= 0xa6) pop(2)
+    else if (op === 0xa7 || op === 0xc8 || op === 0xb1) { /* goto / return void */ } else if (RETURN_OPS.has(op)) pop(1)
+    else if (op === 0xb2) push({ k: 'field', ref: r.ref })
+    else if (op === 0xb3) pop(1)
+    else if (op === 0xb4) { const [recv] = pop(1); push({ k: 'ifield', ref: r.ref, recv }) } else if (op === 0xb5) pop(2)
+    else if (op >= 0xb6 && op <= 0xb9) {
+      if (!r.ref) { poison(); continue }
+      const n = descParamTypes(r.ref.desc).length
+      const args = pop(n)
+      const recv = op === 0xb8 ? null : pop(1)[0]
+      visit(r, i, recv, args, rows.slice(stmtStart, i))
+      if (!r.ref.desc.endsWith(')V')) push({ k: 'call', ref: r.ref, recv, args })
+    } else if (op === 0xba) {
+      if (!r.samDesc) { poison(); continue }
+      const captures = pop(descParamTypes(r.samDesc).length)
+      push({ k: 'indy', bsmIndex: r.bsmIndex, samName: r.samName, captures, parsed })
+    } else if (op === 0xbb) push({ k: 'new', cls: r.cls })
+    else if (op === 0xbc || op === 0xbd) { pop(1); push({ k: 'arr', cls: r.cls }) } else if (op === 0xbe || op === 0xc1) { pop(1); push({ k: 'val' }) } else if (op === 0xc2 || op === 0xc3) pop(1)
+    else poison() // wide / multianewarray / jsr / athrow / anything else
+    // statement boundaries: an empty (or poisoned, now reset) stack after a
+    // consuming instruction
+    const ends = op === 0xb3 || op === 0xb5 || op === 0x57 || op === 0x58 || r.astore !== undefined ||
+      (op >= 0x36 && op <= 0x4e) || RETURN_OPS.has(op) || op === 0xb1 || op === 0xa7 || op === 0xc8 ||
+      (op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7 || op === 0xbf
+    if (ends) { if (!stack) stack = []; if (stack.length === 0) stmtStart = i + 1 } else if (stack && stack.length === 0) stmtStart = i + 1
+  }
+  return rows
+}
+
+// the class of an enum iterated by `for (E e : E.values())`: the element of
+// an array produced by E.values()
+function enumOfSym (sym, universe) {
+  if (!sym || sym.k !== 'elem' || !sym.arr || sym.arr.k !== 'call' || !sym.arr.ref) return null
+  const ref = sym.arr.ref
+  if (ref.name !== 'values' || !ref.desc.startsWith('()[L') || !ref.desc.endsWith(';')) return null
+  const en = ref.desc.slice(4, -1)
+  if (ref.owner !== en || !universe.has(en)) return null
+  const p = universe.get(en)
+  return p && p.superName === 'java/lang/Enum' ? en : null
+}
+
+// the ordered enum constants of E (the <clinit> putstatic order) with the
+// string an accessor returns for each: a getter of a field the constructor
+// stores from a String parameter (the value is that constant's literal
+// argument), or Enum.name() (optionally case-folded). null = not derivable.
+function enumConstantStrings (en, accessorRef, universe, ctx) {
+  const memoKey = `${en}#${accessorRef.owner}#${accessorRef.name}${accessorRef.desc}`
+  if (ctx.enumStrings.has(memoKey)) return ctx.enumStrings.get(memoKey)
+  let out = null
+  try { out = deriveEnumConstantStrings(en, accessorRef, universe) } catch { out = null }
+  ctx.enumStrings.set(memoKey, out)
+  return out
+}
+
+function deriveEnumConstantStrings (en, accessorRef, universe) {
+  const p = universe.get(en)
+  if (!p) return null
+  const enumFields = new Set(p.fields.filter((f) => f.desc === `L${en};` && (f.flags & 0x4000)).map((f) => f.name))
+  const clinit = p.codes.find((m) => m.method === '<clinit>')
+  if (!clinit) return null
+  const consts = [] // {field, strs} in putstatic order
+  for (const stmt of statements(decodeInstructions(clinit.code, p.cp))) {
+    const put = stmt[stmt.length - 1]
+    if (!put.ref || put.ref.owner !== en || !enumFields.has(put.ref.name)) continue
+    if (stmt.some((r) => r.target !== undefined)) return null
+    consts.push({ field: put.ref.name, strs: stmt.filter((r) => r.str !== undefined).map((r) => r.str), ctorDesc: [...stmt].reverse().find((r) => r.op === 0xb7 && r.ref && r.ref.name === '<init>' && r.ref.owner === en)?.ref.desc })
+  }
+  if (consts.length !== enumFields.size) return null
+  // the accessor body
+  let mode = null
+  if (accessorRef.owner === 'java/lang/Enum' && accessorRef.name === 'name') mode = { name: true, fold: null }
+  else {
+    const m = universeMethod(universe, accessorRef.owner, accessorRef.name, accessorRef.desc)
+    if (!m) return null
+    const body = m.rows.filter((r) => r.op !== 0x00)
+    if (body.length === 3 && body[0].aload === 0 && body[1].op === 0xb4 && body[1].ref && body[1].ref.owner === en && body[2].op === 0xb0) {
+      mode = { field: body[1].ref.name }
+    } else if (body.length >= 3 && body[0].aload === 0 && body[1].op === 0xb6 && body[1].ref && body[1].ref.name === 'name' && body[1].ref.desc === '()Ljava/lang/String;' && body[body.length - 1].op === 0xb0) {
+      const mid = body.slice(2, -1)
+      const fold = mid.find((r) => r.op === 0xb6 && r.ref && r.ref.owner === STRING_CLS && (r.ref.name === 'toLowerCase' || r.ref.name === 'toUpperCase'))
+      if (mid.some((r) => !(r.op === 0xb2 || (r.op === 0xb6 && r.ref && r.ref.owner === STRING_CLS)))) return null
+      mode = { name: true, fold: fold ? fold.ref.name : null }
+    } else return null
+  }
+  if (mode.name) {
+    const names = []
+    for (const c of consts) {
+      if (c.strs[0] !== c.field) return null // javac passes the constant's own name first
+      names.push(mode.fold === 'toLowerCase' ? c.field.toLowerCase() : mode.fold === 'toUpperCase' ? c.field.toUpperCase() : c.field)
     }
+    return names
+  }
+  // field mode: which String parameter does the constructor store into it?
+  const ctorDesc = consts[0].ctorDesc
+  if (!ctorDesc || consts.some((c) => c.ctorDesc !== ctorDesc)) return null
+  const init = universeMethod(universe, en, '<init>', ctorDesc)
+  if (!init) return null
+  let slot = null
+  for (let i = 1; i < init.rows.length; i++) {
+    const r = init.rows[i]
+    if (r.op === 0xb5 && r.ref && r.ref.owner === en && r.ref.name === mode.field) {
+      const prev = init.rows[i - 1]
+      if (prev.aload === undefined || prev.aload === 0) return null
+      slot = prev.aload
+      break
+    }
+  }
+  if (slot == null) return null
+  const params = descParamTypes(ctorDesc)
+  let s = 1
+  let stringOrdinal = -1
+  let hit = null
+  params.forEach((t) => {
+    if (t === STR_DESC) stringOrdinal++
+    if (s === slot) hit = t === STR_DESC ? stringOrdinal : null
+    s += (t === 'J' || t === 'D') ? 2 : 1
+  })
+  if (hit == null) return null
+  const stringParams = params.filter((t) => t === STR_DESC).length
+  const names = []
+  for (const c of consts) {
+    if (c.strs.length !== stringParams) return null // a non-literal String argument: not derivable
+    names.push(c.strs[hit])
+  }
+  return names
+}
+
+// the registry NAME(S) a symbolic value stands for: one literal, or the
+// ordered list an enum-loop recipe expands to. null = not derivable.
+function nameValuesOf (sym, universe, ctx, depth = 0) {
+  if (!sym || depth > 6) return null
+  if (sym.k === 'str') return [sym.v]
+  if (sym.k === 'indy') {
+    const info = indyInfo(sym.parsed, sym.bsmIndex)
+    if (!info || info.kind !== 'concat' || info.recipe == null) return null
+    const parts = sym.captures.map((c) => nameValuesOf(c, universe, ctx, depth + 1))
+    if (parts.some((x) => !x)) return null
+    const pieces = []
+    let ai = 0
+    let ci = 0
+    let lit = ''
+    for (const ch of info.recipe) {
+      if (ch === '' || ch === '') {
+        if (lit) { pieces.push(lit); lit = '' }
+        if (ch === '') { if (ai >= parts.length) return null; pieces.push(parts[ai++]) } else { const c = info.consts[ci++]; if (c == null) return null; pieces.push(c) }
+      } else lit += ch
+    }
+    if (lit) pieces.push(lit)
+    if (ai !== parts.length) return null
+    const varying = pieces.filter((x) => Array.isArray(x) && x.length > 1)
+    if (varying.length > 1) return null
+    const n = varying.length ? varying[0].length : 1
+    const out = []
+    for (let c = 0; c < n; c++) out.push(pieces.map((x) => typeof x === 'string' ? x : (x.length === 1 ? x[0] : x[c])).join(''))
+    return out
+  }
+  if (sym.k === 'call' && sym.ref) {
+    const ref = sym.ref
+    if (ref.owner === STRING_CLS && (ref.name === 'toLowerCase' || ref.name === 'toUpperCase') && retDesc(ref.desc) === STR_DESC) {
+      const inner = nameValuesOf(sym.recv, universe, ctx, depth + 1)
+      return inner ? inner.map((s) => ref.name === 'toLowerCase' ? s.toLowerCase() : s.toUpperCase()) : null
+    }
+    if (ref.desc === '()Ljava/lang/String;' && sym.recv) {
+      const en = enumOfSym(sym.recv, universe)
+      if (en) return enumConstantStrings(en, ref, universe, ctx)
+    }
+  }
+  return null
+}
+
+// the block FACTORY a symbolic value stands for: {cls, ctorDesc, factoryRows}
+// from a Class::new handle, a lambda whose body constructs a block, a `new`,
+// or a static producer returning a block-typed value (one hop). null = none.
+function factoryOfSym (sym, parsed, universe, vocab) {
+  if (!sym) return null
+  if (sym.k === 'indy') {
+    const info = indyInfo(sym.parsed, sym.bsmIndex)
+    if (!info || info.kind !== 'lambda') return null
+    return factoryFromImpl(info.impl, sym.parsed, universe, vocab)
+  }
+  if (sym.k === 'new') return chainReachesBlock(sym.cls, universe, vocab) ? { cls: sym.cls, ctorDesc: null, factoryRows: null } : null
+  if (sym.k === 'call' && sym.ref && sym.ref.desc.startsWith('(')) {
+    const rd = retDesc(sym.ref.desc)
+    if (!rd || !chainReachesBlock(rd.slice(1, -1), universe, vocab)) return null
+    const body = universeMethod(universe, sym.ref.owner, sym.ref.name, sym.ref.desc)
+    if (!body) return null
+    const n = body.rows.find((r) => r.op === 0xbb && r.cls && chainReachesBlock(r.cls, universe, vocab))
+    return n ? { cls: n.cls, ctorDesc: invokedCtorDesc(n.cls, body.rows), factoryRows: body.rows } : null
+  }
+  return null
+}
+
+// modid of a DeferredRegister: the last string literal of the clinit
+// statement that creates the field the register call reads (memoized over
+// the universe; a registrar class with exactly one register is its own
+// fallback)
+function drModidOf (fieldKey, universe, ctx) {
+  if (ctx.drModids.has(fieldKey)) return ctx.drModids.get(fieldKey)
+  let out = null
+  const [owner] = fieldKey.split('#')
+  const body = universeMethod(universe, owner, '<clinit>', '()V')
+  if (body) {
+    for (const stmt of statements(body.rows)) {
+      const put = stmt[stmt.length - 1]
+      if (!put.ref || `${put.ref.owner}#${put.ref.name}` !== fieldKey || put.ref.desc !== `L${DR_CLS};`) continue
+      const hasCreate = stmt.some((r) => r.op === 0xb8 && r.ref && r.ref.owner === DR_CLS && r.ref.name === 'create')
+      if (!hasCreate) continue
+      const strs = stmt.filter((r) => r.str !== undefined).map((r) => r.str)
+      if (strs.length) out = strs[strs.length - 1]
+      break
+    }
+  }
+  ctx.drModids.set(fieldKey, out)
+  return out
+}
+
+function drModidOfSym (recv, parsed, universe, ctx) {
+  if (recv && recv.k === 'field' && recv.ref && recv.ref.desc === `L${DR_CLS};`) {
+    const m = drModidOf(`${recv.ref.owner}#${recv.ref.name}`, universe, ctx)
+    if (m) return m
+  }
+  // fallback: the class creates exactly one DeferredRegister
+  const keys = []
+  for (const f of parsed.fields) if (f.desc === `L${DR_CLS};`) keys.push(`${parsed.className}#${f.name}`)
+  const modids = [...new Set(keys.map((k) => drModidOf(k, universe, ctx)).filter(Boolean))]
+  return modids.length === 1 ? modids[0] : null
+}
+
+function isDrRegister (r) {
+  return r.op === 0xb6 && r.ref && r.ref.owner === DR_CLS && r.ref.name === 'register' && r.ref.desc === DR_REGISTER_DESC
+}
+
+// registration SITES of one method: every matching call whose name(s) and
+// factory resolve. Sites inside a loop (a backward branch spans them) whose
+// name lists share a length are emitted CONSTANT-MAJOR - the order the loop
+// body actually registers in (name_<c> then other_<c> for each c).
+function collectSites (parsed, method, universe, vocab, ctx, matcher, argsOf) {
+  const sites = []
+  const rows = symbolicWalk(parsed, method, (r, i, recv, args, stmtRows) => {
+    if (!matcher(r)) return
+    const picked = argsOf(r, recv, args, stmtRows)
+    if (!picked) return
+    const names = nameValuesOf(picked.nameSym, universe, ctx)
+    if (!names || !names.length) return
+    const fac = factoryOfSym(picked.factorySym, parsed, universe, vocab)
+    if (!fac) return
+    sites.push({ pc: r.pc, names, fac, modid: picked.modid, stmtRows })
+  })
+  if (!sites.length) return []
+  const loops = rows.filter((r) => r.target !== undefined && r.target <= r.pc).map((r) => ({ start: r.target, end: r.pc }))
+  const regionOf = (pc) => {
+    let best = null
+    for (const l of loops) if (pc >= l.start && pc <= l.end && (!best || (l.end - l.start) < (best.end - best.start))) best = l
+    return best
+  }
+  const out = []
+  const done = new Set()
+  for (const s of sites) {
+    if (done.has(s)) continue
+    const region = regionOf(s.pc)
+    const group = region ? sites.filter((x) => regionOf(x.pc) === region) : [s]
+    for (const g of group) done.add(g)
+    const n = group[0].names.length
+    const uniform = group.every((g) => g.names.length === n)
+    if (uniform) {
+      for (let c = 0; c < n; c++) for (const g of group) out.push({ name: g.names[c], site: g })
+    } else {
+      for (const g of group) for (const nm of g.names) out.push({ name: nm, site: g })
+    }
+  }
+  return out
+}
+
+function pushRegistration (out, name, site, vocab) {
+  const { fac, modid, stmtRows } = site
+  if (!modid || !name || name.includes(':') || name.includes(' ')) return
+  out.push({
+    name: `${modid}:${name}`,
+    cls: fac.cls,
+    supplierRows: fac.factoryRows ?? stmtRows,
+    era: vocab.era,
+    ctorDesc: fac.ctorDesc ?? invokedCtorDesc(fac.cls, stmtRows)
+  })
+}
+
+// ---------------------------------------------------------------------------
+// registration extraction (Forge DeferredRegister): every DR.register call
+// in any method of the class whose name resolves - a literal, or an
+// enum-loop recipe (HF58b)
+function forgeRegistrations (parsed, universe, vocab, out, ctx) {
+  for (const method of parsed.codes) {
+    const emitted = collectSites(parsed, method, universe, vocab, ctx, isDrRegister, (r, recv, args) => {
+      const modid = drModidOfSym(recv, parsed, universe, ctx)
+      return modid ? { nameSym: args[0], factorySym: args[1], modid } : null
+    })
+    for (const e of emitted) pushRegistration(out, e.name, e.site, vocab)
+  }
+}
+
+// HF58b: a mod's OWN registration helper - a static method whose body calls
+// DR.register with one of its own String parameters as the name (directly,
+// or by forwarding to such a helper). Returns {owner, name, desc, nameParam,
+// modid} or null.
+function drHelperSignature (parsed, method, universe, ctx, known) {
+  if (!(method.flags & 0x0008)) return null
+  const slots = paramSlotsOf(method.desc)
+  let found = null
+  symbolicWalk(parsed, method, (r, i, recv, args) => {
+    if (found) return
+    let nameSym = null
+    let modid = null
+    if (isDrRegister(r)) {
+      nameSym = args[0]
+      modid = drModidOfSym(recv, parsed, universe, ctx)
+    } else {
+      const h = r.op === 0xb8 && r.ref ? known.get(`${r.ref.owner}#${r.ref.name}#${r.ref.desc}`) : null
+      if (!h) return
+      nameSym = args[h.nameParam]
+      modid = h.modid
+    }
+    if (!modid || !nameSym || nameSym.k !== 'param') return
+    const ps = slots.get(nameSym.n)
+    if (!ps || ps.type !== STR_DESC) return
+    found = { owner: parsed.className, name: method.method, desc: method.desc, nameParam: ps.index, modid }
+  })
+  return found
+}
+
+// call sites of a DR helper across one parsed class: the name argument
+// resolves like any registration (literal or loop recipe), the factory is
+// whichever argument stands for a block factory
+function drHelperCallSites (parsed, helper, universe, vocab, out, ctx) {
+  const isHelperCall = (r) => r.op === 0xb8 && r.ref &&
+    r.ref.owner === helper.owner && r.ref.name === helper.name && r.ref.desc === helper.desc
+  for (const method of parsed.codes) {
+    if (parsed.className === helper.owner && method.method === helper.name && method.desc === helper.desc) continue
+    const emitted = collectSites(parsed, method, universe, vocab, ctx, isHelperCall, (r, recv, args) => {
+      const factorySym = args.find((a, i) => i !== helper.nameParam && factoryOfSym(a, parsed, universe, vocab))
+      return factorySym ? { nameSym: args[helper.nameParam], factorySym, modid: helper.modid } : null
+    })
+    for (const e of emitted) pushRegistration(out, e.name, e.site, vocab)
   }
 }
 
@@ -1101,6 +1665,9 @@ function deriveBlockShapes (jarPaths) {
   const consumerHelpers = new Map() // 'owner#name#desc' -> {helper, vocab}
   const rgCtx = { fieldModids: new Map(), typeModids: new Map() }
   const rgClasses = [] // registrate registration candidates (second sweep so modid creation bindings exist first)
+  const ctx = { enumStrings: new Map(), drModids: new Map() } // HF58b: memo for the enum-loop / helper registrars
+  const drRegClasses = [] // HF58b: DeferredRegister-referencing classes (helper signatures need every class parsed first)
+  const drHelpers = new Map() // 'owner#name#desc' -> {helper, vocab}
   const rgBytes = Buffer.from(RG_PKG)
   const rgBbBytes = Buffer.from(RG_BB)
   const funcBytes = Buffer.from('java/util/function/')
@@ -1118,11 +1685,11 @@ function deriveBlockShapes (jarPaths) {
       let parsed
       try { parsed = parseClassFile(raw) } catch { continue }
       if (!parsed) continue
-      const era = eraOfClass(parsed) ?? (isFabricReg ? 'intermediary' : 'srg')
-      const vocab = VOCABS[era]
+      const era = universe.eraOf(cls, parsed) ?? (isFabricReg ? 'intermediary' : 'srg')
+      const vocab = VOCABS[era] || VOCABS.srg
       if (isForgeReg || isFabricReg || isRegistrate) stats.regClasses++
       try {
-        if (isForgeReg) forgeRegistrations(parsed, universe, vocab, regs)
+        if (isForgeReg) { forgeRegistrations(parsed, universe, vocab, regs, ctx); drRegClasses.push({ parsed, vocab }) }
         if (isFabricReg) {
           fabricDirectRegistrations(parsed, universe, vocab, regs)
           for (const m of parsed.codes) {
@@ -1148,6 +1715,20 @@ function deriveBlockShapes (jarPaths) {
       }
     }
   }
+  // HF58b: the mods' own DeferredRegister helpers (two rounds: a helper
+  // that forwards its name parameter to another helper resolves once the
+  // target is known)
+  for (let round = 0; round < 2; round++) {
+    for (const { parsed, vocab } of drRegClasses) {
+      for (const m of parsed.codes) {
+        const key = `${parsed.className}#${m.method}#${m.desc}`
+        if (drHelpers.has(key)) continue
+        let h = null
+        try { h = drHelperSignature(parsed, m, universe, ctx, new Map([...drHelpers].map(([k, v]) => [k, v.helper]))) } catch { h = null }
+        if (h) drHelpers.set(key, { helper: h, vocab })
+      }
+    }
+  }
   // registrate registrations (after creation bindings are collected)
   for (const { parsed, vocab } of rgClasses) {
     try {
@@ -1160,7 +1741,8 @@ function deriveBlockShapes (jarPaths) {
   // not reference the Registry/sink classes themselves)
   const helperPasses = [
     ...[...fabricHelpers.values()].map((h) => ({ helper: h, vocab: VOCABS.intermediary, sites: fabricHelperCallSites })),
-    ...[...consumerHelpers.values()].map((e) => ({ helper: e.helper, vocab: e.vocab, sites: consumerHelperCallSites }))
+    ...[...consumerHelpers.values()].map((e) => ({ helper: e.helper, vocab: e.vocab, sites: consumerHelperCallSites })),
+    ...[...drHelpers.values()].map((e) => ({ helper: e.helper, vocab: e.vocab, sites: (p, h, u, v, o) => drHelperCallSites(p, h, u, v, o, ctx) }))
   ]
   for (const { helper, vocab, sites } of helperPasses) {
     const ownerBytes = Buffer.from(helper.owner)
@@ -1188,21 +1770,34 @@ function deriveBlockShapes (jarPaths) {
       // extraction of the same chain (keep it); differing class = genuinely
       // ambiguous evidence => abstain
       if (regCls.get(reg.name) !== reg.cls) {
-        blocks.set(reg.name, { shape: 'abstain', stateCount: null, cls: reg.cls, why: 'duplicate registration' })
+        blocks.set(reg.name, { shape: 'abstain', stateCount: null, stateIndex: null, witness: 'unknown', cls: reg.cls, why: 'duplicate registration' })
       }
       continue
     }
     regCls.set(reg.name, reg.cls)
-    const vocab = VOCABS[reg.era]
+    // HF58b: the BLOCK class's own era decides the vocabulary its state
+    // definition is read with (a registrar and its blocks can differ only
+    // in a mixed jar; the registrar's era is the fallback)
+    const clsParsed = universe.has(reg.cls) ? universe.get(reg.cls) : null
+    const clsEra = clsParsed ? universe.eraOf(reg.cls, clsParsed) : null
+    const vocab = VOCABS[clsEra] || VOCABS[reg.era]
     let entry
     try {
       const sol = reg.registrate
         ? registrateSolidity(reg, universe, vocab)
         : solidityOf(reg.cls, reg.supplierRows, universe, vocab, reg.ctorDesc)
-      const stateCount = stateCountOf(reg.cls, universe, vocab)
-      entry = { shape: sol.shape, stateCount, cls: reg.cls, why: sol.why }
+      const idx = stateIndexOf(reg.cls, universe, vocab)
+      entry = {
+        shape: sol.shape,
+        stateCount: idx ? idx.count : null,
+        stateIndex: idx && idx.props ? { props: idx.props } : null,
+        witness: idx ? 'bytecode' : 'unknown',
+        era: vocab.era,
+        cls: reg.cls,
+        why: sol.why
+      }
     } catch (err) {
-      entry = { shape: 'abstain', stateCount: null, cls: reg.cls, why: `derivation error: ${err.message}` }
+      entry = { shape: 'abstain', stateCount: null, stateIndex: null, witness: 'unknown', cls: reg.cls, why: `derivation error: ${err.message}` }
     }
     blocks.set(reg.name, entry)
   }
@@ -1210,6 +1805,7 @@ function deriveBlockShapes (jarPaths) {
   for (const b of blocks.values()) {
     stats[b.shape] = (stats[b.shape] ?? 0) + 1
     if (b.stateCount != null) stats.counted++
+    if (b.stateIndex) stats.indexed = (stats.indexed ?? 0) + 1
   }
   stats.ms = Date.now() - t0
   debug(`shape scan: ${stats.registrations} blocks from ${stats.units} jar units in ${stats.ms}ms ` +
@@ -1217,4 +1813,4 @@ function deriveBlockShapes (jarPaths) {
   return { blocks, stats }
 }
 
-module.exports = { deriveBlockShapes, _internal: { buildUniverse, eraOfClass, VOCABS, chainOf, stateCountOf, solidityOf, ctorChainSignals } }
+module.exports = { deriveBlockShapes, decodeStateIndex, _internal: { buildUniverse, eraOfClass, VOCABS, chainOf, stateCountOf, stateIndexOf, solidityOf, ctorChainSignals, symbolicWalk, nameValuesOf } }

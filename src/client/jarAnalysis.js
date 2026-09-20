@@ -23,8 +23,8 @@ function zipCentralEntries (buf) {
     if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
   }
   if (eocd < 0) throw new Error('no zip end-of-central-directory')
-  const count = buf.readUInt16LE(eocd + 10)
-  let off = buf.readUInt32LE(eocd + 16)
+  const { count, cdOffset } = zipDirectoryBounds(buf, eocd)
+  let off = cdOffset
   const entries = []
   for (let i = 0; i < count; i++) {
     if (off + 46 > buf.length || buf.readUInt32LE(off) !== 0x02014b50) break
@@ -38,6 +38,28 @@ function zipCentralEntries (buf) {
     off += 46 + nameLen + buf.readUInt16LE(off + 30) + buf.readUInt16LE(off + 32)
   }
   return entries
+}
+
+// HF58b: the central-directory entry count and offset. The classic EOCD
+// carries 16-bit/32-bit fields that SATURATE (0xFFFF / 0xFFFFFFFF) on a
+// ZIP64 archive (a jar past 65,535 entries or 4 GiB); the true values then
+// live in the ZIP64 EOCD record, reached through the ZIP64 locator that
+// immediately precedes the classic EOCD (APPNOTE 4.3.14 / 4.3.15). A
+// saturated field with no readable locator/record keeps the classic value
+// (the walk then stops at the first malformed record as before).
+function zipDirectoryBounds (buf, eocd) {
+  let count = buf.readUInt16LE(eocd + 10)
+  let cdOffset = buf.readUInt32LE(eocd + 16)
+  if (count !== 0xFFFF && cdOffset !== 0xFFFFFFFF) return { count, cdOffset }
+  const loc = eocd - 20
+  if (loc < 0 || buf.readUInt32LE(loc) !== 0x07064b50) return { count, cdOffset }
+  const rec64 = Number(buf.readBigUInt64LE(loc + 8))
+  if (rec64 + 56 > buf.length || buf.readUInt32LE(rec64) !== 0x06064b50) return { count, cdOffset }
+  const count64 = Number(buf.readBigUInt64LE(rec64 + 32)) // total entries in the central directory
+  const off64 = Number(buf.readBigUInt64LE(rec64 + 48)) // central directory offset
+  if (count === 0xFFFF) count = count64
+  if (cdOffset === 0xFFFFFFFF) cdOffset = off64
+  return { count, cdOffset }
 }
 
 function zipEntryData (buf, entry) {
@@ -258,6 +280,8 @@ function decodeInstructions (code, cp) {
       case 0x11: row.int = code.readInt16BE(pc + 1); break // sipush
       case 0x19: row.aload = code[pc + 1]; break // aload <n>
       case 0x2a: case 0x2b: case 0x2c: case 0x2d: row.aload = op - 0x2a; break // aload_0..3
+      case 0x3a: row.astore = code[pc + 1]; break // astore <n> (HF58b: local definitions for the loop-registrar walk)
+      case 0x4b: case 0x4c: case 0x4d: case 0x4e: row.astore = op - 0x4b; break // astore_0..3
       case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
         row.int = op - 0x03; break // iconst_m1..iconst_5
       case 0xb2: case 0xb3: case 0xb4: case 0xb5: // getstatic/putstatic/getfield/putfield
@@ -267,7 +291,7 @@ function decodeInstructions (code, cp) {
         row.cls = cpClassName(cp, code.readUInt16BE(pc + 1)); break
       case 0xba: { // invokedynamic
         const c = cp[code.readUInt16BE(pc + 1)]
-        if (c && c.bsmIndex !== undefined) { row.bsmIndex = c.bsmIndex; const nat = cp[c.natIndex]; if (nat) row.samName = cpUtf8(cp, nat.nameIndex) }
+        if (c && c.bsmIndex !== undefined) { row.bsmIndex = c.bsmIndex; const nat = cp[c.natIndex]; if (nat) { row.samName = cpUtf8(cp, nat.nameIndex); row.samDesc = cpUtf8(cp, nat.descIndex) } }
         break
       }
       case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f:
@@ -354,6 +378,7 @@ function javaStringHash (s) {
 module.exports = {
   readAnnotationsAttr,
   zipCentralEntries,
+  zipDirectoryBounds,
   zipEntryData,
   parseClassFile,
   walkBytecode,

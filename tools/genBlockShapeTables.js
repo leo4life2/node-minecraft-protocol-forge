@@ -45,6 +45,17 @@
 //   --tiny    mappings/mappings.tiny out of https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.1/intermediary-1.20.1-v2.jar
 //   --mc-data node_modules/minecraft-data
 //
+// HF58b MOJMAP ERA (Forge 1.20.2+ / NeoForge / 26.x jars carry Mojang member
+// names): a third namespace 'mojmap' generated from a Mojang-named server jar
+// (Mojang ships deobfuscated server jars from 26.1) and MERGED into the
+// existing file, whose srg/intermediary namespaces are kept and enriched with
+// the state-index value orders (propCard.kind/min/values) of their own version:
+//   node tools/genBlockShapeTables.js --era mojmap \
+//     --jar <server-26.3-unpacked.jar (the Forge 26.3 installer's libraries/net/minecraft/server/26.3/)> \
+//     --mc-data <node_modules/minecraft-data> --mc-version 26.3 \
+//     --merge src/client/data/blockShapeTables.json --out src/client/data/blockShapeTables.json
+//   (shipped table: 2026-09-20, server-26.3-unpacked.jar sha1 cc3964451a3b32a0488110d5e3e6ad8d75fe6a66, self-test 878/878)
+//
 // Usage:
 //   node tools/genBlockShapeTables.js \
 //     --srg-jar <server-...-srg.jar> --tsrg <joined.tsrg> \
@@ -54,7 +65,7 @@
 const fs = require('fs')
 const path = require('path')
 const {
-  zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions
+  zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions, resolveLambdaImpl
 } = require('../src/client/jarAnalysis')
 const { WRITES } = require('../src/client/friendlyByteBufWrites')
 
@@ -66,7 +77,10 @@ function parseArgs () {
   const a = process.argv.slice(2)
   const out = {}
   for (let i = 0; i < a.length; i += 2) out[a[i].replace(/^--/, '')] = a[i + 1]
-  for (const k of ['srg-jar', 'tsrg', 'tiny', 'mojmap', 'mc-data', 'mc-version', 'out']) {
+  const required = out.era === 'mojmap'
+    ? ['jar', 'mc-data', 'mc-version', 'out'] // HF58b: --era mojmap --jar <Mojang-named server jar> [--merge <existing tables>]
+    : ['srg-jar', 'tsrg', 'tiny', 'mojmap', 'mc-data', 'mc-version', 'out']
+  for (const k of required) {
     if (!out[k]) { console.error(`missing --${k}`); process.exit(2) }
   }
   return out
@@ -134,13 +148,13 @@ function classifyPropertyStatement (stmt) {
   if (d.startsWith('(Ljava/lang/String;II)')) {
     const ints = stmt.filter((r) => r.int !== undefined).map((r) => r.int)
     const [lo, hi] = ints.slice(-2)
-    if (hi !== undefined) return { kind: 'value', name, card: hi - lo + 1, put }
+    if (hi !== undefined) return { kind: 'value', name, card: hi - lo + 1, min: lo, propKind: 'int', put }
     return { kind: 'unknown', name, put }
   }
   if (d.startsWith('(Ljava/lang/String;)')) {
     // BooleanProperty.create(name) => 2; DirectionProperty.create(name) => all 6
-    const card = d.endsWith(`L${P}DirectionProperty;`) ? 6 : 2
-    return { kind: 'value', name, card, put }
+    const isDir = d.endsWith(`L${P}DirectionProperty;`)
+    return { kind: 'value', name, card: isDir ? 6 : 2, propKind: isDir ? 'enum' : 'bool', put }
   }
   if (d.startsWith('(Ljava/lang/String;Ljava/lang/Class;)')) {
     const clsRow = [...stmt].reverse().find((r) => (r.op === 0x12 || r.op === 0x13) && r.cls)
@@ -148,19 +162,128 @@ function classifyPropertyStatement (stmt) {
   }
   // varargs / collection / predicate flavors: count aastores when present
   const aastores = stmt.filter((r) => r.op === 0x53).length
-  if (aastores > 0) return { kind: 'value', name, card: aastores, put }
+  if (aastores > 0) return { kind: 'value', name, card: aastores, propKind: 'enum', put }
   return { kind: 'unsolved', name, create: create.ref, put }
+}
+
+function loadMcData (args, mcVersion) {
+  const dataRoot = path.join(args['mc-data'], 'minecraft-data', 'data')
+  const dataPaths = JSON.parse(fs.readFileSync(path.join(dataRoot, 'dataPaths.json'), 'utf8'))
+  const blocksRel = dataPaths.pc[mcVersion].blocks
+  return JSON.parse(fs.readFileSync(path.join(dataRoot, blocksRel, 'blocks.json'), 'utf8'))
+}
+
+// property name + cardinality -> {type, values} from minecraft-data's per-block
+// state lists; a pair whose value list differs between blocks is 'ambiguous'
+// (never exported - a wrong value order would misname states).
+function buildValueIndex (mcData) {
+  const idx = new Map()
+  for (const b of mcData) {
+    for (const s of b.states || []) {
+      const k = `${s.name}#${s.num_values}`
+      const values = s.type === 'bool' ? ['true', 'false'] : (s.values || []).map(String)
+      const cur = idx.get(k)
+      if (cur === undefined) idx.set(k, { type: s.type, values })
+      else if (cur !== 'ambiguous' && (cur.type !== s.type || cur.values.join(',') !== values.join(','))) idx.set(k, 'ambiguous')
+    }
+  }
+  return idx
+}
+
+// HF58b: enrich an already-generated namespace's propCard with the value
+// orders of its own minecraft version (the srg/intermediary tables keep
+// their vocabulary; only the state-index fields are added).
+function enrichValues (ns, valueIndex) {
+  for (const v of Object.values(ns.propCard || {})) {
+    if (!v || !v.name || v.card == null) continue
+    const vi = valueIndex.get(`${v.name}#${v.card}`)
+    if (!vi || vi === 'ambiguous') continue
+    if (!v.kind) v.kind = vi.type
+    if (vi.type === 'int' && v.min == null && vi.values.length) v.min = Number(vi.values[0])
+    if (vi.type === 'enum' && !v.values) v.values = vi.values
+  }
 }
 
 function main () {
   const args = parseArgs()
+  if (args.era === 'mojmap') return mainMojmap(args)
   const jar = jarIndex(args['srg-jar'])
-  const dataRoot = path.join(args['mc-data'], 'minecraft-data', 'data')
-  const dataPaths = JSON.parse(fs.readFileSync(path.join(dataRoot, 'dataPaths.json'), 'utf8'))
-  const blocksRel = dataPaths.pc[args['mc-version']].blocks
-  const mcData = JSON.parse(fs.readFileSync(path.join(dataRoot, blocksRel, 'blocks.json'), 'utf8'))
-  const mdByName = new Map(mcData.map((b) => [b.name, b]))
+  const mcData = loadMcData(args, args['mc-version'])
+  const valueIndex = buildValueIndex(mcData)
+  const built = buildEraTables(jar, mcData, valueIndex)
+  const srgTables = built.tables
+  const { ok, failures } = built
+  const nameToClass = { size: built.total }
+  const classMapMojToObf = parseProguardClasses(fs.readFileSync(args.mojmap, 'utf8'))
+  const { memberMapSrgToObf } = parseTsrg(fs.readFileSync(args.tsrg, 'utf8'))
+  const tiny = parseTiny(fs.readFileSync(args.tiny, 'utf8'))
+  const inter = translateTables(srgTables, classMapMojToObf, memberMapSrgToObf, tiny)
+  const writeVocab = friendlyByteBufWriteVocab(fs.readFileSync(args.mojmap, 'utf8'), fs.readFileSync(args.tsrg, 'utf8'), tiny, classMapMojToObf)
+  srgTables.ids.friendlyByteBufWrites = writeVocab.srg
+  srgTables.ids.classNames.friendlyByteBuf = FBB_CLS
+  inter.ids.friendlyByteBufWrites = writeVocab.intermediary
+  inter.ids.classNames.friendlyByteBuf = tiny.classes.get(classMapMojToObf.get(FBB_CLS)) ?? null
+  console.log('friendlyByteBufWrites:', JSON.stringify(writeVocab))
 
+  // vanilla no-collision block names (minecraft-data: boundingBox empty)
+  const vanillaNonSolid = mcData.filter((b) => b.boundingBox === 'empty').map((b) => b.name)
+
+  const out = {
+    generated: new Date().toISOString(),
+    generator: 'tools/genBlockShapeTables.js',
+    mcVersion: args['mc-version'],
+    selfTest: { ok, total: nameToClass.size, failures: failures.length },
+    vanillaNonSolid,
+    namespaces: { srg: srgTables, intermediary: inter }
+  }
+  fs.mkdirSync(path.dirname(args.out), { recursive: true })
+  fs.writeFileSync(args.out, JSON.stringify(out))
+  console.log(`wrote ${args.out} (${(fs.statSync(args.out).size / 1024).toFixed(0)} KB)`)
+  if (failures.length) process.exit(1)
+}
+
+// HF58b MOJMAP ERA: Forge 1.20.2+ / NeoForge / any Mojang-named jar - the
+// vocabulary IS the Mojang spelling, read from a Mojang-named server jar of
+// that era (Mojang ships deobfuscated server jars from 26.1; earlier eras
+// take the Forge/NeoForge installer's official-names jar). --merge keeps the
+// other namespaces of an existing tables file and enriches their propCard
+// with the state-index value orders of their own version.
+function mainMojmap (args) {
+  const jar = jarIndex(args.jar)
+  const mcData = loadMcData(args, args['mc-version'])
+  const valueIndex = buildValueIndex(mcData)
+  const built = buildEraTables(jar, mcData, valueIndex)
+  const tables = built.tables
+  // FriendlyByteBuf writes: a Mojang-named jar spells every write by its
+  // Mojang name (identity vocabulary; the shared WRITES table is the list)
+  tables.ids.friendlyByteBufWrites = Object.fromEntries(Object.keys(WRITES).map((w) => [w, [w]]))
+  tables.ids.classNames.friendlyByteBuf = FBB_CLS
+  const vanillaNonSolid = mcData.filter((b) => b.boundingBox === 'empty').map((b) => b.name)
+  let out
+  if (args.merge) {
+    out = JSON.parse(fs.readFileSync(args.merge, 'utf8'))
+    const mergedMcData = loadMcData(args, out.mcVersion)
+    const mergedIndex = buildValueIndex(mergedMcData)
+    for (const ns of Object.values(out.namespaces)) enrichValues(ns, mergedIndex)
+    out.vanillaNonSolid = [...new Set([...out.vanillaNonSolid, ...vanillaNonSolid])]
+  } else {
+    out = { generated: null, generator: 'tools/genBlockShapeTables.js', mcVersion: null, selfTest: null, vanillaNonSolid, namespaces: {} }
+  }
+  out.generated = new Date().toISOString()
+  const jarSha1 = require('crypto').createHash('sha1').update(fs.readFileSync(args.jar)).digest('hex')
+  out.mojmap = { mcVersion: args['mc-version'], jar: path.basename(args.jar), jarSha1, selfTest: { ok: built.ok, total: built.total, failures: built.failures.length } }
+  out.namespaces.mojmap = tables
+  fs.mkdirSync(path.dirname(args.out), { recursive: true })
+  fs.writeFileSync(args.out, JSON.stringify(out))
+  console.log(`wrote ${args.out} (${(fs.statSync(args.out).size / 1024).toFixed(0)} KB) with namespaces ${Object.keys(out.namespaces).join(',')}`)
+  if (built.failures.length) process.exit(1)
+}
+
+// The vocabulary of ONE mapping era, read from ONE deobfuscated server jar
+// and self-tested against that version's minecraft-data (HF58b: shared by
+// the srg pipeline and the mojmap era; nothing here knows which era it is).
+function buildEraTables (jar, mcData, valueIndex) {
+  const mdByName = new Map(mcData.map((b) => [b.name, b]))
   // ---- 1. block-package class set + hierarchy -----------------------------
   const blockClasses = jar.classNames.filter((c) =>
     c.startsWith('net/minecraft/world/level/block/') && !c.includes('$Builder'))
@@ -272,8 +395,8 @@ function main () {
       } else if (r.op === 0xb9 && r.ref && /^java\/util\/(List|Map|Collection|Set|Iterator|Iterable)$/.test(r.ref.owner)) {
         dynamic = true // collection-driven property registration
       } else if ((r.op === 0xb6 || r.op === 0xb7 || r.op === 0xb8) && r.ref &&
-                 /\)L([^;]+);$/.test(r.ref.desc) && isPropDesc(`L${r.ref.desc.match(/\)L([^;]+);$/)[1]};`)) {
-        dynamic = true // a helper PRODUCES properties (MultifaceBlock-style)
+                 /\)\[?L([^;]+);$/.test(r.ref.desc) && isPropDesc(`L${r.ref.desc.match(/\)\[?L([^;]+);$/)[1]};`)) {
+        dynamic = true // a helper PRODUCES properties, one or an ARRAY of them (MultifaceBlock-style; HF58b remediation: the array form too)
       } else if (r.target !== undefined && r.target < r.pc) {
         dynamic = true // backward branch: property registration inside a loop
       }
@@ -286,48 +409,84 @@ function main () {
   const blocksParsed = jar.get(BLOCKS_CLS)
   const clinit = blocksParsed.codes.find((m) => m.method === '<clinit>')
   const rows = decodeInstructions(clinit.code, blocksParsed.cp)
-  const helperNew = (methodName, desc) => {
-    const m = blocksParsed.codes.find((c) => c.method === methodName && c.desc === desc)
-    if (!m) return null
-    const hRows = decodeInstructions(m.code, blocksParsed.cp)
-    const n = hRows.find((r) => r.op === 0xbb && r.cls && hierarchy[r.cls] !== undefined)
-    if (n) return n.cls
-    // helper may itself delegate (one more level)
-    for (const r of hRows) {
-      if (r.op === 0xb8 && r.ref && r.ref.owner === BLOCKS_CLS && returnsBlockClass(r.ref.desc)) {
-        const inner = helperNew(r.ref.name, r.ref.desc)
-        if (inner) return inner
-      }
-    }
-    return null
-  }
   // a method whose return type is any block-package class (helpers return
   // concrete subtypes: log() -> RotatedPillarBlock, bed() -> BedBlock, ...)
   const returnsBlockClass = (desc) => {
     const m = desc.match(/\)L([^;]+);$/)
     return !!(m && (m[1] === BLOCK_CLS || hierarchy[m[1]] !== undefined))
   }
+  // the block class a row window constructs: a `new <block class>`, a
+  // factory handle (Class::new = REF_newInvokeSpecial, or a static lambda of
+  // Blocks whose body constructs one - the 1.21+ register(id, Factory,
+  // Properties) idiom), or a Blocks helper returning a block class (its body
+  // resolved the same way, bounded)
+  const classOfRows = (rows, depth = 0) => {
+    if (depth > 3) return null
+    const n = rows.find((r) => r.op === 0xbb && r.cls && hierarchy[r.cls] !== undefined)
+    if (n) return n.cls
+    for (const r of rows) {
+      if (r.op !== 0xba || r.bsmIndex === undefined) continue
+      const impl = resolveLambdaImpl(blocksParsed, r.bsmIndex)
+      if (!impl) continue
+      if (impl.refKind === 8 && (impl.owner === BLOCK_CLS || hierarchy[impl.owner] !== undefined)) return impl.owner
+      if (impl.owner === BLOCKS_CLS) {
+        const m = blocksParsed.codes.find((c) => c.method === impl.name && c.desc === impl.desc)
+        const viaLambda = m ? classOfRows(decodeInstructions(m.code, blocksParsed.cp), depth + 1) : null
+        if (viaLambda) return viaLambda
+      }
+    }
+    for (const r of rows) {
+      if (r.op === 0xb8 && r.ref && r.ref.owner === BLOCKS_CLS && returnsBlockClass(r.ref.desc) && !r.ref.desc.startsWith('(Ljava/lang/String;')) {
+        const m = blocksParsed.codes.find((c) => c.method === r.ref.name && c.desc === r.ref.desc)
+        const viaHelper = m ? classOfRows(decodeInstructions(m.code, blocksParsed.cp), depth + 1) : null
+        if (viaHelper) return viaHelper
+      }
+    }
+    return null
+  }
+  // the registry name of a Blocks statement: its first string literal, else
+  // (1.21+: register(BlockItemIds.X, ...)) the string that defines the id
+  // constant it reads - the first literal of that constant's own clinit
+  // statement in its declaring class
+  const constNameMemo = new Map()
+  const constNameOf = (owner, field) => {
+    const k = key(owner, field)
+    if (constNameMemo.has(k)) return constNameMemo.get(k)
+    let out = null
+    const p = jar.get(owner)
+    const ci = p && p.codes.find((m) => m.method === '<clinit>')
+    if (ci) {
+      for (const st of statements(decodeInstructions(ci.code, p.cp))) {
+        const put = st[st.length - 1]
+        if (!put.ref || put.ref.owner !== owner || put.ref.name !== field) continue
+        const sr = st.find((r) => r.str !== undefined)
+        out = sr ? sr.str : null
+        break
+      }
+    }
+    constNameMemo.set(k, out)
+    return out
+  }
+  const nameOfStmt = (stmt) => {
+    const sr = stmt.find((r) => r.str !== undefined)
+    if (sr) return sr.str
+    for (const r of stmt) {
+      if (r.op !== 0xb2 || !r.ref || !r.ref.desc.startsWith('L')) continue
+      if (r.ref.owner.startsWith('net/minecraft/world/level/block/') || r.ref.owner === BLOCKS_CLS) continue
+      const n = constNameOf(r.ref.owner, r.ref.name)
+      if (n) return n
+    }
+    return null
+  }
   const blocksFieldToName = {}
   const nameToClass = new Map()
   for (const stmt of statements(rows)) {
     const put = stmt[stmt.length - 1]
     if (!put.ref || put.ref.owner !== BLOCKS_CLS || put.ref.desc !== `L${BLOCK_CLS};`) continue
-    const nameRow = stmt.find((r) => r.str !== undefined)
-    if (!nameRow) continue
-    const name = nameRow.str
+    const name = nameOfStmt(stmt)
+    if (!name) continue
     blocksFieldToName[put.ref.name] = name
-    let cls = null
-    const news = stmt.filter((r) => r.op === 0xbb && r.cls && hierarchy[r.cls] !== undefined)
-    if (news.length) cls = news[0].cls
-    if (!cls) {
-      for (const r of stmt) {
-        if (r.op === 0xb8 && r.ref && r.ref.owner === BLOCKS_CLS && returnsBlockClass(r.ref.desc) && !r.ref.desc.startsWith('(Ljava/lang/String;')) {
-          cls = helperNew(r.ref.name, r.ref.desc)
-          if (cls) break
-        }
-      }
-    }
-    nameToClass.set(name, cls)
+    nameToClass.set(name, classOfRows(stmt))
   }
 
   // ---- 5. effective property set + count per vanilla block ----------------
@@ -510,10 +669,10 @@ function main () {
   }
   let noCollission = null
   const propsOf = []
-  let propsCopy = null
+  const propsCopyAll = [] // every static copy factory (one on 1.20.1; ofFullCopy + ofLegacyCopy on 1.21+)
   for (const m of propsParsed.codes) {
     if (m.desc === `()L${PROPS_CLS};` && (m.flags & 0x0008)) propsOf.push(m.method) // static of()
-    if (m.desc === `(L${BEHAVIOUR_CLS};)L${PROPS_CLS};` && (m.flags & 0x0008)) propsCopy = m.method
+    if (m.desc === `(L${BEHAVIOUR_CLS};)L${PROPS_CLS};` && (m.flags & 0x0008)) propsCopyAll.push(m.method)
     if (m.desc === `()L${PROPS_CLS};` && !(m.flags & 0x0008) && propsHasCollision) {
       const rowsM = decodeInstructions(m.code, propsParsed.cp)
       const writesFalse = rowsM.some((r, i) =>
@@ -540,7 +699,7 @@ function main () {
     getCollisionShape,
     propsNoCollission: noCollission,
     propsOf,
-    propsCopy,
+    propsCopy: propsCopyAll.length === 1 ? propsCopyAll[0] : propsCopyAll,
     registryRegister: registerMethods
   }
   console.log('ids:', JSON.stringify(ids, null, 1))
@@ -568,7 +727,31 @@ function main () {
     if (p.codes.some((m) => m.method === getCollisionShape && shapeDesc(m))) overridesCollision.push(cls)
   }
 
-  const srgTables = {
+  // HF58b STATE INDEX: the value ORDER of every property, so a state id
+  // names its property values. kind/min come from the create call the
+  // bytecode shows; the value list comes from minecraft-data (keyed by
+  // property name + cardinality, kept only when every vanilla block that
+  // uses that pair agrees - 'facing'/4 is the horizontal set everywhere,
+  // 'facing'/6 the full set). Ints and bools need no list (ascending /
+  // [true, false] by the vanilla Property contracts).
+  for (const [k, v] of propCard) {
+    const raw = propRaw.get(k)
+    if (raw && raw.kind === 'value' && raw.propKind) {
+      v.kind = raw.propKind
+      if (raw.min != null) v.min = raw.min
+    } else if (raw && (raw.kind === 'enumAll' || raw.kind === 'unsolved')) v.kind = 'enum'
+    if (v.kind === 'enum' && v.name && v.card != null) {
+      const vi = valueIndex.get(`${v.name}#${v.card}`)
+      if (vi && vi !== 'ambiguous' && vi.type === 'enum') v.values = vi.values
+    }
+  }
+  // unsolved property cardinalities (no vanilla instance pinned them): a
+  // mod class reading one abstains at runtime - named here so the table's
+  // blind spots are visible
+  const unsolvedKeys = [...propCard].filter(([, v]) => v.card == null).map(([k]) => k)
+  const unsolvedUsed = Object.entries(classContrib).filter(([, v]) => v.props.some((pk) => unsolvedKeys.includes(canonPropKey(pk)))).map(([c]) => c.split('/').pop())
+  console.log(`unsolved property cardinalities: ${unsolvedKeys.length} (${unsolvedKeys.map((k) => k.split('/').pop()).join(', ')}); classes reading them: ${unsolvedUsed.join(', ') || 'none'}`)
+  const eraTables = {
     ids: {
       ...ids,
       // override-sensitive method names ship as candidate ARRAYS in every
@@ -586,7 +769,7 @@ function main () {
         propInteger: `${P}IntegerProperty`,
         propBoolean: `${P}BooleanProperty`,
         propEnum: `${P}EnumProperty`,
-        propDirection: `${P}DirectionProperty`,
+        propDirection: jar.get(`${P}DirectionProperty`) ? `${P}DirectionProperty` : null,
         propBase: `${P}Property`
       }
     },
@@ -597,33 +780,7 @@ function main () {
     enumCounts,
     overridesCollision
   }
-
-  const classMapMojToObf = parseProguardClasses(fs.readFileSync(args.mojmap, 'utf8'))
-  const { memberMapSrgToObf } = parseTsrg(fs.readFileSync(args.tsrg, 'utf8'))
-  const tiny = parseTiny(fs.readFileSync(args.tiny, 'utf8'))
-  const inter = translateTables(srgTables, classMapMojToObf, memberMapSrgToObf, tiny)
-  const writeVocab = friendlyByteBufWriteVocab(fs.readFileSync(args.mojmap, 'utf8'), fs.readFileSync(args.tsrg, 'utf8'), tiny, classMapMojToObf)
-  srgTables.ids.friendlyByteBufWrites = writeVocab.srg
-  srgTables.ids.classNames.friendlyByteBuf = FBB_CLS
-  inter.ids.friendlyByteBufWrites = writeVocab.intermediary
-  inter.ids.classNames.friendlyByteBuf = tiny.classes.get(classMapMojToObf.get(FBB_CLS)) ?? null
-  console.log('friendlyByteBufWrites:', JSON.stringify(writeVocab))
-
-  // vanilla no-collision block names (minecraft-data: boundingBox empty)
-  const vanillaNonSolid = mcData.filter((b) => b.boundingBox === 'empty').map((b) => b.name)
-
-  const out = {
-    generated: new Date().toISOString(),
-    generator: 'tools/genBlockShapeTables.js',
-    mcVersion: args['mc-version'],
-    selfTest: { ok, total: nameToClass.size, failures: failures.length },
-    vanillaNonSolid,
-    namespaces: { srg: srgTables, intermediary: inter }
-  }
-  fs.mkdirSync(path.dirname(args.out), { recursive: true })
-  fs.writeFileSync(args.out, JSON.stringify(out))
-  console.log(`wrote ${args.out} (${(fs.statSync(args.out).size / 1024).toFixed(0)} KB)`)
-  if (failures.length) process.exit(1)
+  return { tables: eraTables, ok, total: nameToClass.size, failures }
 }
 
 // -- Mojang official (proguard) mappings: moj class -> obf class ------------

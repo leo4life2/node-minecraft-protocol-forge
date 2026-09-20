@@ -1,0 +1,1 @@
+package syn; import net.minecraft.world.level.block.Block; import net.minecraft.world.level.block.state.*; public class WeirdExtBlock extends Block { public WeirdExtBlock(BlockBehaviour.Properties p) { super(p); } @Override protected void createBlockStateDefinition(StateDefinition.Builder<Block, BlockState> b) { b.add(External.PROP); } }

@@ -1,0 +1,1910 @@
+[
+ {
+  "name": "glow_sticks:glow_stick_light",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickLightBlock",
+  "site_kind": "literal ldc in ModBlocks.<clinit> -> DeferredRegister.register(String,Supplier)",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "glow_sticks:glow_stick_light_water",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickLightWaterBlock",
+  "site_kind": "literal ldc in ModBlocks.<clinit>",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "glow_sticks:glow_stick_white",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_white",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_orange",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_orange",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_magenta",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_magenta",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_light_blue",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_light_blue",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_yellow",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_yellow",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_lime",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_lime",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_pink",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_pink",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_gray",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_gray",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_light_gray",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_light_gray",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_cyan",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_cyan",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_purple",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_purple",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_blue",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_blue",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_brown",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_brown",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_green",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_green",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_red",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_red",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_black",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_black",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_maroon",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_maroon",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_rose",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_rose",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_coral",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_coral",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_indigo",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_indigo",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_navy",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_navy",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_slate",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_slate",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_olive",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_olive",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_amber",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_amber",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_beige",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_beige",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_teal",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_teal",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_mint",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_mint",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_aqua",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_aqua",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_verdant",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_verdant",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_forest",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_forest",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_ginger",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_ginger",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "glow_sticks:glow_stick_tan",
+  "class": "de/markusbordihn/glowsticks/block/GlowStickBlock",
+  "site_kind": "enum-loop: for GlowStickColor.values() -> getName() -> makeConcatWithConstants \"glow_stick_\\u0001\" -> DR.register",
+  "properties": [
+   {
+    "name": "level",
+    "kind": "IntegerProperty 0..31",
+    "count": 32
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING [north,south,west,east]",
+    "count": 4
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty [true,false]",
+    "count": 2
+   }
+  ],
+  "count": 256
+ },
+ {
+  "name": "glow_sticks:creative_glow_stick_tan",
+  "class": "de/markusbordihn/glowsticks/block/CreativeGlowStickBlock",
+  "site_kind": "enum-loop: same loop, \"creative_glow_stick_\\u0001\"",
+  "properties": [
+   {
+    "name": "face",
+    "kind": "EnumProperty AttachFace [floor,wall,ceiling]",
+    "count": 3
+   },
+   {
+    "name": "facing",
+    "kind": "DirectionProperty HORIZONTAL_FACING",
+    "count": 4
+   },
+   {
+    "name": "variant",
+    "kind": "IntegerProperty 0..5",
+    "count": 6
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty",
+    "count": 2
+   },
+   {
+    "name": "redstone_control",
+    "kind": "IntegerProperty 0..16",
+    "count": 17
+   }
+  ],
+  "count": 2448
+ },
+ {
+  "name": "foodtxf:rice",
+  "class": "com/jahirtrap/foodtxf/block/RiceCropBlock",
+  "site_kind": "own static helper ModContent.registerBlock(String,Function,Properties) -> lambda -> DR.register(name param); factory RiceCropBlock::new",
+  "properties": [
+   {
+    "name": "age",
+    "kind": "IntegerProperty AGE_7 0..7 (CropBlock super)",
+    "count": 8
+   },
+   {
+    "name": "waterlogged",
+    "kind": "BooleanProperty (RiceCropBlock CSD)",
+    "count": 2
+   }
+  ],
+  "count": 16
+ },
+ {
+  "name": "foodtxf:black_kitchen_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper registerBlock; factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "foodtxf:white_kitchen_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper registerBlock; factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:raw_steel_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:raw_bronze_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:raw_lead_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:raw_silver_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:raw_tin_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:steel_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:bronze_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:lead_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:silver_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ },
+ {
+  "name": "ingotcraft:tin_block",
+  "class": "net/minecraft/world/level/block/Block",
+  "site_kind": "helper ModContent.registerBlock (ingotcraft); factory Block::new",
+  "properties": [],
+  "count": 1
+ }
+]

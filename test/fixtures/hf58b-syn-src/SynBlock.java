@@ -1,0 +1,1 @@
+package syn; import net.minecraft.world.level.block.Block; import net.minecraft.world.level.block.state.BlockBehaviour; public class SynBlock extends Block { public SynBlock(BlockBehaviour.Properties p) { super(p); } }
