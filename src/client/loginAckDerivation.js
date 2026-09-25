@@ -246,12 +246,21 @@ function newFacts () {
 // a class defines a static String constant (ConstantValue) equal to it —
 // the `MOD_ID = "x"` shape javac folds into every use, which is exactly why
 // the class building the channel id never carries the namespace bytes.
+// Rider HF69a: only a `[[mods]]` table's modId is the jar's OWN id — a
+// `[[dependencies.<x>]]` table names ANOTHER mod's id (forge, minecraft, a
+// library), which this jar does not own.
 function modsTomlDeclares (buf, entries, ns) {
   for (const entry of entries) {
     if (!MODS_TOML_ENTRIES.has(entry.name)) continue
     let text = ''
     try { text = zipEntryData(buf, entry).toString('utf8') } catch { continue }
-    for (const m of text.matchAll(/^\s*modId\s*=\s*"([^"]+)"/gm)) if (m[1] === ns) return true
+    let table = null
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.match(/^\s*\[\[\s*([^\]\s]+)\s*\]\]/)
+      if (t) { table = t[1]; continue }
+      const m = line.match(/^\s*modId\s*=\s*"([^"]+)"/)
+      if (m && table === 'mods' && m[1] === ns) return true
+    }
   }
   return false
 }
@@ -472,17 +481,19 @@ function helperNsOf (facts, owner, name) {
   return ns
 }
 
-// The namespace a (String)->RL helper body fixes: the single ldc string it
-// carries (`new RL(NS, path)`), or — HF69a (B) — when the body builds an RL
-// SUBCLASS from its argument, the namespace that subclass's constructor
-// chain provably prepends. Anything else is unproven (null).
+// The namespace a (String)->RL helper body fixes: HF69a (B) — when the body
+// builds an RL SUBCLASS from its argument, the namespace that subclass's
+// constructor chain provably prepends is THE proof (Rider HF69a: it is read
+// first — a lone string literal beside a subclass ctor is not the namespace
+// the jar's channel wears); otherwise the single ldc string the body carries
+// (`new RL(NS, path)`). Anything else is unproven (null).
 function helperNsFromBody (facts, parsed, m) {
   const ev = eventsFor(facts, parsed, m)
-  const strs = ev.filter((e) => e.k === 'str')
-  if (strs.length === 1) return strs[0].v
   const ctor = ev.find((e) => e.k === 'call' && e.r.name === '<init>' && e.r.desc === '(Ljava/lang/String;)V' &&
     !RL_CLASSES.has(e.r.owner) && isRlClass(facts, e.r.owner))
-  return ctor ? ctorChainNs(facts, ctor.r.owner) : null
+  if (ctor) return ctorChainNs(facts, ctor.r.owner)
+  const strs = ev.filter((e) => e.k === 'str')
+  return strs.length === 1 ? strs[0].v : null
 }
 
 // HF69a (B): the namespace an RL subclass's (String) constructor prepends to

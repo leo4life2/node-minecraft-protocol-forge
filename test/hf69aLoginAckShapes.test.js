@@ -280,4 +280,46 @@ describe('HF69a - split constants, RL subclasses, direction-less login packets w
     assert.strictEqual(_internal.methodWritesNothing(facts, { owner: SYNC, name: 'toBytes', desc: `(L${FBB};)V` }), false)
     assert.strictEqual(_internal.methodWritesNothing(facts, { owner: `${PKG}/Missing`, name: 'x', desc: '()V' }), null)
   })
+
+  it('Rider H11 a helper body with ONE string literal beside a subclass ctor takes the ctor chain as the proof, never the literal', () => {
+    // the verifier's P7: `id(s) { "splitns"; return new ModRL(s) }` while ModRL prepends "otherns:"
+    const mod = (constNs) => buildClass({
+      name: MOD,
+      fields: [{ name: 'MOD_ID', desc: STR, constValue: constNs }],
+      methods: [{ name: 'id', desc: `(${STR})L${MODRL};`, flags: 0x0009, code: (a) => a.ldcStr('splitns').pop().new_(MODRL).dup().aload(0).invokespecial(MODRL, '<init>', `(${STR})V`).areturn() }]
+    })
+    const entries = (constNs, rlNs) => [
+      { name: `${MOD}.class`, data: mod(constNs) }, { name: `${MODRL}.class`, data: modRlClass({ ns: rlNs }) },
+      { name: `${NET}.class`, data: netClass({}) }, { name: `${SYNC}.class`, data: syncClass() },
+      { name: `${REPLY}.class`, data: replyClass(REPLY) }, { name: `${OTHER}.class`, data: replyClass(OTHER) }]
+    // the verifier's shape: the jar owns splitns (the constant), the literal says splitns, the chain says otherns -> no proof for splitns
+    const dir = writeJarDir('h11', entries('splitns', 'otherns'))
+    assert.strictEqual(assessLoginChannel('splitns:handshake', [dir]).verdict, 'unknown', 'the literal alone proves nothing')
+    // the jar owns otherns: the chain is read past the disagreeing literal
+    const owned = writeJarDir('h11c', entries('otherns', 'otherns'))
+    const r = assessLoginChannel('otherns:handshake', [owned])
+    assert.strictEqual(r.verdict, 'ack')
+    assert.strictEqual(r.index, 3)
+    const same = writeJarDir('h11b', entries('splitns', 'splitns'))
+    assert.strictEqual(assessLoginChannel('splitns:handshake', [same]).verdict, 'ack', 'literal == chain still derives')
+  })
+
+  it('Rider H12 mods.toml: a [[dependencies.*]] modId is another mod\'s id, never this jar\'s ownership; [[mods]] still is', () => {
+    const toml = { name: 'META-INF/mods.toml', data: Buffer.from('modLoader="javafml"\n[[mods]]\n    modId="tomlns"\n[[dependencies.tomlns]]\n    modId="depns"\n    mandatory=true\n[[dependencies.tomlns]]\n    modId="minecraft"\n', 'utf8') }
+    const dir = writeJarDir('h12', [
+      { name: `${MOD}.class`, data: modClass({ ns: 'tomlns', withConstant: false }) }, { name: `${MODRL}.class`, data: modRlClass({ ns: 'tomlns' }) },
+      { name: `${NET}.class`, data: netClass({}) }, { name: `${SYNC}.class`, data: syncClass() },
+      { name: `${REPLY}.class`, data: replyClass(REPLY) }, { name: `${OTHER}.class`, data: replyClass(OTHER) }, toml])
+    const jar = path.join(dir, 'h12.jar')
+    const own = (ns) => {
+      const facts = _internal.newFacts()
+      _internal.indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [], artifacts: [] }, facts, 0, Buffer.from(ns), Buffer.from('handshake'), [], true)
+      return facts.nsOwners.map((o) => o.by)
+    }
+    assert.deepStrictEqual(own('tomlns'), ['mods.toml'])
+    assert.deepStrictEqual(own('depns'), [], 'a dependency id is not owned')
+    assert.deepStrictEqual(own('minecraft'), [])
+    assert.strictEqual(assessLoginChannel('depns:handshake', [dir]).verdict, 'unknown')
+    assert.strictEqual(assessLoginChannel('tomlns:handshake', [dir]).verdict, 'ack')
+  })
 })
