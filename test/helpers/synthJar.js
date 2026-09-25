@@ -200,11 +200,15 @@ function buildClass (spec) {
   const superIdx = cp.cls(spec.superName || 'java/lang/Object')
   const codeAttr = cp.utf8('Code')
   const ifaceIdxs = (spec.interfaces || []).map((n) => cp.cls(n))
+  // HF69a: `constValue` (a String) writes a ConstantValue attribute — the
+  // `static final String MOD_ID = "x"` shape javac folds at every use site
   const fieldSpecs = (spec.fields || []).map((f) => ({
     flags: f.flags != null ? f.flags : 0x0019, // public static final
     nameIdx: cp.utf8(f.name),
-    descIdx: cp.utf8(f.desc)
+    descIdx: cp.utf8(f.desc),
+    constIdx: typeof f.constValue === 'string' ? cp.str(f.constValue) : null
   }))
+  const cvAttrName = fieldSpecs.some((f) => f.constIdx != null) ? cp.utf8('ConstantValue') : null
   // bootstrap methods must be interned before the pool is frozen; each entry
   // becomes {ref: <handle>, args: [<same handle>, ...strArgs]} — enough for
   // resolveLambdaImpl (scans args for the implementation MethodHandle) AND
@@ -271,8 +275,15 @@ function buildClass (spec) {
     fh.writeUInt16BE(f.flags, 0)
     fh.writeUInt16BE(f.nameIdx, 2)
     fh.writeUInt16BE(f.descIdx, 4)
-    fh.writeUInt16BE(0, 6) // no attributes
+    fh.writeUInt16BE(f.constIdx != null ? 1 : 0, 6) // attributes: ConstantValue or none
     parts.push(fh)
+    if (f.constIdx != null) {
+      const cv = Buffer.alloc(8)
+      cv.writeUInt16BE(cvAttrName, 0)
+      cv.writeUInt32BE(2, 2)
+      cv.writeUInt16BE(f.constIdx, 6)
+      parts.push(cv)
+    }
   }
 
   const mCount = Buffer.alloc(2)

@@ -47,7 +47,7 @@
 const fs = require('fs')
 const path = require('path')
 const debug = require('debug')('minecraft-protocol-forge')
-const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, cpUtf8, cpRef } = require('./jarAnalysis')
+const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, resolveLambdaImpl, cpUtf8, cpRef } = require('./jarAnalysis')
 const { NESTED_JAR_RE, forEachNestedJar } = require('./nestedJars')
 
 // HF38 MED-3 — THE DERIVATION VERSION. Every embedder that persists this
@@ -59,7 +59,10 @@ const { NESTED_JAR_RE, forEachNestedJar } = require('./nestedJars')
 // change to what this module derives from the same jars.
 //   1 — HF13 base derivation
 //   2 — HF16-R getstatic/putstatic declarer walk + HF36 net/minecraft/util/ResourceLocation
-const LOGIN_ACK_DERIVATION_VERSION = 2
+//   3 — HF69a namespace-owner prefilter (mods.toml / String constants), RL
+//       subclasses + constructor-chain helper namespaces, lambda encoders
+//       proven from their bytecode, markAsLoginPacket = a server payload
+const LOGIN_ACK_DERIVATION_VERSION = 3
 
 const RL_CLASSES = new Set([
   'net/minecraft/resources/ResourceLocation', // mojmap/srg (Forge 1.17+ mods)
@@ -94,6 +97,51 @@ const returnsSimpleChannel = (desc) => {
 }
 // FriendlyByteBuf across mapping sets (mojmap, intermediary, legacy mcp)
 const BYTEBUF_TYPES = ['net/minecraft/network/FriendlyByteBuf', 'net/minecraft/class_2540', 'net/minecraft/network/PacketBuffer']
+// Every buffer type a registered encoder could write through: the mapped
+// FriendlyByteBuf names above plus netty's ByteBuf they all extend.
+const BUFFER_OWNERS = new Set([...BYTEBUF_TYPES, 'io/netty/buffer/ByteBuf'])
+const RL_NEEDLES = [...RL_CLASSES].map((n) => Buffer.from(n, 'utf8'))
+const MODS_TOML_ENTRIES = new Set(['META-INF/mods.toml', 'META-INF/neoforge.mods.toml'])
+const JAVA_STRING = 'Ljava/lang/String;'
+const ACC_STATIC = 0x0008
+const NS_RE = /^[a-z0-9_.-]+$/
+const CONCAT_SLOT = '\u0001' // the one dynamic slot of a makeConcatWithConstants recipe
+
+// HF69a (B): a class whose superclass chain reaches an RL class IS an RL
+// class for every purpose below (Silent Gear's util.ModResourceLocation
+// extends net.minecraft.resources.ResourceLocation and every id of that mod
+// is typed by the subclass). The hierarchy is read from the jar's own class
+// files (lazyClass) and cached per facts; a chain we cannot read is not RL.
+function isRlClass (facts, name) {
+  if (!name) return false
+  if (RL_CLASSES.has(name)) return true
+  if (!facts || !facts.rlSubclasses) return false
+  if (facts.rlSubclasses.has(name)) return facts.rlSubclasses.get(name)
+  facts.rlSubclasses.set(name, false) // cycle guard while the chain is read
+  let verdict = false
+  let cur = name
+  for (let depth = 0; depth < 8 && cur; depth++) {
+    const parsed = lazyClass(facts, cur)
+    if (!parsed || !parsed.superName) break
+    if (RL_CLASSES.has(parsed.superName)) { verdict = true; break }
+    cur = parsed.superName
+  }
+  facts.rlSubclasses.set(name, verdict)
+  return verdict
+}
+const isRlDesc = (facts, desc) => typeof desc === 'string' && desc[0] === 'L' && desc.endsWith(';') && isRlClass(facts, desc.slice(1, -1))
+// (String) -> <RL or RL subclass> helper descriptor: the returned class, or null
+function rlHelperReturn (facts, desc) {
+  const m = typeof desc === 'string' && desc.match(/^\(Ljava\/lang\/String;\)L([^;]+);$/)
+  return m && isRlClass(facts, m[1]) ? m[1] : null
+}
+// whether any PARAMETER of a method descriptor is an RL (sub)class
+function descTakesRl (facts, desc) {
+  if (typeof desc !== 'string') return false
+  const params = desc.slice(1, desc.indexOf(')'))
+  for (const m of params.matchAll(/L([^;]+);/g)) if (isRlClass(facts, m[1])) return true
+  return false
+}
 
 const ACC_BRIDGE = 0x0040
 
@@ -182,22 +230,72 @@ function newFacts () {
     parsed: new Map(), // className -> parsed class
     events: new Map(), // 'className#method#desc' -> event list
     rlFields: new Map(), // 'owner.field' -> {ns, path}
-    helperNs: new Map() // 'owner.name' -> ns  ((String)->RL id helpers)
+    helperNs: new Map(), // 'owner.name' -> ns  ((String)->RL id helpers)
+    rlSubclasses: new Map(), // HF69a: className -> reaches an RL class
+    indys: new Map(), // HF69a: 'className#method#desc' -> invokedynamic sites
+    ctorNs: new Map(), // HF69a: RL-subclass className -> namespace its ctor chain prepends
+    nsOwners: [], // HF69a: {jarPath, chain, by, className?} jars that own the namespace
+    jarHints: new Set(), // HF69a: top-level jars the strict pass saw the namespace in (mods.toml or class bytes)
+    abstains: [] // HF69a: named reasons a derivation stopped, for the receipt
   }
 }
 
-function indexJar (buf, source, facts, depth, nsNeedle, pathNeedle, hot) {
+// HF69a (A): does this (possibly nested) jar OWN the channel's namespace?
+// Two class-file/descriptor facts say so, no name list: the mods.toml /
+// neoforge.mods.toml modId (the loader's own namespace truth) equals it, or
+// a class defines a static String constant (ConstantValue) equal to it —
+// the `MOD_ID = "x"` shape javac folds into every use, which is exactly why
+// the class building the channel id never carries the namespace bytes.
+function modsTomlDeclares (buf, entries, ns) {
+  for (const entry of entries) {
+    if (!MODS_TOML_ENTRIES.has(entry.name)) continue
+    let text = ''
+    try { text = zipEntryData(buf, entry).toString('utf8') } catch { continue }
+    for (const m of text.matchAll(/^\s*modId\s*=\s*"([^"]+)"/gm)) if (m[1] === ns) return true
+  }
+  return false
+}
+function namespaceOwnership (buf, entries, ns, nsNeedle, facts, source) {
+  if (modsTomlDeclares(buf, entries, ns)) return { jarPath: source.jarPath, chain: source.chain, by: 'mods.toml' }
+  for (const entry of entries) {
+    if (NESTED_JAR_RE.test(entry.name) || !entry.name.endsWith('.class') || entry.name.startsWith('META-INF/')) continue
+    let data
+    try { data = zipEntryData(buf, entry) } catch { continue }
+    if (!data.includes(nsNeedle)) continue
+    const parsed = facts.parsed.get(entry.name.slice(0, -6)) || parseClassFile(data)
+    if (!parsed) continue
+    facts.parsed.set(parsed.className, parsed)
+    const owns = parsed.fields.some((f) => (f.flags & ACC_STATIC) && f.desc === JAVA_STRING && f.constValue === ns)
+    if (owns) return { jarPath: source.jarPath, chain: source.chain, by: 'string-constant', className: parsed.className }
+  }
+  return null
+}
+
+function indexJar (buf, source, facts, depth, nsNeedle, pathNeedle, hot, wide) {
   let entries
   try { entries = zipCentralEntries(buf) } catch (err) {
     debug(`login-ack scan: unreadable jar ${source.jarPath} (${err.message})`)
     return
   }
+  // HF69a (A): the wide pass (run only when the strict both-halves prefilter
+  // found no channel) admits, in a jar that OWNS the namespace, every class
+  // that carries the PATH half and names an RL class — a channel-creation
+  // site consumes an RL, so its constant pool must spell one; the namespace
+  // half lives in another class's constant (or in mods.toml) and is
+  // resolved through the id helper / RL-subclass chain at derivation time.
+  const ns = nsNeedle.toString('utf8')
+  const owner = wide ? namespaceOwnership(buf, entries, ns, nsNeedle, facts, source) : null
+  if (owner) facts.nsOwners.push(owner)
+  // the strict pass leaves a hint per top-level jar: only a jar whose
+  // mods.toml declares the namespace or whose class bytes carry it can own
+  // it, so the wide pass re-reads those jars alone
+  if (!wide && modsTomlDeclares(buf, entries, ns)) facts.jarHints.add(source.jarPath)
   // HF53: nested jars (both loader spellings, subfolders, manifest-named) are indexed
   // through the one shared rule; the chain remembers the nesting so the
   // receipt can name the parent that carried the owner (a JarJar-nested
   // login channel is corroborated by the PARENT jar the local folder holds).
   forEachNestedJar(buf, entries, depth, ({ entry, data, artifact }) => {
-    indexJar(data, { jarPath: source.jarPath, chain: [...source.chain, entry.name], artifacts: [...(source.artifacts || []), artifact] }, facts, depth + 1, nsNeedle, pathNeedle, hot)
+    indexJar(data, { jarPath: source.jarPath, chain: [...source.chain, entry.name], artifacts: [...(source.artifacts || []), artifact] }, facts, depth + 1, nsNeedle, pathNeedle, hot, wide)
   })
   for (const entry of entries) {
     if (NESTED_JAR_RE.test(entry.name)) continue
@@ -208,14 +306,55 @@ function indexJar (buf, source, facts, depth, nsNeedle, pathNeedle, hot) {
     // creation site; everything else is parsed lazily on demand
     let data
     try { data = zipEntryData(buf, entry) } catch { continue }
-    if (data.includes(nsNeedle) && data.includes(pathNeedle)) {
-      const parsed = parseClassFile(data)
+    const hasNs = data.includes(nsNeedle)
+    if (!wide && hasNs) facts.jarHints.add(source.jarPath)
+    const strict = hasNs && data.includes(pathNeedle)
+    const widened = !strict && owner && data.includes(pathNeedle) && RL_NEEDLES.some((n) => data.includes(n))
+    if (strict || widened) {
+      if (hot.some((h) => h.className === className)) continue // already hot from the strict pass
+      const parsed = facts.parsed.get(className) || parseClassFile(data)
       if (parsed) {
         facts.parsed.set(parsed.className, parsed)
         hot.push(parsed)
       }
     }
   }
+}
+
+// HF69a: the invokedynamic sites of one method, in instruction order —
+// { insn, name, desc, impl: {owner,name,desc,refKind}|null, recipe } where
+// `impl` is the LambdaMetafactory implementation handle (a lambda body or a
+// method reference) and `recipe` the makeConcatWithConstants recipe string.
+// Read from the class's BootstrapMethods table: data, never executed.
+function indySitesOf (facts, parsed, m) {
+  const key = `${parsed.className}#${m.method}#${m.desc}`
+  if (facts.indys.has(key)) return facts.indys.get(key)
+  const out = []
+  let insn = 0
+  walkBytecode(m.code, (op, pc) => {
+    if (op === 0xba) {
+      const c = parsed.cp[m.code.readUInt16BE(pc + 1)]
+      const nat = c && parsed.cp[c.natIndex]
+      const bsm = c && parsed.bootstrapMethods && parsed.bootstrapMethods[c.bsmIndex]
+      let recipe = null
+      if (bsm) {
+        for (const a of bsm.args) {
+          const ac = parsed.cp[a]
+          if (ac && ac.tag === 8) { recipe = cpUtf8(parsed.cp, ac.strIndex); break }
+        }
+      }
+      out.push({
+        insn,
+        name: nat ? cpUtf8(parsed.cp, nat.nameIndex) : null,
+        desc: nat ? cpUtf8(parsed.cp, nat.descIndex) : null,
+        impl: c ? resolveLambdaImpl(parsed, c.bsmIndex) : null,
+        recipe
+      })
+    }
+    insn++
+  })
+  facts.indys.set(key, out)
+  return out
 }
 
 function lazyClass (facts, className) {
@@ -250,15 +389,14 @@ function harvestIdentifiers (facts, parsed) {
     const ev = eventsFor(facts, parsed, m)
     // helper: static method (Ljava/lang/String;)L<RL>; whose body ldc's
     // exactly one string (the namespace)
-    const helperMatch = m.desc.match(/^\(Ljava\/lang\/String;\)L([^;]+);$/)
-    if (helperMatch && RL_CLASSES.has(helperMatch[1])) {
-      const strs = ev.filter((e) => e.k === 'str')
-      if (strs.length === 1) facts.helperNs.set(`${parsed.className}.${m.method}`, strs[0].v)
+    if (rlHelperReturn(facts, m.desc)) {
+      const ns = helperNsFromBody(facts, parsed, m)
+      if (ns) facts.helperNs.set(`${parsed.className}.${m.method}`, ns)
     }
     // static final RL FIELD = new RL("ns","path") / new RL("ns:path")
     for (let i = 0; i < ev.length; i++) {
       const e = ev[i]
-      if (e.k !== 'put' || !e.r.desc || e.r.desc[0] !== 'L' || !RL_CLASSES.has(e.r.desc.slice(1, -1))) continue
+      if (e.k !== 'put' || !isRlDesc(facts, e.r.desc)) continue
       const id = rlValueBefore(ev, i, facts)
       if (id) facts.rlFields.set(`${e.r.owner}.${e.r.name}`, id)
     }
@@ -270,11 +408,11 @@ function harvestIdentifiers (facts, parsed) {
 function rlValueBefore (ev, i, facts) {
   for (let j = i - 1; j >= 0 && j >= i - 8; j--) {
     const e = ev[j]
-    if (e.k === 'call' && e.r.name === '<init>' && RL_CLASSES.has(e.r.owner)) {
+    if (e.k === 'call' && e.r.name === '<init>' && isRlClass(facts, e.r.owner)) {
       const strs = []
       for (let s = j - 1; s >= 0 && strs.length < 2; s--) {
         if (ev[s].k === 'str') strs.unshift(ev[s].v)
-        else if (ev[s].k === 'new' && RL_CLASSES.has(ev[s].v)) break
+        else if (ev[s].k === 'new' && isRlClass(facts, ev[s].v)) break
       }
       if (e.r.desc === '(Ljava/lang/String;Ljava/lang/String;)V' && strs.length >= 2) {
         return { ns: strs[strs.length - 2], path: strs[strs.length - 1] }
@@ -282,19 +420,28 @@ function rlValueBefore (ev, i, facts) {
       if (e.r.desc === '(Ljava/lang/String;)V' && strs.length >= 1) {
         const s = strs[strs.length - 1]
         const ix = s.indexOf(':')
+        if (!RL_CLASSES.has(e.r.owner)) {
+          // HF69a (B): an RL SUBCLASS constructor may rewrite its argument;
+          // only a namespace its constructor chain provably prepends to a
+          // bare path resolves (Silent Gear's ModResourceLocation("network"))
+          if (ix >= 0) return null
+          const ns = ctorChainNs(facts, e.r.owner)
+          return ns ? { ns, path: s } : null
+        }
         return ix >= 0 ? { ns: s.slice(0, ix), path: s.slice(ix + 1) } : { ns: 'minecraft', path: s }
       }
       return null
     }
-    if (e.k === 'get' && e.r.desc && e.r.desc[0] === 'L' && RL_CLASSES.has(e.r.desc.slice(1, -1))) {
+    if (e.k === 'get' && isRlDesc(facts, e.r.desc)) {
       return facts.rlFields.get(`${e.r.owner}.${e.r.name}`) || null
     }
     if (e.k === 'call') {
-      const helper = e.r.desc && e.r.desc.match(/^\(Ljava\/lang\/String;\)L([^;]+);$/)
-      if (helper && RL_CLASSES.has(helper[1])) {
+      if (rlHelperReturn(facts, e.r.desc)) {
         const ns = helperNsOf(facts, e.r.owner, e.r.name)
         const prev = ev.slice(Math.max(0, j - 3), j).reverse().find((x) => x.k === 'str')
-        if (ns && prev) return { ns, path: prev.v }
+        // a ':' inside the literal is never a legal RL path character: the
+        // helper's contract on it is unknown, so the id stays unresolved
+        if (ns && prev && !prev.v.includes(':')) return { ns, path: prev.v }
         return null
       }
     }
@@ -316,14 +463,67 @@ function helperNsOf (facts, owner, name) {
   if (parsed) {
     for (const m of parsed.codes) {
       if (m.method !== name) continue
-      const match = m.desc.match(/^\(Ljava\/lang\/String;\)L([^;]+);$/)
-      if (!match || !RL_CLASSES.has(match[1])) continue
-      const strs = eventsFor(facts, parsed, m).filter((e) => e.k === 'str')
-      if (strs.length === 1) ns = strs[0].v
+      if (!rlHelperReturn(facts, m.desc)) continue
+      ns = helperNsFromBody(facts, parsed, m)
       break
     }
   }
   facts.helperNs.set(key, ns)
+  return ns
+}
+
+// The namespace a (String)->RL helper body fixes: the single ldc string it
+// carries (`new RL(NS, path)`), or — HF69a (B) — when the body builds an RL
+// SUBCLASS from its argument, the namespace that subclass's constructor
+// chain provably prepends. Anything else is unproven (null).
+function helperNsFromBody (facts, parsed, m) {
+  const ev = eventsFor(facts, parsed, m)
+  const strs = ev.filter((e) => e.k === 'str')
+  if (strs.length === 1) return strs[0].v
+  const ctor = ev.find((e) => e.k === 'call' && e.r.name === '<init>' && e.r.desc === '(Ljava/lang/String;)V' &&
+    !RL_CLASSES.has(e.r.owner) && isRlClass(facts, e.r.owner))
+  return ctor ? ctorChainNs(facts, ctor.r.owner) : null
+}
+
+// HF69a (B): the namespace an RL subclass's (String) constructor prepends to
+// its argument before reaching the RL constructor — read from the ctor's own
+// body and the same-class (String)->String helpers it calls (depth 2): a
+// makeConcatWithConstants recipe "<ns>:\u0001", an ldc "<ns>:" prefix (the
+// StringBuilder-era concat), or the first string of a two-arg RL ctor.
+// Exactly ONE distinct candidate resolves; none or several is unproven.
+function ctorChainNs (facts, className) {
+  if (facts.ctorNs.has(className)) return facts.ctorNs.get(className)
+  facts.ctorNs.set(className, null)
+  const parsed = lazyClass(facts, className)
+  const candidates = new Set()
+  const visit = (owner, m, depth) => {
+    const ev = eventsFor(facts, parsed, m)
+    for (const site of indySitesOf(facts, parsed, m)) {
+      // "<ns>:\u0001" — a namespace, a colon, then the argument slot and nothing else
+      const recipe = site.recipe
+      if (typeof recipe !== 'string' || !recipe.endsWith(`:${CONCAT_SLOT}`) || recipe.indexOf(CONCAT_SLOT) !== recipe.length - 1) continue
+      const ns = recipe.slice(0, -2)
+      if (NS_RE.test(ns)) candidates.add(ns)
+    }
+    for (let i = 0; i < ev.length; i++) {
+      const e = ev[i]
+      if (e.k === 'str' && /^[a-z0-9_.-]+:$/.test(e.v)) candidates.add(e.v.slice(0, -1))
+      if (e.k === 'call' && e.r.name === '<init>' && RL_CLASSES.has(e.r.owner) && e.r.desc === '(Ljava/lang/String;Ljava/lang/String;)V') {
+        const strs = ev.slice(Math.max(0, i - 4), i).filter((x) => x.k === 'str')
+        if (strs.length >= 2 && NS_RE.test(strs[strs.length - 2].v)) candidates.add(strs[strs.length - 2].v)
+      }
+      if (e.k === 'call' && e.r.owner === owner && e.r.desc === '(Ljava/lang/String;)Ljava/lang/String;' && depth < 2) {
+        const callee = parsed.codes.find((mm) => mm.method === e.r.name && mm.desc === e.r.desc)
+        if (callee) visit(owner, callee, depth + 1)
+      }
+    }
+  }
+  if (parsed) {
+    const ctor = parsed.codes.find((mm) => mm.method === '<init>' && mm.desc === '(Ljava/lang/String;)V')
+    if (ctor) visit(className, ctor, 0)
+  }
+  const ns = candidates.size === 1 ? [...candidates][0] : null
+  facts.ctorNs.set(className, ns)
   return ns
 }
 
@@ -333,7 +533,7 @@ function helperNsOf (facts, owner, name) {
 // or SimpleChannel.registerMessage. Extracts, via the surrounding events:
 // message class, index source (constant | counter field), channel binding
 // (static field | unbound), login markers, and any NetworkDirection constant.
-function extractRegSites (ev, className, method) {
+function extractRegSites (ev, className, method, indys) {
   const sites = []
   for (let i = 0; i < ev.length; i++) {
     const e = ev[i]
@@ -370,17 +570,32 @@ function extractRegSites (ev, className, method) {
       if (p.k === 'get' && NETWORK_DIRECTIONS.has(p.r.owner) && !direction) direction = p.r.name
     }
     // forwards scan for builder-chain login markers, bounded by the next
-    // SimpleChannel call / field store (statement end)
+    // SimpleChannel call / field store (statement end). HF69a keeps the two
+    // markers apart: loginIndex(..) names a message that carries the login
+    // index (either direction), markAsLoginPacket() names a payload the
+    // SERVER generates at login (SimpleChannel.MessageBuilder#markAsLoginPacket
+    // -> loginPacketGenerators -> SimpleChannel#networkLoginGather;
+    // NetworkRegistry#gatherLoginPayloads gathers for LOGIN_TO_CLIENT only).
     let loginMarked = false
+    let loginIndexMarked = false
+    let loginPacketMarked = false
+    let noResponse = false
+    let encoderIndy = null
     for (let j = i + 1; j < ev.length; j++) {
       const n = ev[j]
-      if (n.k === 'call' && MESSAGE_BUILDERS.has(n.r.owner) &&
-          (n.r.name === 'loginIndex' || n.r.name === 'markAsLoginPacket')) loginMarked = true
+      if (n.k === 'call' && MESSAGE_BUILDERS.has(n.r.owner)) {
+        if (n.r.name === 'loginIndex') { loginMarked = true; loginIndexMarked = true }
+        if (n.r.name === 'markAsLoginPacket') { loginMarked = true; loginPacketMarked = true }
+        if (n.r.name === 'noResponse') noResponse = true
+        // .encoder(<lambda>): javac pushes the invokedynamic right before the
+        // call, so the adjacent indy (insn - 1) IS the registered encoder
+        if (n.r.name === 'encoder' && indys) encoderIndy = indys.find((d) => d.insn === n.insn - 1) || null
+      }
       if (n.k === 'call' && SIMPLE_CHANNELS.has(n.r.owner)) break
       if (n.k === 'put') break
       if (n.k === 'get' && NETWORK_DIRECTIONS.has(n.r.owner) && !direction) direction = n.r.name
     }
-    sites.push({ className, method, evIdx: i, msgClass, index, channelField, direction, loginMarked, ev })
+    sites.push({ className, method, evIdx: i, msgClass, index, channelField, direction, loginMarked, loginIndexMarked, loginPacketMarked, noResponse, encoderIndy, ev })
   }
   return sites
 }
@@ -404,6 +619,68 @@ function hasEmptyEncoder (facts, className) {
     else return false // a real encoder writes bytes -> not an empty ack
   }
   return found
+}
+
+// HF69a (C): does a method PROVABLY write nothing to a buffer? A body with no
+// invocation at all cannot touch a ByteBuf (every write is a method call on
+// it); an invocation on a buffer type is a write (or at least unproven); any
+// other invocation is followed into its own body (same rule, depth 2) —
+// `(msg, buf) -> msg.encode(buf)` delegations stay provable. Returns true /
+// false / null (null = a body we cannot read: unproven, never a verdict).
+function methodWritesNothing (facts, ref, depth = 0) {
+  if (!ref || !ref.owner || !ref.name || !ref.desc) return null
+  const parsed = lazyClass(facts, ref.owner)
+  if (!parsed) return null
+  const m = parsed.codes.find((mm) => mm.method === ref.name && mm.desc === ref.desc)
+  if (!m) return null
+  let verdict = true
+  walkBytecode(m.code, (op, pc) => {
+    if (verdict !== true) return
+    if (op === 0xba) { verdict = null; return } // a nested lambda: unproven
+    if (op === 0xb6 || op === 0xb7 || op === 0xb8 || op === 0xb9) {
+      const r = cpRef(parsed.cp, m.code.readUInt16BE(pc + 1))
+      if (!r || BUFFER_OWNERS.has(r.owner)) { verdict = false; return }
+      if (depth >= 2) { verdict = null; return }
+      const sub = methodWritesNothing(facts, r, depth + 1)
+      if (sub !== true) verdict = sub
+    }
+  })
+  return verdict
+}
+
+// The ack-candidate proof for one registration site: the REGISTERED encoder
+// first (the lambda / method reference SimpleChannel actually calls —
+// IndexedMessageCodec#build runs `encoder` after writeByte(index)), then the
+// message class's own buffer methods (the pre-HF69a proof) when the
+// registered one cannot be read. { empty, proof } — proof names what was read.
+function encoderProofOf (facts, site) {
+  const impl = site.encoderIndy && site.encoderIndy.impl
+  if (impl) {
+    const r = methodWritesNothing(facts, impl)
+    if (r === true) return { empty: true, proof: `registered encoder ${impl.owner}#${impl.name} writes nothing` }
+    if (r === false) return { empty: false, proof: `registered encoder ${impl.owner}#${impl.name} writes` }
+  }
+  if (site.msgClass && hasEmptyEncoder(facts, site.msgClass)) return { empty: true, proof: `${site.msgClass} buffer methods are empty` }
+  return { empty: false, proof: impl ? `registered encoder ${impl.owner}#${impl.name} unreadable` : `${site.msgClass} encoder not provably empty` }
+}
+
+// HF69a: the message classes the mod's own handlers answer with —
+// `channel.reply(new X(), ctx)` (SimpleChannel#reply) in any hot class — the
+// real client's reply, read from the reply sites themselves.
+function replyClassesOf (facts, hotClasses) {
+  const out = new Map() // className -> 'Owner#method'
+  for (const parsed of hotClasses) {
+    for (const m of parsed.codes) {
+      const ev = eventsFor(facts, parsed, m)
+      for (let i = 0; i < ev.length; i++) {
+        const e = ev[i]
+        if (e.k !== 'call' || !SIMPLE_CHANNELS.has(e.r.owner) || e.r.name !== 'reply') continue
+        const made = ev.slice(Math.max(0, i - 6), i).reverse().find((x) => x.k === 'new')
+        if (made && !out.has(made.v)) out.set(made.v, `${parsed.className}#${m.method}`)
+      }
+    }
+  }
+  return out
 }
 
 // --- LOCAL int-counter reasoning -------------------------------------------
@@ -500,30 +777,59 @@ function deriveDirect (facts, channelField, hotClasses, channelId) {
   for (const parsed of hotClasses) {
     for (const m of parsed.codes) {
       const ev = eventsFor(facts, parsed, m)
-      for (const s of extractRegSites(ev, parsed.className, m.method)) {
+      for (const s of extractRegSites(ev, parsed.className, m.method, indySitesOf(facts, parsed, m))) {
         if (s.channelField === channelField) sites.push(s)
       }
     }
   }
   if (sites.length === 0) return null
 
-  const ackSites = sites.filter((s) =>
-    s.loginMarked &&
-    s.msgClass && hasEmptyEncoder(facts, s.msgClass) &&
-    (!s.direction || s.direction === 'LOGIN_TO_SERVER'))
+  const proofs = new Map()
+  let ackSites = sites.filter((s) => {
+    if (!s.loginMarked || !s.msgClass || (s.direction && s.direction !== 'LOGIN_TO_SERVER')) return false
+    const p = encoderProofOf(facts, s)
+    proofs.set(s, p)
+    return p.empty
+  })
   if (ackSites.length === 0) {
+    const tried = sites.filter((s) => proofs.has(s)).map((s) => proofs.get(s).proof)
+    facts.abstains.push(`no empty-encoder login candidate among ${sites.length} registrations${tried.length ? ` (${tried.join('; ')})` : ''}`)
     debug(`login-ack ${channelId}: no empty-encoder login candidate among ${sites.length} registrations - abstaining`)
     return null
   }
-  const distinctClasses = new Set(ackSites.map((s) => s.msgClass))
+  let distinctClasses = new Set(ackSites.map((s) => s.msgClass))
+  let replySite = null
   if (distinctClasses.size > 1) {
+    // HF69a (C): among several empty-encoder login messages, the ones marked
+    // as login PACKETS are payloads the server generates (cited above), so
+    // the client's reply is among the rest; if still ambiguous, the classes
+    // the mod's handlers actually `reply(new X(), ctx)` with decide.
+    const clientSide = ackSites.filter((s) => !s.loginPacketMarked || s.direction === 'LOGIN_TO_SERVER')
+    if (clientSide.length && new Set(clientSide.map((s) => s.msgClass)).size < distinctClasses.size) ackSites = clientSide
+    distinctClasses = new Set(ackSites.map((s) => s.msgClass))
+    if (distinctClasses.size > 1) {
+      const replies = replyClassesOf(facts, hotClasses)
+      const replied = ackSites.filter((s) => replies.has(s.msgClass))
+      if (replied.length && new Set(replied.map((s) => s.msgClass)).size === 1) {
+        ackSites = replied
+        replySite = replies.get(ackSites[0].msgClass)
+      }
+      distinctClasses = new Set(ackSites.map((s) => s.msgClass))
+    }
+  }
+  if (distinctClasses.size > 1) {
+    facts.abstains.push(`ambiguous ack candidates (${[...distinctClasses].join(', ')})`)
     debug(`login-ack ${channelId}: ambiguous ack candidates (${[...distinctClasses].join(', ')}) - abstaining`)
     return null
   }
   const ack = ackSites[0]
+  const encoderProof = proofs.get(ack).proof
+  const replySites = replyClassesOf(facts, hotClasses)
+  if (!replySite && replySites.has(ack.msgClass)) replySite = replySites.get(ack.msgClass)
+  const extras = { encoderProof, replySite: replySite || null, loginPacketMarked: ack.loginPacketMarked, noResponse: ack.noResponse }
 
   if (ack.index && ack.index.const != null) {
-    return { index: ack.index.const, msgClass: ack.msgClass, evidence: `explicit constant at ${ack.className}#${ack.method}` }
+    return { index: ack.index.const, msgClass: ack.msgClass, evidence: `explicit constant at ${ack.className}#${ack.method}`, ...extras }
   }
   if (ack.index && ack.index.local != null) {
     const v = resolveLocalIndex(ack.ev, ack.index.local, ack.index.useEvIdx)
@@ -531,9 +837,10 @@ function deriveDirect (facts, channelField, hotClasses, channelId) {
       debug(`login-ack ${channelId}: local counter slot ${ack.index.local} not provably straight-line - abstaining`)
       return null
     }
-    return { index: v, msgClass: ack.msgClass, evidence: `local int counter slot ${ack.index.local} = ${v} (straight-line simulation) at ${ack.className}#${ack.method}` }
+    return { index: v, msgClass: ack.msgClass, evidence: `local int counter slot ${ack.index.local} = ${v} (straight-line simulation) at ${ack.className}#${ack.method}`, ...extras }
   }
   if (!ack.index || !ack.index.counter) {
+    facts.abstains.push(`ack index source unresolved for ${ack.msgClass}`)
     debug(`login-ack ${channelId}: ack index source unresolved - abstaining`)
     return null
   }
@@ -596,7 +903,7 @@ function deriveDirect (facts, channelField, hotClasses, channelId) {
     // registrations) - they consume later counter values, never earlier ones
   }
 
-  return { index: seed + usesBefore, msgClass: ack.msgClass, evidence: `counter ${counter} seed ${seed} + ${usesBefore} prior uses` }
+  return { index: seed + usesBefore, msgClass: ack.msgClass, evidence: `counter ${counter} seed ${seed} + ${usesBefore} prior uses`, ...extras }
 }
 
 // --- WRAPPER shape ----------------------------------------------------------
@@ -762,8 +1069,7 @@ function findCreations (facts, hotClasses, ns, pathPart) {
         const e = ev[i]
         if (e.k !== 'call' || !e.r.desc) continue
         // a call that CONSUMES a ResourceLocation and returns an object
-        const takesRL = [...RL_CLASSES].some((rl) => e.r.desc.includes(`L${rl};`) && e.r.desc.indexOf(`L${rl};`) < e.r.desc.indexOf(')'))
-        if (!takesRL || !/\)L[^;]+;$/.test(e.r.desc)) continue
+        if (!descTakesRl(facts, e.r.desc) || !/\)L[^;]+;$/.test(e.r.desc)) continue
         if (e.r.name === '<init>') continue
         const id = rlValueBefore(ev, i, facts)
         if (!id || id.ns !== ns || id.path !== pathPart) continue
@@ -1010,36 +1316,47 @@ function assessUncached (channelId, paths) {
   const hot = []
   const nsNeedle = Buffer.from(ns, 'utf8')
   const pathNeedle = Buffer.from(pathPart, 'utf8')
-  for (const p of paths) {
-    let jars = []
-    try {
-      jars = fs.statSync(p).isDirectory()
-        ? fs.readdirSync(p).filter((f) => f.endsWith('.jar')).map((f) => path.join(p, f))
-        : [p]
-    } catch (err) {
-      debug(`login-ack scan: source ${p} unreadable (${err.message})`)
-      continue
-    }
-    for (const jar of jars) {
+  const scan = (wide) => {
+    for (const p of paths) {
+      let jars = []
       try {
-        indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [], artifacts: [] }, facts, 0, nsNeedle, pathNeedle, hot)
+        jars = fs.statSync(p).isDirectory()
+          ? fs.readdirSync(p).filter((f) => f.endsWith('.jar')).map((f) => path.join(p, f))
+          : [p]
       } catch (err) {
-        debug(`login-ack scan: skipping ${jar} (${err.message})`)
+        debug(`login-ack scan: source ${p} unreadable (${err.message})`)
+        continue
+      }
+      for (const jar of jars) {
+        if (wide && !facts.jarHints.has(jar)) continue // the strict pass saw no trace of the namespace here
+        try {
+          indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [], artifacts: [] }, facts, 0, nsNeedle, pathNeedle, hot, wide)
+        } catch (err) {
+          debug(`login-ack scan: skipping ${jar} (${err.message})`)
+        }
       }
     }
   }
-  if (hot.length === 0) return { verdict: 'unknown' }
-
-  const creations = findCreations(facts, hot, ns, pathPart)
   // Only CHANNEL-class creations count as local knowledge: a direct
   // SimpleChannel stored in a field, or a wrapper-builder chain that
   // registers messages. The same ResourceLocation routinely names other
   // things (dynamic registries, capabilities — origins:origins is a registry
   // key in the same family pack), and treating those as channel knowledge
   // would honest-fail joins the 99 convention may still carry.
-  const channelCreations = creations.filter((c) =>
+  const channelCreationsOf = () => findCreations(facts, hot, ns, pathPart).filter((c) =>
     (c.direct && c.channelField) ||
     (!c.direct && c.chain.some((link) => /^register/i.test(link.name))))
+  scan(false)
+  let channelCreations = hot.length ? channelCreationsOf() : []
+  if (channelCreations.length === 0) {
+    // HF69a (A): the strict prefilter (both id halves in one class) saw no
+    // channel — the id may be split across the mod-id constant / mods.toml
+    // and the class carrying the path. The wide pass admits path-carrying
+    // RL-naming classes of the namespace's OWNER jars only, then the same
+    // derivation runs; a jar that owns nothing stays exactly as before.
+    scan(true)
+    channelCreations = hot.length && facts.nsOwners.length ? channelCreationsOf() : []
+  }
   if (channelCreations.length === 0) return { verdict: 'unknown' }
 
   for (const creation of channelCreations) {
@@ -1065,10 +1382,14 @@ function assessUncached (channelId, paths) {
   let substantive = null
   for (const parsed of hot) {
     for (const m of parsed.codes) {
-      for (const site of extractRegSites(eventsFor(facts, parsed, m), parsed.className, m.method)) {
+      for (const site of extractRegSites(eventsFor(facts, parsed, m), parsed.className, m.method, indySitesOf(facts, parsed, m))) {
         if (!site.channelField || !fields.has(site.channelField)) continue
+        // HF69a (C): a markAsLoginPacket site without a LOGIN_TO_SERVER
+        // direction is a payload the SERVER sends (cited in extractRegSites)
+        // — never the client's reply, so it cannot make the reply substantive
+        if (site.loginPacketMarked && site.direction !== 'LOGIN_TO_SERVER') continue
         if (site.loginMarked && site.msgClass && (!site.direction || site.direction === 'LOGIN_TO_SERVER') &&
-            !hasEmptyEncoder(facts, site.msgClass)) {
+            !encoderProofOf(facts, site).empty) {
           substantive = site.msgClass
         }
       }
@@ -1078,6 +1399,7 @@ function assessUncached (channelId, paths) {
   return {
     verdict: 'underivable',
     reason: substantive ? 'substantive-reply' : 'no-derivable-ack',
+    why: facts.abstains.length ? facts.abstains.join('; ') : undefined,
     msgClass: substantive || undefined,
     ...where,
     evidence: `channel is created by a local jar (${channelCreations[0].className}${where.nestedChain.length ? `, nested in ${where.jarName} -> ${where.nestedArtifact}` : ''}) but no provable login-ack reply exists`
@@ -1101,4 +1423,4 @@ function corroborationOf (facts, className) {
   }
 }
 
-module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor } }
+module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor, isRlClass, ctorChainNs, helperNsOf, methodWritesNothing, encoderProofOf, indySitesOf, namespaceOwnership } }

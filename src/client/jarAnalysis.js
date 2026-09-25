@@ -105,7 +105,20 @@ function parseClassFile (b) {
     }
     return out
   }
-  const fields = readMembers().map((f) => ({ name: f.name, desc: f.desc, flags: f.flags }))
+  // HF69a: a field's ConstantValue attribute (the `static final String
+  // MOD_ID = "x"` shape javac folds into every use site) is class-file DATA
+  // the login-ack deriver reads to learn which namespace a jar's constants
+  // spell - a String or int constant, else undefined.
+  const constValueOf = (attrs) => {
+    for (const attr of attrs) {
+      if (attr.name !== 'ConstantValue' || attr.len !== 2) continue
+      const c = cp[b.readUInt16BE(attr.start)]
+      if (c && c.tag === 8) return cpUtf8(cp, c.strIndex)
+      if (c && c.tag === 3) return c.int
+    }
+    return undefined
+  }
+  const fields = readMembers().map((f) => ({ name: f.name, desc: f.desc, flags: f.flags, constValue: constValueOf(f.attrs) }))
   const codes = []
   // HF15-R: the full method table (name/desc/flags — ABSTRACT and interface
   // members included, which carry no Code attribute and so never appear in
