@@ -105,7 +105,7 @@ function replyClass (name = REPLY, { withEmptyEncode = false } = {}) {
 
 // Net.<clinit>: CHANNEL = NetworkRegistry.newSimpleChannel(Mod.id("handshake"));
 // then the registrations, every one messageBuilder(Class,int) with NO direction
-function netClass ({ helperReturns = MODRL, replyEncoder = 'empty', extraReplyAt = null, replyTo = REPLY, syncAsLoginPacket = true, syncEncoderEmpty = false } = {}) {
+function netClass ({ helperReturns = MODRL, replyEncoder = 'empty', extraReplyAt = null, replyTo = REPLY, syncAsLoginPacket = true, syncEncoderEmpty = false, idBuilder = null } = {}) {
   const bsms = [
     { refKind: 5, owner: SYNC, name: 'toBytes', desc: `(L${FBB};)V` }, // 0: Sync::toBytes
     { refKind: 6, owner: NET, name: 'lambda$enc', desc: `(L${REPLY};L${FBB};)V` }, // 1: (reply, buf) -> ...
@@ -136,7 +136,8 @@ function netClass ({ helperReturns = MODRL, replyEncoder = 'empty', extraReplyAt
         desc: '()V',
         flags: 0x0008,
         code: (a) => {
-          a.ldcStr('handshake').invokestatic(MOD, 'id', `(${STR})L${helperReturns};`)
+          // Rider-2: idBuilder = the strict shape (the id built inline in this class)
+          ;(idBuilder ? idBuilder(a) : a.ldcStr('handshake').invokestatic(MOD, 'id', `(${STR})L${helperReturns};`))
             .invokestatic(NR, 'newSimpleChannel', `(L${RL};)L${SC};`)
             .putstatic(NET, 'CHANNEL', `L${SC};`)
           register(a, SYNC, 1, { packet: syncAsLoginPacket, bsm: syncEncoderEmpty ? 2 : 0 })
@@ -321,5 +322,68 @@ describe('HF69a - split constants, RL subclasses, direction-less login packets w
     assert.deepStrictEqual(own('minecraft'), [])
     assert.strictEqual(assessLoginChannel('depns:handshake', [dir]).verdict, 'unknown')
     assert.strictEqual(assessLoginChannel('tomlns:handshake', [dir]).verdict, 'ack')
+  })
+
+  // Rider-2 (MED-3): the receipt names the owner fact that admitted the
+  // class, the id helper and the namespace chain it was proven from — built
+  // from the facts the derivation already read, never a second pass.
+  describe('Rider-2 namespaceProof on the receipt', () => {
+    const CHAIN = (ns) => ({ rlSubclass: MODRL, kind: 'concat-recipe', className: MODRL, method: 'addNs', recipe: `${ns}:${SLOT}` })
+    const HELPER = { className: MOD, method: 'id', returnType: MODRL }
+
+    it('R2-1 the F10 shape: owner = the string constant (its class named), helper MOD#id -> ModRL, chain = the ctor recipe', () => {
+      const r = assessLoginChannel('splitns:handshake', [synthJar('r21')])
+      assert.strictEqual(r.verdict, 'ack')
+      assert.deepStrictEqual(r.namespaceProof, { owner: { by: 'string-constant', className: MOD }, helper: HELPER, chain: CHAIN('splitns') })
+    })
+
+    it('R2-2 the mods.toml shape: owner by mods-toml (no class), the same helper and chain', () => {
+      const r = assessLoginChannel('tomlns:handshake', [synthJar('r22', { ns: 'tomlns', withConstant: false, withToml: true })])
+      assert.strictEqual(r.verdict, 'ack')
+      assert.deepStrictEqual(r.namespaceProof, { owner: { by: 'mods-toml', className: null }, helper: HELPER, chain: CHAIN('tomlns') })
+    })
+
+    it('R2-3 NEGATIVE: the underivable receipt carries the same object with what was proven (substantive reply, ambiguous candidates)', () => {
+      const sub = assessLoginChannel('splitns:handshake', [synthJar('r23a', { replyEncoder: 'writes' })])
+      assert.strictEqual(sub.verdict, 'underivable')
+      assert.strictEqual(sub.reason, 'substantive-reply')
+      assert.deepStrictEqual(sub.namespaceProof, { owner: { by: 'string-constant', className: MOD }, helper: HELPER, chain: CHAIN('splitns') })
+      const amb = assessLoginChannel('splitns:handshake', [synthJar('r23b', { extraReplyAt: 2, replyTo: null })])
+      assert.strictEqual(amb.verdict, 'underivable')
+      assert.strictEqual(amb.reason, 'no-derivable-ack')
+      assert.deepStrictEqual(amb.namespaceProof, { owner: { by: 'string-constant', className: MOD }, helper: HELPER, chain: CHAIN('splitns') })
+    })
+
+    it('R2-4 the H11 shape (a literal beside the subclass ctor): the chain named is the ctor recipe, never the literal', () => {
+      const mod = buildClass({
+        name: MOD,
+        fields: [{ name: 'MOD_ID', desc: STR, constValue: 'otherns' }],
+        methods: [{ name: 'id', desc: `(${STR})L${MODRL};`, flags: 0x0009, code: (a) => a.ldcStr('splitns').pop().new_(MODRL).dup().aload(0).invokespecial(MODRL, '<init>', `(${STR})V`).areturn() }]
+      })
+      const dir = writeJarDir('r24', [
+        { name: `${MOD}.class`, data: mod }, { name: `${MODRL}.class`, data: modRlClass({ ns: 'otherns' }) },
+        { name: `${NET}.class`, data: netClass({}) }, { name: `${SYNC}.class`, data: syncClass() },
+        { name: `${REPLY}.class`, data: replyClass(REPLY) }, { name: `${OTHER}.class`, data: replyClass(OTHER) }])
+      const r = assessLoginChannel('otherns:handshake', [dir])
+      assert.strictEqual(r.verdict, 'ack')
+      assert.deepStrictEqual(r.namespaceProof, { owner: { by: 'string-constant', className: MOD }, helper: HELPER, chain: CHAIN('otherns') })
+    })
+
+    it('R2-5 the strict shape (both halves inline in the creating class): owner by class-bytes, no helper, chain = the two-arg RL init', () => {
+      const inline = (a) => a.new_(RL).dup().ldcStr('strictns').ldcStr('handshake').invokespecial(RL, '<init>', `(${STR}${STR})V`)
+      const dir = writeJarDir('r25', [
+        { name: `${MOD}.class`, data: modClass({ ns: 'splitns' }) }, { name: `${MODRL}.class`, data: modRlClass({ ns: 'splitns' }) },
+        { name: `${NET}.class`, data: netClass({ idBuilder: inline }) }, { name: `${SYNC}.class`, data: syncClass() },
+        { name: `${REPLY}.class`, data: replyClass(REPLY) }, { name: `${OTHER}.class`, data: replyClass(OTHER) }])
+      const r = assessLoginChannel('strictns:handshake', [dir])
+      assert.strictEqual(r.verdict, 'ack')
+      assert.strictEqual(r.index, 3)
+      assert.deepStrictEqual(r.namespaceProof, { owner: { by: 'class-bytes', className: NET }, helper: null, chain: { kind: 'two-arg-init', className: RL, ns: 'strictns' } })
+    })
+
+    it('R2-6 the pure builder: a creation with no retained proof says so (class-bytes owner, null helper, null chain)', () => {
+      const facts = _internal.newFacts()
+      assert.deepStrictEqual(_internal.namespaceProofOf(facts, { className: NET }), { owner: { by: 'class-bytes', className: NET }, helper: null, chain: null })
+    })
   })
 })

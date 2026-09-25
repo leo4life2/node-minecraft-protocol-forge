@@ -234,6 +234,8 @@ function newFacts () {
     rlSubclasses: new Map(), // HF69a: className -> reaches an RL class
     indys: new Map(), // HF69a: 'className#method#desc' -> invokedynamic sites
     ctorNs: new Map(), // HF69a: RL-subclass className -> namespace its ctor chain prepends
+    ctorProof: new Map(), // Rider-2: RL-subclass className -> {kind, className, method, recipe|prefix|ns} the one candidate was read from
+    helperProof: new Map(), // Rider-2: 'owner.name' -> {className, method, returnType, chain} for a resolved id helper
     nsOwners: [], // HF69a: {jarPath, chain, by, className?} jars that own the namespace
     jarHints: new Set(), // HF69a: top-level jars the strict pass saw the namespace in (mods.toml or class bytes)
     abstains: [] // HF69a: named reasons a derivation stopped, for the receipt
@@ -424,7 +426,8 @@ function rlValueBefore (ev, i, facts) {
         else if (ev[s].k === 'new' && isRlClass(facts, ev[s].v)) break
       }
       if (e.r.desc === '(Ljava/lang/String;Ljava/lang/String;)V' && strs.length >= 2) {
-        return { ns: strs[strs.length - 2], path: strs[strs.length - 1] }
+        const ns = strs[strs.length - 2]
+        return { ns, path: strs[strs.length - 1], via: { helper: null, chain: { kind: 'two-arg-init', className: e.r.owner, ns } } }
       }
       if (e.r.desc === '(Ljava/lang/String;)V' && strs.length >= 1) {
         const s = strs[strs.length - 1]
@@ -435,14 +438,17 @@ function rlValueBefore (ev, i, facts) {
           // bare path resolves (Silent Gear's ModResourceLocation("network"))
           if (ix >= 0) return null
           const ns = ctorChainNs(facts, e.r.owner)
-          return ns ? { ns, path: s } : null
+          return ns ? { ns, path: s, via: { helper: null, chain: facts.ctorProof.get(e.r.owner) || null } } : null
         }
-        return ix >= 0 ? { ns: s.slice(0, ix), path: s.slice(ix + 1) } : { ns: 'minecraft', path: s }
+        const via = { helper: null, chain: { kind: 'one-arg-init', className: e.r.owner, literal: s } }
+        return ix >= 0 ? { ns: s.slice(0, ix), path: s.slice(ix + 1), via } : { ns: 'minecraft', path: s, via }
       }
       return null
     }
     if (e.k === 'get' && isRlDesc(facts, e.r.desc)) {
-      return facts.rlFields.get(`${e.r.owner}.${e.r.name}`) || null
+      const key = `${e.r.owner}.${e.r.name}`
+      const id = facts.rlFields.get(key)
+      return id ? { ...id, via: { ...(id.via || { helper: null, chain: null }), field: key } } : null
     }
     if (e.k === 'call') {
       if (rlHelperReturn(facts, e.r.desc)) {
@@ -450,7 +456,10 @@ function rlValueBefore (ev, i, facts) {
         const prev = ev.slice(Math.max(0, j - 3), j).reverse().find((x) => x.k === 'str')
         // a ':' inside the literal is never a legal RL path character: the
         // helper's contract on it is unknown, so the id stays unresolved
-        if (ns && prev && !prev.v.includes(':')) return { ns, path: prev.v }
+        if (ns && prev && !prev.v.includes(':')) {
+          const proof = facts.helperProof.get(`${e.r.owner}.${e.r.name}`) || null
+          return { ns, path: prev.v, via: { helper: proof ? { className: proof.className, method: proof.method, returnType: proof.returnType } : { className: e.r.owner, method: e.r.name, returnType: rlHelperReturn(facts, e.r.desc) }, chain: proof ? proof.chain : null } }
+        }
         return null
       }
     }
@@ -491,9 +500,21 @@ function helperNsFromBody (facts, parsed, m) {
   const ev = eventsFor(facts, parsed, m)
   const ctor = ev.find((e) => e.k === 'call' && e.r.name === '<init>' && e.r.desc === '(Ljava/lang/String;)V' &&
     !RL_CLASSES.has(e.r.owner) && isRlClass(facts, e.r.owner))
-  if (ctor) return ctorChainNs(facts, ctor.r.owner)
-  const strs = ev.filter((e) => e.k === 'str')
-  return strs.length === 1 ? strs[0].v : null
+  let ns = null
+  let chain = null
+  if (ctor) {
+    ns = ctorChainNs(facts, ctor.r.owner)
+    chain = ns ? facts.ctorProof.get(ctor.r.owner) || null : null
+  } else {
+    const strs = ev.filter((e) => e.k === 'str')
+    ns = strs.length === 1 ? strs[0].v : null
+    // Rider-2: the body's own two-arg RL init is the chain the literal fed
+    const init = ns && ev.find((e) => e.k === 'call' && e.r.name === '<init>' && e.r.desc === '(Ljava/lang/String;Ljava/lang/String;)V' && isRlClass(facts, e.r.owner))
+    chain = ns ? (init ? { kind: 'two-arg-init', className: init.r.owner, method: m.method, ns } : { kind: 'literal', className: parsed.className, method: m.method, ns }) : null
+  }
+  // Rider-2: the receipt names the helper and the chain the namespace was proven from
+  if (ns) facts.helperProof.set(`${parsed.className}.${m.method}`, { className: parsed.className, method: m.method, returnType: rlHelperReturn(facts, m.desc), chain })
+  return ns
 }
 
 // HF69a (B): the namespace an RL subclass's (String) constructor prepends to
@@ -506,7 +527,8 @@ function ctorChainNs (facts, className) {
   if (facts.ctorNs.has(className)) return facts.ctorNs.get(className)
   facts.ctorNs.set(className, null)
   const parsed = lazyClass(facts, className)
-  const candidates = new Set()
+  const candidates = new Map() // ns -> the proof it was read from (first sighting)
+  const found = (ns, proof) => { if (!candidates.has(ns)) candidates.set(ns, proof) }
   const visit = (owner, m, depth) => {
     const ev = eventsFor(facts, parsed, m)
     for (const site of indySitesOf(facts, parsed, m)) {
@@ -514,14 +536,14 @@ function ctorChainNs (facts, className) {
       const recipe = site.recipe
       if (typeof recipe !== 'string' || !recipe.endsWith(`:${CONCAT_SLOT}`) || recipe.indexOf(CONCAT_SLOT) !== recipe.length - 1) continue
       const ns = recipe.slice(0, -2)
-      if (NS_RE.test(ns)) candidates.add(ns)
+      if (NS_RE.test(ns)) found(ns, { kind: 'concat-recipe', className: owner, method: m.method, recipe })
     }
     for (let i = 0; i < ev.length; i++) {
       const e = ev[i]
-      if (e.k === 'str' && /^[a-z0-9_.-]+:$/.test(e.v)) candidates.add(e.v.slice(0, -1))
+      if (e.k === 'str' && /^[a-z0-9_.-]+:$/.test(e.v)) found(e.v.slice(0, -1), { kind: 'ldc-prefix', className: owner, method: m.method, prefix: e.v })
       if (e.k === 'call' && e.r.name === '<init>' && RL_CLASSES.has(e.r.owner) && e.r.desc === '(Ljava/lang/String;Ljava/lang/String;)V') {
         const strs = ev.slice(Math.max(0, i - 4), i).filter((x) => x.k === 'str')
-        if (strs.length >= 2 && NS_RE.test(strs[strs.length - 2].v)) candidates.add(strs[strs.length - 2].v)
+        if (strs.length >= 2 && NS_RE.test(strs[strs.length - 2].v)) found(strs[strs.length - 2].v, { kind: 'two-arg-init', className: e.r.owner, method: m.method, ns: strs[strs.length - 2].v })
       }
       if (e.k === 'call' && e.r.owner === owner && e.r.desc === '(Ljava/lang/String;)Ljava/lang/String;' && depth < 2) {
         const callee = parsed.codes.find((mm) => mm.method === e.r.name && mm.desc === e.r.desc)
@@ -533,8 +555,9 @@ function ctorChainNs (facts, className) {
     const ctor = parsed.codes.find((mm) => mm.method === '<init>' && mm.desc === '(Ljava/lang/String;)V')
     if (ctor) visit(className, ctor, 0)
   }
-  const ns = candidates.size === 1 ? [...candidates][0] : null
+  const ns = candidates.size === 1 ? [...candidates.keys()][0] : null
   facts.ctorNs.set(className, ns)
+  facts.ctorProof.set(className, ns ? { rlSubclass: className, ...candidates.get(ns) } : null)
   return ns
 }
 
@@ -1104,7 +1127,7 @@ function findCreations (facts, hotClasses, ns, pathPart) {
           if (ev[j].k === 'put' && isSimpleChannelDesc(ev[j].r.desc)) { channelField = `${ev[j].r.owner}.${ev[j].r.name}`; break }
           if (ev[j].k === 'put') break
         }
-        creations.push({ className: parsed.className, method: m.method, direct: isDirectChannel, channelField, chain })
+        creations.push({ className: parsed.className, method: m.method, direct: isDirectChannel, channelField, chain, idProof: id.via || null })
       }
     }
   }
@@ -1382,7 +1405,7 @@ function assessUncached (channelId, paths) {
     // itself truncates), so it is unprovable — abstain into 'underivable'.
     if (r && r.index != null && r.index >= 0 && r.index <= 255) {
       const where = corroborationOf(facts, creation.className)
-      return { verdict: 'ack', ...r, ...where, evidence: `${r.evidence}${where.nestedChain.length ? ` (${where.corroboration}: ${where.jarName} -> ${where.nestedArtifact})` : ''}`, reply: Buffer.from([r.index]) }
+      return { verdict: 'ack', ...r, ...where, namespaceProof: namespaceProofOf(facts, creation), evidence: `${r.evidence}${where.nestedChain.length ? ` (${where.corroboration}: ${where.jarName} -> ${where.nestedArtifact})` : ''}`, reply: Buffer.from([r.index]) }
     }
   }
 
@@ -1413,8 +1436,28 @@ function assessUncached (channelId, paths) {
     why: facts.abstains.length ? facts.abstains.join('; ') : undefined,
     msgClass: substantive || undefined,
     ...where,
+    namespaceProof: namespaceProofOf(facts, channelCreations[0]),
     evidence: `channel is created by a local jar (${channelCreations[0].className}${where.nestedChain.length ? `, nested in ${where.jarName} -> ${where.nestedArtifact}` : ''}) but no provable login-ack reply exists`
   }
+}
+
+// Rider-2 (MED-3): the receipt names the facts the namespace was admitted
+// and resolved from — no second pass: `owner` is the nsOwners record of the
+// creating class's own jar (mods-toml / string-constant + className), or
+// 'class-bytes' when the strict prefilter admitted the class on its own
+// constant pool; `helper` the (String)->RL id helper that resolved the id
+// (className, method, returnType) or null when the id was built inline;
+// `chain` the RL-subclass constructor recipe / ldc prefix / two-arg RL init
+// the namespace was read from, or null when nothing in the chain fixed it.
+function namespaceProofOf (facts, creation) {
+  const loc = facts.classIndex.get(creation.className)
+  const sameChain = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || [])
+  const rec = loc ? facts.nsOwners.find((o) => o.jarPath === loc.jarPath && sameChain(o.chain, loc.chain)) : null
+  const owner = rec
+    ? { by: rec.by === 'mods.toml' ? 'mods-toml' : rec.by, className: rec.className || null }
+    : { by: 'class-bytes', className: creation.className }
+  const via = creation.idProof || {}
+  return { owner, helper: via.helper || null, chain: via.chain || null }
 }
 
 // HF53: WHERE the channel's creating class was read — the receipt names the
@@ -1434,4 +1477,4 @@ function corroborationOf (facts, className) {
   }
 }
 
-module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor, isRlClass, ctorChainNs, helperNsOf, methodWritesNothing, encoderProofOf, indySitesOf, namespaceOwnership } }
+module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor, isRlClass, ctorChainNs, helperNsOf, methodWritesNothing, encoderProofOf, indySitesOf, namespaceOwnership, namespaceProofOf } }
