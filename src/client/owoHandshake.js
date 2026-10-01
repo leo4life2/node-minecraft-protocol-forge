@@ -87,6 +87,10 @@ const OWO_IDENTIFIER_CLASSES = new Set([
 ])
 const OWO_CHANNEL_CLASS = 'io/wispforest/owo/network/OwoNetChannel'
 const OWO_CONTROLLER_CLASS = 'io/wispforest/owo/particles/systems/ParticleSystemController'
+// the opcodes that consume (or replace) operand-stack values between a string
+// constant and the call it was loaded for: aconst_null, aload/aload_n,
+// getstatic/getfield, invoke* (see the peephole note in scanClass)
+const STACK_CONSUMING_OPS = new Set([0x01, 0x19, 0x2a, 0x2b, 0x2c, 0x2d, 0xb2, 0xb4, 0xb6, 0xb7, 0xb8, 0xb9, 0xba])
 
 // Replays one class's bytecode against the registration patterns javac emits,
 // collecting channel/controller creations, register calls and static
@@ -134,7 +138,7 @@ function scanOwoClass (parsed, facts) {
     let lastChannel = null // channel created in THIS method (fluent/putstatic target)
     let lastController = null
     let pendingNewController = false
-    walkBytecode(code, (op, pc) => {
+    const visit = (op, pc) => {
       if (op === 0x12 || op === 0x13) { // ldc / ldc_w
         const c = cp[op === 0x12 ? code[pc + 1] : code.readUInt16BE(pc + 1)]
         if (c && c.tag === 8) { lastStrings.push(utf8(c.strIndex)); if (lastStrings.length > 2) lastStrings.shift() } else if (c && c.tag === 7) lastClassConst = utf8(c.nameIndex)
@@ -230,6 +234,17 @@ function scanOwoClass (parsed, facts) {
           facts.systemRegs.push({ controller: lastReceiverField ? null : lastController, field: lastReceiverField })
         }
       }
+    }
+    // Rider (HF72 verify MED): the string-constant window is a PEEPHOLE —
+    // only constants loaded IMMEDIATELY before the creation call are its
+    // arguments. Any instruction that consumes the operand stack (a call,
+    // a field read, a local load, a null) ends the window, so constants
+    // loaded for an unrelated call (Log.i("a", "b")) are never attributed
+    // to a wrapper or identifier built from non-constant arguments after
+    // it: that site is skipped and said, never a guessed "a:b".
+    walkBytecode(code, (op, pc) => {
+      visit(op, pc)
+      if (STACK_CONSUMING_OPS.has(op)) lastStrings.length = 0
     })
   }
 }

@@ -143,6 +143,34 @@ describe('HF72 — the identifier shape through an intermediary, the under-deriv
     assert.match(fpd.skipped[0].shape, /no identifier constant reached the creation call/)
   })
 
+  it('C3b (Rider, verify MED). constants loaded for an UNRELATED call before a wrapper or identifier built from non-constants are never borrowed — the constant window ends at every stack-consuming instruction; skipped and said, never a guessed "stale:strs"', () => {
+    const W = 'zz/m/util/Dyn'
+    const log = (a) => a.ldcStr('stale').ldcStr('strs').invokestatic('zz/m/Log', 'i', '(Ljava/lang/String;Ljava/lang/String;)V')
+    // the wrapper shape (the fix's own) behind a stale pair
+    const wrapped = netClass('zz/m/Net', (a) => log(a).new_(W).dup().aconstNull().aconstNull()
+      .invokespecial(W, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V').invokevirtual(W, 'unwrap', `()L${ID};`))
+    const fpw = owo.scanOwoFingerprints([dirWith({ 'stalew-1.0.0.jar': jarOf('stalew', wrapped, 'zz/m/Net') })])
+    assert.deepStrictEqual(fpw.channels, {}, 'the stale pair is not the wrapper\'s identifier')
+    assert.strictEqual(fpw.skipped.length, 1)
+    assert.match(fpw.skipped[0].shape, /no identifier constant reached the creation call/)
+    // the literal shape (pre-existing on the base) behind the same stale pair
+    const literal = netClass('zz/m/Net', (a) => log(a).new_(ID).dup().aconstNull().aconstNull().invokespecial(ID, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V'))
+    const fpl = owo.scanOwoFingerprints([dirWith({ 'stalel-1.0.0.jar': jarOf('stalel', literal, 'zz/m/Net') })])
+    assert.deepStrictEqual(fpl.channels, {})
+    assert.strictEqual(fpl.skipped.length, 1)
+    // a non-constant namespace read from a static field + a constant path: half an identifier is none
+    const half = netClass('zz/m/Net', (a) => log(a).new_(ID).dup().getstatic('zz/m/Mod', 'MOD_ID', 'Ljava/lang/String;').ldcStr('main').invokespecial(ID, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V'))
+    const fph = owo.scanOwoFingerprints([dirWith({ 'staleh-1.0.0.jar': jarOf('staleh', half, 'zz/m/Net') })])
+    assert.deepStrictEqual(fph.channels, {})
+    assert.strictEqual(fph.skipped.length, 1)
+    // CONTROL: the same stale pair before a wrapper built from ITS OWN constants still derives
+    const fresh = netClass('zz/m/Net', (a) => log(a).new_(W).dup().ldcStr('freshmod').ldcStr('main')
+      .invokespecial(W, '<init>', '(Ljava/lang/String;Ljava/lang/String;)V').invokevirtual(W, 'unwrap', `()L${ID};`))
+    const fpf = owo.scanOwoFingerprints([dirWith({ 'freshmod-1.0.0.jar': jarOf('freshmod', fresh, 'zz/m/Net') })])
+    assert.strictEqual(fpf.channels['freshmod:main'], expected('freshmod', 'main'))
+    assert.deepStrictEqual(fpf.skipped, [])
+  })
+
   it('B1. assess stamps derived.skipped[] (site + reason + shape) — the UNDER-DERIVED receipt; a fully derived reply carries []', () => {
     const W = 'zz/m/util/Dyn'
     const dyn = netClass('zz/m/Net', (a) => a.new_(W).dup().aconstNull().aconstNull()
