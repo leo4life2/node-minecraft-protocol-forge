@@ -96,7 +96,8 @@ function installLoginWindow (client, options) {
     queries: [],
     refused: [],
     budgetStops: [],
-    derivationMs: 0
+    derivationMs: 0,
+    asyncDerivationMs: 0 // HF72: derivations that ran OFF the login path (a forked scan / an acquisition) — never 'on the login path'
   }
   client.forgeLoginWindow = w
   client.forgeLoginWindowSummary = () => loginWindowSummary(client)
@@ -193,7 +194,7 @@ function settle (e, w, outcome, extra) {
   // open at close have none (their "latency" would be the login's length)
   e.latencyMs = e.arrivedAt != null && outcome !== 'no-reply-expected' && outcome !== 'unanswered-at-close' ? e.answeredAt - e.arrivedAt : null
   if (extra) Object.assign(e, extra)
-  if (e.derivation && !e.derivation.done) { e.derivation.done = true; e.derivation.ms = e.answeredAt - e.derivation.startedAt; w.derivationMs += e.derivation.ms }
+  if (e.derivation && !e.derivation.done) { e.derivation.done = true; e.derivation.ms = e.answeredAt - e.derivation.startedAt; w.asyncDerivationMs += e.derivation.ms }
   if (e.timer) { clearTimeout(e.timer); e.timer = null }
   return true
 }
@@ -380,7 +381,7 @@ function closeWindow (client, by) {
   const pre = s.prelogin ? `; pre-login derivation ${s.prelogin.assessed} channel(s) in ${s.prelogin.ms} ms (${s.prelogin.fromCache} from the persistent cache)` : ''
   const open = s.unansweredAtClose.length > 0 ? `; UNANSWERED at close: ${s.unansweredAtClose.join(', ')}` : ''
   console.log(`[forge] login window (${by}): ${s.queries.length} login quer${s.queries.length === 1 ? 'y' : 'ies'} in ${s.elapsedMs} ms of the ${w.windowMs} ms window; ` +
-    `${s.counts.answered} answered, ${s.counts.declined} declined, ${s.counts.dropped} dropped, ${s.counts.budget} budget-stopped, ${s.counts.refused} refused;${slow}; derivation ${w.derivationMs} ms on the login path${pre}${open}`)
+    `${s.counts.answered} answered, ${s.counts.declined} declined, ${s.counts.dropped} dropped, ${s.counts.budget} budget-stopped, ${s.counts.refused} refused;${slow}; derivation ${w.derivationMs} ms on the login path${w.asyncDerivationMs > 0 ? `, ${w.asyncDerivationMs} ms off it` : ''}${pre}${open}`)
 }
 
 /** JSON-safe snapshot: names, counts, timings — never a body. */
@@ -428,6 +429,7 @@ function loginWindowSummary (client) {
     counts,
     slowest,
     derivationMs: w.derivationMs,
+    asyncDerivationMs: w.asyncDerivationMs, // HF72
     unansweredAtClose: queries.filter((q) => q.outcome === 'unanswered-at-close' || q.outcome == null).map((q) => q.channel),
     budgetStops: w.budgetStops.map((f) => ({ channel: f.channel, action: f.action, waitedMs: f.waitedMs, budgetMs: f.budgetMs, derivation: f.derivation })),
     refused: w.refused.map((r) => ({ messageId: r.messageId, channel: r.channel, kind: r.kind, why: r.why, priorOutcome: r.priorOutcome })),

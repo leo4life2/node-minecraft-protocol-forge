@@ -93,6 +93,21 @@ const OWO_CONTROLLER_CLASS = 'io/wispforest/owo/particles/systems/ParticleSystem
 // Identifier fields into `facts`. Attribution is a peephole over the constants
 // each call site loads (getstatic receiver, ldc class/string operands) - exact
 // for the straight-line static-init code owo mods use.
+// "ns:path" / "path" (the minecraft namespace) -> {ns, path}, the one split
+function splitIdentifier (s) {
+  const ix = s.indexOf(':')
+  return ix >= 0 ? { ns: s.slice(0, ix), path: s.slice(ix + 1) } : { ns: 'minecraft', path: s }
+}
+
+// HF72: the shape of an identifier the scan tracked but could not resolve,
+// for the under-derived receipt (names the pattern, never guesses a value).
+function describeIdentifierShape (id) {
+  if (!id) return 'no identifier constant reached the creation call (built by code the scan does not follow)'
+  if (id.fieldRef) return `a static field (${id.fieldRef}) whose value the scan could not resolve`
+  if (id.helper) return `a helper call (${id.helper.owner}#${id.helper.name}) whose namespace the scan could not resolve`
+  return 'an identifier value the scan could not resolve'
+}
+
 function scanOwoClass (parsed, facts) {
   if (facts.scannedClasses.has(parsed.className)) return
   facts.scannedClasses.add(parsed.className)
@@ -111,6 +126,10 @@ function scanOwoClass (parsed, facts) {
     const lastStrings = [] // rolling window of the last two ldc'd strings
     let lastClassConst = null // last ldc'd Class constant
     let lastIdentifier = null // {ns,path} | {helper,path} | {fieldRef}
+    // HF72: an object a NON-identifier class built from the string constants
+    // ({owner, ns, path}) — the mod's own wrapper/compat type an instance
+    // conversion then turns into the Identifier (the intermediary shape).
+    let lastWrapped = null
     let lastReceiverField = null // 'owner.field' of last channel/controller getstatic
     let lastChannel = null // channel created in THIS method (fluent/putstatic target)
     let lastController = null
@@ -138,9 +157,20 @@ function scanOwoClass (parsed, facts) {
         const r = ref(code.readUInt16BE(pc + 1))
         if (!r || !r.desc) return
         const helper = r.desc.match(/^\(Ljava\/lang\/String;\)L([^;]+);$/)
+        const factory2 = r.desc.match(/^\(Ljava\/lang\/String;Ljava\/lang\/String;\)L([^;]+);$/)
         if (helper && OWO_IDENTIFIER_CLASSES.has(helper[1])) {
-          // MyMod.id("path") convention: namespace is an ldc inside the helper
-          lastIdentifier = { helper: { owner: r.owner, name: r.name }, path: lastStrings[lastStrings.length - 1] }
+          if (OWO_IDENTIFIER_CLASSES.has(r.owner) && lastStrings.length >= 1) {
+            // HF72: the identifier class's own one-string factory (Identifier.of("ns:path"))
+            lastIdentifier = splitIdentifier(lastStrings[lastStrings.length - 1])
+          } else {
+            // MyMod.id("path") convention: namespace is an ldc inside the helper
+            lastIdentifier = { helper: { owner: r.owner, name: r.name }, path: lastStrings[lastStrings.length - 1] }
+          }
+        } else if (factory2 && OWO_IDENTIFIER_CLASSES.has(factory2[1]) && lastStrings.length >= 2) {
+          // HF72: a two-string static factory returning the Identifier
+          // (Identifier.of(ns, path) on 1.21+, a mod's own MyMod.id(ns, path))
+          // — the two constants ARE the identifier, whatever the owner.
+          lastIdentifier = { ns: lastStrings[lastStrings.length - 2], path: lastStrings[lastStrings.length - 1], via: `${r.owner}#${r.name}` }
         } else if (r.owner === OWO_CHANNEL_CLASS && (r.name === 'create' || r.name === 'createOptional')) {
           lastChannel = {
             id: lastIdentifier,
@@ -160,9 +190,7 @@ function scanOwoClass (parsed, facts) {
           if (r.desc === '(Ljava/lang/String;Ljava/lang/String;)V' && lastStrings.length >= 2) {
             lastIdentifier = { ns: lastStrings[lastStrings.length - 2], path: lastStrings[lastStrings.length - 1] }
           } else if (r.desc === '(Ljava/lang/String;)V' && lastStrings.length >= 1) {
-            const s = lastStrings[lastStrings.length - 1]
-            const ix = s.indexOf(':')
-            lastIdentifier = ix >= 0 ? { ns: s.slice(0, ix), path: s.slice(ix + 1) } : { ns: 'minecraft', path: s }
+            lastIdentifier = splitIdentifier(lastStrings[lastStrings.length - 1])
           }
         } else if (r.owner === OWO_CONTROLLER_CLASS && pendingNewController) {
           lastController = { id: lastIdentifier, count: 0, site: `${className}#${method}` }
@@ -170,11 +198,26 @@ function scanOwoClass (parsed, facts) {
           pendingNewController = false
           lastIdentifier = null
           lastReceiverField = null
+        } else if (r.desc === '(Ljava/lang/String;Ljava/lang/String;)V' && lastStrings.length >= 2) {
+          // HF72: a mod's own wrapper built from the two constants
+          // (new CompatResourceLocation("ns", "path") ... .unwrap())
+          lastWrapped = { owner: r.owner, ns: lastStrings[lastStrings.length - 2], path: lastStrings[lastStrings.length - 1] }
+        } else if (r.desc === '(Ljava/lang/String;)V' && lastStrings.length >= 1) {
+          lastWrapped = Object.assign({ owner: r.owner }, splitIdentifier(lastStrings[lastStrings.length - 1]))
         }
-      } else if (op === 0xb6) { // invokevirtual
+      } else if (op === 0xb6 || op === 0xb9) { // invokevirtual / invokeinterface
         const r = ref(code.readUInt16BE(pc + 1))
         if (!r) return
-        if (r.owner === OWO_CHANNEL_CLASS && /^register(Serverbound|Clientbound|ClientboundDeferred)$/.test(r.name)) {
+        const conv = r.desc && r.desc.match(/^\(\)L([^;]+);$/)
+        if (conv && OWO_IDENTIFIER_CLASSES.has(conv[1]) && lastWrapped && lastWrapped.owner === r.owner) {
+          // HF72: the wrapper's no-arg conversion returning the Identifier —
+          // the constants it was built from are the identifier
+          lastIdentifier = { ns: lastWrapped.ns, path: lastWrapped.path, via: `${r.owner}#${r.name}` }
+          lastWrapped = null
+        } else if (op === 0xb9) {
+          // interface calls carry no owo registration (OwoNetChannel and the
+          // controller are classes); only the conversion above reads them
+        } else if (r.owner === OWO_CHANNEL_CLASS && /^register(Serverbound|Clientbound|ClientboundDeferred)$/.test(r.name)) {
           facts.registrations.push({
             kind: r.name,
             className: lastClassConst,
@@ -336,11 +379,15 @@ function scanOwoFingerprints (paths) {
     if (ctl) ctl.count++
   }
 
-  const out = { channels: {}, controllers: {}, optional: {} }
+  // HF72: `skipped` = every channel/controller the scan SAW but could not
+  // name — the reply is then under-derived and the receipt says where.
+  const out = { channels: {}, controllers: {}, optional: {}, skipped: [] }
   for (const ch of facts.channels) {
     const id = resolveOwoIdentifier(facts, ch.id, 0)
     if (!id) {
-      console.warn(`[forge] owo channel created at ${ch.site} has an unresolvable identifier - skipping (the server will name it if it gates the join)`)
+      const shape = describeIdentifierShape(ch.id)
+      out.skipped.push({ kind: ch.optional ? 'optional-channel' : 'channel', site: ch.site, reason: 'unresolvable-identifier', shape })
+      console.warn(`[forge] owo channel created at ${ch.site} has an unresolvable identifier (${shape}) - skipping (the server will name it if it gates the join)`)
       continue
     }
     let sum = 0
@@ -355,7 +402,9 @@ function scanOwoFingerprints (paths) {
   for (const ctl of facts.controllers) {
     const id = resolveOwoIdentifier(facts, ctl.id, 0)
     if (!id) {
-      console.warn(`[forge] owo particle controller created at ${ctl.site} has an unresolvable identifier - skipping`)
+      const shape = describeIdentifierShape(ctl.id)
+      out.skipped.push({ kind: 'controller', site: ctl.site, reason: 'unresolvable-identifier', shape })
+      console.warn(`[forge] owo particle controller created at ${ctl.site} has an unresolvable identifier (${shape}) - skipping`)
       continue
     }
     const key = `${id.ns}:${id.path}`
@@ -396,13 +445,61 @@ function owoFingerprintsFor (options) {
       const n = (m) => Object.keys(m).length
       console.log(`[forge] derived owo fingerprints from ${paths.join(', ')}: ` +
         `${n(fingerprints.channels)} channels, ${n(fingerprints.controllers)} controllers, ` +
-        `${n(fingerprints.optional)} optional (${Date.now() - started}ms)`)
+        `${n(fingerprints.optional)} optional (${Date.now() - started}ms on the login path)${skippedClause(fingerprints)}`)
     } catch (err) {
       console.warn(`[forge] owo fingerprint scan failed (${err.message}) - replying with empty maps`)
     }
   }
   owoFingerprintCache.set(key, fingerprints)
   return fingerprints
+}
+
+// HF72: the under-derived clause of the derived log line (names every site)
+function skippedClause (fingerprints) {
+  const sk = (fingerprints && fingerprints.skipped) || []
+  return sk.length ? `; UNDER-DERIVED, ${sk.length} skipped: ${sk.map((x) => `${x.kind} at ${x.site} (${x.shape})`).join('; ')}` : ''
+}
+
+// HF72: the scan OFF the login path. The synchronous scan froze the agent's
+// event loop for the whole derivation (2.3-3.0 s on the field's CurseForge
+// instance) — every other login query's instant decline then left in a
+// burst BEHIND the slow reply, the server kicked with those bytes unread
+// and the kick text was lost to the abortive close (F11). `assessAsync`
+// takes the process boundary by INJECTION (`options.scanJob(paths)` — a
+// promise of the fingerprint maps; MinePal's src/utils/owoScanJob.js forks
+// ./owoScanRunner.js under the same forked-child rule as its
+// shapeDerivationJob, so this module stays a jars-only parser — PRIVACY
+// LAW 2) and lands the result in the SAME per-process cache the
+// synchronous path reads. No job / a job that fails = the synchronous scan
+// (today's behaviour, never a lost reply).
+
+/**
+ * HF72: the asynchronous twin of `assess` for the Fabric lane's reply
+ * boundary — resolves to exactly what `assess` returns, but the jar scan
+ * runs off the event loop (first call per mods folder; later calls read
+ * the cache synchronously). The caller's other login replies are written
+ * while this runs; the reply is written when it lands.
+ */
+function assessAsync (data, options) {
+  const paths = modsPathsFor(options)
+  const key = paths.join('|')
+  const job = options && typeof options.scanJob === 'function' ? options.scanJob : null
+  if (!job || paths.length === 0 || owoFingerprintCache.has(key)) return Promise.resolve(assess(data, options))
+  const started = Date.now()
+  return Promise.resolve().then(() => job(paths)).then((fingerprints) => {
+    if (!fingerprints || typeof fingerprints !== 'object' || !fingerprints.channels) throw new Error('the scan job returned no fingerprint maps')
+    return fingerprints
+  }).then((fingerprints) => {
+    const n = (m) => Object.keys(m || {}).length
+    console.log(`[forge] derived owo fingerprints from ${paths.join(', ')}: ` +
+      `${n(fingerprints.channels)} channels, ${n(fingerprints.controllers)} controllers, ` +
+      `${n(fingerprints.optional)} optional (${Date.now() - started}ms off the login path)${skippedClause(fingerprints)}`)
+    if (!owoFingerprintCache.has(key)) owoFingerprintCache.set(key, fingerprints)
+    return assess(data, options)
+  }, (err) => {
+    console.warn(`[forge] owo fingerprint scan job failed (${err && err.message}) after ${Date.now() - started} ms - scanning on the login path instead`)
+    return assess(data, options)
+  })
 }
 
 // Raw (non-loginwrapper) login channels: builder(data, options) returns the
@@ -452,8 +549,18 @@ function assess (data, options) {
   return {
     data: buildReply(fingerprints),
     sources,
-    derived: { channels: counts(fingerprints.channels), controllers: counts(fingerprints.controllers), optional: counts(fingerprints.optional), channelIds: Object.keys(fingerprints.channels), controllerIds: Object.keys(fingerprints.controllers) }
+    derived: {
+      channels: counts(fingerprints.channels),
+      controllers: counts(fingerprints.controllers),
+      optional: counts(fingerprints.optional),
+      channelIds: Object.keys(fingerprints.channels),
+      controllerIds: Object.keys(fingerprints.controllers),
+      // HF72: every channel/controller the scan saw but could not name —
+      // an under-derived reply the server will reject by name; the receipt
+      // and the kick copy name the site even when the kick text is lost.
+      skipped: Array.isArray(fingerprints.skipped) ? fingerprints.skipped.map((x) => ({ kind: x.kind, site: x.site, reason: x.reason, shape: x.shape })) : []
+    }
   }
 }
 
-module.exports = { CHANNEL: 'owo:handshake', buildReply, encodeIdHashMap, owoIdentifierHash, scanOwoFingerprints, modsPathsFor, owoFingerprintsFor, RAW_LOGIN_PROTOCOLS, assess }
+module.exports = { CHANNEL: 'owo:handshake', buildReply, encodeIdHashMap, owoIdentifierHash, scanOwoFingerprints, modsPathsFor, owoFingerprintsFor, RAW_LOGIN_PROTOCOLS, assess, assessAsync, describeIdentifierShape }
