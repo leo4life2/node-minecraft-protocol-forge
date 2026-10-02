@@ -187,7 +187,7 @@ function findSideSuffixes (index, factoryInfo) {
   const candidates = new Set(referencedClassNames(factoryInfo))
   candidates.add(factoryInfo.className)
   for (const name of candidates) {
-    if (!index.raw.has(name)) continue
+    if (!(index.has ? index.has(name) : index.raw.has(name))) continue
     const info = index.get(name)
     if (!info) continue
     for (const m of info.codes) {
@@ -214,7 +214,7 @@ function findSideSuffixes (index, factoryInfo) {
 function findCtorNamespaces (index, factoryName) {
   const namespaces = new Set()
   const needle = Buffer.from(factoryName, 'utf8')
-  for (const name of [...index.raw.keys()]) {
+  for (const name of (index.allNames ? index.allNames() : [...index.raw.keys()])) { // HF73b: a resolution scan - pack-wide, every unit examined is on the trail
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes(needle)) continue
     const info = index.get(name)
@@ -251,7 +251,7 @@ function findCtorNamespaces (index, factoryName) {
 function countCounterCallSites (index, factoryName, counterMethod) {
   let count = 0
   const needle = Buffer.from(factoryName, 'utf8')
-  for (const name of [...index.raw.keys()]) {
+  for (const name of (index.allNames ? index.allNames() : [...index.raw.keys()])) { // HF73b: a resolution scan - pack-wide, every unit examined is on the trail
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes(needle)) continue
     const info = index.get(name)
@@ -273,7 +273,7 @@ function countCounterCallSites (index, factoryName, counterMethod) {
 function deriveWrapperFactoryListenChannels (index, diagnostics) {
   const ids = []
   let factories = 0
-  for (const name of [...index.raw.keys()]) {
+  for (const name of (index.seedNames ? index.seedNames() : [...index.raw.keys()])) { // HF73b: a producer scan - the focus unit's own classes
     if (factories >= MAX_FACTORIES) break
     let bytes
     try { bytes = index.rawBytes(name) } catch { continue }
@@ -408,7 +408,7 @@ function deriveFabricListenChannels (index, diagnostics) {
   const ids = new Set()
   const helperCache = new Map()
   const needle = Buffer.from(FABRIC_PAYLOAD_REGISTRY, 'utf8')
-  for (const name of [...index.raw.keys()]) {
+  for (const name of (index.seedNames ? index.seedNames() : [...index.raw.keys()])) { // HF73b: a producer scan - the focus unit's own classes
     let bytes
     try { bytes = index.rawBytes(name) } catch { continue }
     if (!bytes || !bytes.includes(needle)) continue
@@ -508,7 +508,7 @@ function findInclusiveSites (index, target, owners, cache) {
   const sites = []
   cache.set(key, sites)
   const needles = [...owners].map((o) => Buffer.from(simpleName(o), 'utf8'))
-  for (const cls of [...index.raw.keys()]) {
+  for (const cls of (index.allNames ? index.allNames() : [...index.raw.keys()])) { // HF73b: a resolution scan - pack-wide, every unit examined is on the trail
     let bytes
     try { bytes = index.rawBytes(cls) } catch { continue }
     if (!bytes || !needles.some((n) => bytes.includes(n))) continue
@@ -577,7 +577,7 @@ function deriveContainerCarriedListenChannels (index, diagnostics, ev) {
   if (!ev || typeof ev.evaluateMethod !== 'function') return []
   // 1. registration sites that read the Type OFF A CONTAINER accessor
   const containers = new Map() // K -> Set(registration methods seen)
-  for (const name of [...index.raw.keys()]) {
+  for (const name of (index.seedNames ? index.seedNames() : [...index.raw.keys()])) { // HF73b: a producer scan - the focus unit's own classes
     let bytes
     try { bytes = index.rawBytes(name) } catch { continue }
     if (!bytes || !bytes.includes(REGISTRAR_TYPE)) continue
@@ -592,7 +592,7 @@ function deriveContainerCarriedListenChannels (index, diagnostics, ev) {
         if ((r.op !== 0xb6 && r.op !== 0xb9) || !r.ref) continue
         if (r.ref.desc !== `()L${MOJMAP_PAYLOAD_TYPE};`) continue
         const owner = r.ref.owner
-        if (owner === REGISTRAR_TYPE || owner === EVENT_TYPE || !index.raw.has(owner)) continue
+        if (owner === REGISTRAR_TYPE || owner === EVENT_TYPE || !(index.has ? index.has(owner) : index.raw.has(owner))) continue
         if (!containers.has(owner)) containers.set(owner, new Set())
         for (const g of regs) containers.get(owner).add(g.ref.name)
       }

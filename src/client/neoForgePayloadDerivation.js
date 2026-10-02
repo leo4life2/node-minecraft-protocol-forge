@@ -72,6 +72,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const debug = require('../../debug')
 const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
 const { nestedJarEntriesOf } = require('./nestedJars') // HF53 rider: the one nested-jar rule
@@ -113,15 +114,23 @@ const REGISTRATION_METHODS = {
 
 // ---------- jar walking ----------
 
+// HF73b: every top-level jar read is a UNIT of the index (one per path, in
+// read order) carrying the jar's content sha1 (hashed from the buffer the
+// read already holds - no second read), its declared mod ids / version and
+// the names of the classes it holds (nested jar-in-jar classes included).
+// The per-jar derivation (deriveNeoForgeJarUnit) walks one unit's classes
+// and records which OTHER units its resolution consulted (the trail).
 function collectJarClasses (jarPath, out, diagnostics, jarLabel) {
   let buf
   try {
     buf = fs.readFileSync(jarPath)
   } catch (err) {
     diagnostics.errors.push(`${jarLabel}: unreadable (${err.message})`)
+    if (out.noteUnit) out.noteUnit({ path: jarPath, label: jarLabel, sha1: null, unreadable: err.message })
     return
   }
-  collectBufferClasses(buf, out, diagnostics, jarLabel, 0)
+  const unit = out.noteUnit ? out.noteUnit({ path: jarPath, label: jarLabel, sha1: crypto.createHash('sha1').update(buf).digest('hex') }) : null
+  collectBufferClasses(buf, out, diagnostics, jarLabel, 0, unit)
 }
 
 // HF53 rider: nested jars through the one shared rule; the nesting bound
@@ -129,7 +138,7 @@ function collectJarClasses (jarPath, out, diagnostics, jarLabel) {
 // still read, one deeper is not (the walk used to have no floor).
 const NESTED_JAR_DEPTH_BOUND = 3
 
-function collectBufferClasses (buf, out, diagnostics, jarLabel, depth) {
+function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = null) {
   let entries
   try {
     entries = zipCentralEntries(buf)
@@ -168,11 +177,13 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth) {
   }
   const jarInfo = { label: jarLabel, modVersion, modIds }
   diagnostics.jars.push(jarInfo)
+  if (unit) { unit.jars.push(jarInfo); unit.modIds.push(...modIds); if (depth === 0) unit.modVersion = modVersion }
   for (const e of entries) {
     if (e.name.endsWith('.class') && !e.name.includes('module-info')) {
       const className = e.name.slice(0, -6)
       if (!out.raw.has(className)) {
-        out.raw.set(className, { buf, entry: e, jar: jarInfo })
+        out.raw.set(className, { buf, entry: e, jar: jarInfo, unit })
+        if (unit) unit.classNames.push(className)
       }
     } else if (e.name.startsWith('META-INF/services/') && !e.name.endsWith('/')) {
       // HF11: ServiceLoader ground truth — veil's platform Factory (and the
@@ -191,7 +202,7 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth) {
     } else if (nested.has(e.name)) {
       if (depth >= NESTED_JAR_DEPTH_BOUND) continue
       try {
-        collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${nested.get(e.name).relPath}`, depth + 1)
+        collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${nested.get(e.name).relPath}`, depth + 1, unit)
       } catch (err) {
         diagnostics.errors.push(`${jarLabel}!${e.name}: nested jar unreadable (${err.message})`)
       }
@@ -203,11 +214,32 @@ function makeClassIndex () {
   const raw = new Map() // internalName -> {buf, entry, jar}
   const services = new Map() // interface internalName -> [impl internalName]
   const parsed = new Map()
+  const units = [] // HF73b: the top-level jars read, in read order
   const index = {
     raw,
     services,
+    units,
+    // HF73b THE TRAIL: while `focus` is a unit, every class lookup that
+    // lands in ANOTHER unit (get / rawBytes / has / jarOf - a parse, a byte
+    // scan, an existence test) adds that unit's path to `trail`. A unit's
+    // per-jar result is valid only while the unit AND every unit on its
+    // trail are unchanged; a lookup that misses (no such class) consults
+    // nothing. Seed scans (the producers: entry methods, mod roots, enum
+    // registries, ack handlers, listen-only factories) iterate seedNames()
+    // = the focus unit's own classes; resolution scans (subclasses, callers,
+    // population sites) stay pack-wide through allNames() / allClassNames
+    // and record every unit they examine.
+    focus: null,
+    trail: null,
+    noteUnit (u) { const unit = { ...u, modIds: [], modVersion: null, classNames: [], jars: [] }; units.push(unit); return unit },
+    consult (r) { const f = index.focus; if (f && r && r.unit && r.unit !== f) index.trail.add(r.unit.path) },
+    has (name) { const r = raw.get(name); index.consult(r); return !!r },
+    jarOf (name) { const r = raw.get(name); index.consult(r); return r ? r.jar : null },
+    seedNames () { return index.focus ? index.focus.classNames : [...raw.keys()] },
+    allNames () { return [...raw.keys()] },
     get (name) {
       if (!name) return null
+      index.consult(raw.get(name))
       if (parsed.has(name)) return parsed.get(name)
       const r = raw.get(name)
       let info = null
@@ -222,6 +254,7 @@ function makeClassIndex () {
     },
     rawBytes (name) {
       const r = raw.get(name)
+      index.consult(r)
       if (!r) return null
       try { return zipEntryData(r.buf, r.entry) } catch { return null }
     }
@@ -1350,7 +1383,7 @@ function analyzeWrapperMethod (index, wrapperCls, methodName, desc, state) {
 
 function deriveEnumRegistries (index, state, markers) {
   const out = []
-  for (const name of state.allClassNames) {
+  for (const name of seedNamesOf(index, state)) {
     const bytes = index.rawBytes(name)
     if (!bytes) continue
     // cheap prefilter: enum + Type construction + toLowerCase
@@ -3206,7 +3239,7 @@ function classTypeId (index, state, cls) {
 // unchanged.
 function deriveAckContracts (index, state, collect = null) {
   const contracts = []
-  for (const cls of state.allClassNames) {
+  for (const cls of seedNamesOf(index, state)) {
     const bytes = index.rawBytes(cls)
     if (!bytes || !bytes.includes('finishCurrentTask')) continue
     const info = index.get(cls)
@@ -3435,7 +3468,7 @@ function deriveModRootRegistrations (index, state, record) {
   const summary = { roots: 0, listeners: 0, registrations: 0, resolvedIds: 0, unresolvedIds: 0, droppedUnprovenOrder: 0, budgetExhausted: false, listenerSites: [], rows: [], steps: 0, unitBudget: MOD_ROOT_UNIT_STEP_BUDGET, totalBudget: MOD_ROOT_TOTAL_STEP_BUDGET, exhaustedUnits: [] }
   diagnostics.modRoot = summary
   const roots = []
-  for (const name of state.allClassNames) {
+  for (const name of seedNamesOf(index, state)) {
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes('/Mod;')) continue
     const info = index.get(name)
@@ -3615,31 +3648,167 @@ function deriveModRootRegistrations (index, state, record) {
   return kept
 }
 
-function deriveNeoForgeComponents (jarPaths) {
-  const started = Date.now()
-  const index = makeClassIndex()
-  const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0, presenceGates: [] }
-  for (const p of jarPaths) collectJarClasses(p, index, diagnostics, path.basename(p))
+// ---------- HF73b: the per-jar derivation ----------
+//
+// A pack's derivation is the union of PER-JAR derivations over ONE shared
+// class index: the index is read from every jar (resolution crosses jars - a
+// library mod's helper, a superclass in an API jar, a caller in a dependent
+// mod), each unit (top-level jar) is then walked on its own fresh state with
+// the index focused on it, and the pack answer is assembled from the units'
+// claims through the same conflict guard as before. A unit's result carries
+// (a) its TRAIL: the other units whose classes its resolution consulted, and
+// (b) its DEPS: the pack facts it read that no class lookup records - the
+// mod-id census it tested (presence gates), the mods.toml versions it looked
+// up by namespace, and the presence-gate verdict of each of its entries. A
+// cached per-jar result holds while the jar, every trail jar and every dep
+// are unchanged (the caller's law; unitDependenciesHold below is the check).
 
-  const versionByModId = Object.create(null)
-  for (const j of diagnostics.jars) for (const id of j.modIds || []) if (j.modVersion && !versionByModId[id]) versionByModId[id] = j.modVersion
-  // HF37: a runtime-versioned registrar falls back to the mods.toml version of
-  // the mod the registrar NAMESPACE names (its own jar), then the site's jar.
-  const metaVersionFor = (namespace, jar) => (namespace && versionByModId[namespace]) || (jar && jar.modVersion) || null
-  const state = {
+function seedNamesOf (index, state) { return index.seedNames ? index.seedNames() : state.allClassNames }
+
+function gateKeyOf (gate) { return gate ? `${gate.modId}|${gate.holder}|${gate.probe}|${gate.site}` : null }
+
+function freshDerivationState (read, diagnostics, deps = null) {
+  const versionByModId = deps
+    ? new Proxy(read.versionByModId, { get (t, k) { if (typeof k === 'string') deps.versions[k] = t[k] ?? null; return t[k] } })
+    : read.versionByModId
+  return {
     versionByModId,
     fieldValues: Object.create(null),
     typeFieldsResolved: new Set(),
     helperCache: new Map(),
     wrapperCache: new Map(),
     dispatched: new Set(),
-    allClassNames: [...index.raw.keys()],
+    allClassNames: read.allClassNames,
     diagnostics
   }
+}
 
+/**
+ * Reads every jar ONCE into the shared index (the units: path, label, content
+ * sha1, mod ids, class names) and derives the pack facts every unit reads:
+ * the mods.toml version census and the presence gates (holders and keyed
+ * user sites anywhere in the pack).
+ */
+function readNeoForgeJarUnits (jarPaths) {
+  const started = Date.now()
+  const index = makeClassIndex()
+  const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0, presenceGates: [] }
+  for (const p of jarPaths) collectJarClasses(p, index, diagnostics, path.basename(p))
+  const versionByModId = Object.create(null)
+  for (const j of diagnostics.jars) for (const id of j.modIds || []) if (j.modVersion && !versionByModId[id]) versionByModId[id] = j.modVersion
+  const read = { index, units: index.units, diagnostics, versionByModId, allClassNames: [...index.raw.keys()], gates: new Map(), readMs: 0 }
+  const gateState = freshDerivationState(read, diagnostics)
+  try {
+    read.gates = deriveModPresenceGates(index, gateState)
+  } catch (err) {
+    diagnostics.errors.push(`presence-gate derivation failed (${err.message})`)
+  }
+  // HF43-r MOD-ROOT WALK (see deriveModRootRegistrations): a PACK pass - every
+  // @Mod constructor runs in the loader's order and a listener one root
+  // registered iterates registration objects OTHER roots populated (HF51: a
+  // library's listener, a dependent mod's objects), so its registrations are
+  // the pack's (the pseudo-unit below, never cached per jar) and the sites it
+  // resolved are a pack fact each unit records in its deps (rootResolved).
+  // It runs on the read's own state after the gates, as the single walk did.
+  read.rootRegistrations = []
+  const record = (reg) => {
+    const spec = REGISTRATION_METHODS[reg.method]
+    if (process.env.MINEPAL_AGG_DEBUG) debug(`record ${reg.method} id=${reg.id} idVal=${JSON.stringify(reg.idVal).slice(0, 160)} site=${reg.site} version=${reg.registrar && reg.registrar.version}`)
+    if (!spec) return
+    read.rootRegistrations.push({ ...reg, ...spec })
+  }
+  try {
+    deriveModRootRegistrations(index, gateState, record)
+  } catch (err) {
+    diagnostics.errors.push(`mod-root walk failed (${err.message})`)
+  }
+  read.modRootResolved = gateState.modRootResolved || new Set()
+  read.readMs = Date.now() - started
+  return read
+}
+
+/** The pack pseudo-unit: the mod-root walk's registrations resolved through the version rules and the aggregator; its trail is every unit (a pack fact). */
+const PACK_UNIT_LABEL = 'mod-roots'
+function derivePackUnit (read) {
+  const unit = { path: null, label: PACK_UNIT_LABEL, sha1: null, pack: true, classNames: [], modIds: [], jars: [] }
+  const out = deriveNeoForgeJarUnit(read, unit, { seedRegistrations: read.rootRegistrations, modRootPass: true })
+  out.trail = read.units.map((u) => u.path).sort()
+  out.pack = true
+  return out
+}
+
+/** The census facts a unit's deps are checked against: mod id -> version|null (present), absent ids missing. */
+function censusOfRead (read) {
+  const present = Object.create(null)
+  for (const j of read.diagnostics.jars) for (const id of j.modIds || []) if (!(id in present)) present[id] = j.modVersion || null
+  return present
+}
+
+/**
+ * HF73b: do a unit's recorded dependencies still hold against a fresh read?
+ * `trailSha1s` = the content sha1 of every trail unit when the result was
+ * derived; the read must hold a unit with each (identity by content, never by
+ * file name); every mod id the unit tested for presence must test the same,
+ * every namespace version it looked up must read the same, and every entry's
+ * presence-gate verdict must read the same. Returns { ok, why }.
+ */
+function unitDependenciesHold (read, { trailSha1s = [], deps = null } = {}) {
+  const have = new Set(read.units.map((u) => u.sha1).filter(Boolean))
+  for (const h of trailSha1s) if (!have.has(h)) return { ok: false, why: `trail jar ${String(h).slice(0, 12)} changed or gone` }
+  if (deps) {
+    const census = censusOfRead(read)
+    for (const [id, present] of Object.entries(deps.present || {})) {
+      const now = ALWAYS_PRESENT_MOD_IDS.has(id) || (id in census)
+      if (now !== !!present) return { ok: false, why: `mod "${id}" ${now ? 'now present' : 'no longer present'}` }
+    }
+    for (const [id, version] of Object.entries(deps.versions || {})) {
+      const now = read.versionByModId[id] ?? null
+      if (now !== (version ?? null)) return { ok: false, why: `mods.toml version of "${id}" changed` }
+    }
+    for (const [cls, key] of Object.entries(deps.gates || {})) {
+      const now = gateKeyOf(read.gates.get(cls) || null)
+      if (now !== (key ?? null)) return { ok: false, why: `presence gate of ${cls} changed` }
+    }
+    for (const [site, resolved] of Object.entries(deps.rootResolved || {})) {
+      if (read.modRootResolved.has(site) !== !!resolved) return { ok: false, why: `mod-root walk verdict of ${site} changed` }
+    }
+  }
+  return { ok: true, why: null }
+}
+
+/**
+ * Derives ONE unit of a read: its entry methods, mod roots, enum / annotation
+ * registries, ack contracts and listen-only surfaces, resolved through the
+ * whole index. Returns the unit's claims (pre-assembly tuples, in the
+ * assembly's phase order), its diagnostics, its trail and its deps.
+ */
+function deriveNeoForgeJarUnit (read, unit, { seedRegistrations = [], modRootPass = false } = {}) {
+  const started = Date.now()
+  const { index } = read
+  const diagnostics = { jars: read.diagnostics.jars, abstains: [], errors: [], registrations: 0, presenceGates: [] }
+  const deps = { present: Object.create(null), versions: Object.create(null), gates: Object.create(null), rootResolved: Object.create(null) }
+  const state = freshDerivationState(read, diagnostics, deps)
+  const versionByModId = state.versionByModId
+  // HF37: a runtime-versioned registrar falls back to the mods.toml version of
+  // the mod the registrar NAMESPACE names (its own jar), then the site's jar.
+  const metaVersionFor = (namespace, jar) => (namespace && versionByModId[namespace]) || (jar && jar.modVersion) || null
+  index.focus = unit
+  index.trail = new Set()
+  try {
+    return deriveUnitBody(read, unit, state, diagnostics, deps, metaVersionFor, started, seedRegistrations, modRootPass)
+  } finally {
+    index.focus = null
+    index.trail = null
+  }
+}
+
+function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, started, seedRegistrations, modRootPass) {
+  const { index } = read
+  // the pack fact each unit reads: was this site resolved by the mod-root walk?
+  const rootResolved = (key) => { const v = read.modRootResolved.has(key); deps.rootResolved[key] = v; return v }
   // entry points: any method whose descriptor takes the registrar event
   const entryMethods = []
-  for (const name of state.allClassNames) {
+  for (const name of seedNamesOf(index, state)) {
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes(EVENT_TYPE)) continue
     const info = index.get(name)
@@ -3649,23 +3818,17 @@ function deriveNeoForgeComponents (jarPaths) {
     }
   }
 
-  const registrations = []
+  const registrations = [...seedRegistrations]
   const silentEntries = []
-  const presenceGates = deriveModPresenceGates(index, state)
-  const modRootStart = registrations.length
-  const censusHas = (modId) => ALWAYS_PRESENT_MOD_IDS.has(modId) || diagnostics.jars.some((j) => (j.modIds || []).includes(modId))
+  const presenceGates = read.gates
+  const censusHas = (modId) => { const v = ALWAYS_PRESENT_MOD_IDS.has(modId) || diagnostics.jars.some((j) => (j.modIds || []).includes(modId)); deps.present[modId] = v; return v }
   const record = (reg) => {
     const spec = REGISTRATION_METHODS[reg.method]
     if (process.env.MINEPAL_AGG_DEBUG) debug(`record ${reg.method} id=${reg.id} idVal=${JSON.stringify(reg.idVal).slice(0, 160)} site=${reg.site} version=${reg.registrar && reg.registrar.version}`)
     if (!spec) return
     registrations.push({ ...reg, ...spec })
   }
-  try {
-    deriveModRootRegistrations(index, state, record)
-  } catch (err) {
-    diagnostics.errors.push(`mod-root walk failed (${err.message})`)
-  }
-  diagnostics.registrations = registrations.length - modRootStart
+  diagnostics.registrations = registrations.length
   for (const { info, method } of entryMethods) {
     // HF11: locals seeded with PROVENANCE tags instead of bare unknowns (the
     // receiver as {k:'this'}, each argument as {k:'param', i}) — same null
@@ -3675,6 +3838,7 @@ function deriveNeoForgeComponents (jarPaths) {
     // values are still produced by the interpreter when registrar() is
     // invoked on the event argument.
     const gate = (method.flags & 0x0008) === 0 ? presenceGates.get(info.className) : null
+    if ((method.flags & 0x0008) === 0) deps.gates[info.className] = gateKeyOf(gate)
     if (gate) {
       const present = censusHas(gate.modId)
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, modId: gate.modId, present, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
@@ -3727,7 +3891,7 @@ function deriveNeoForgeComponents (jarPaths) {
     // HF43-r: an entry the mod-root walk ran to a proven registration (it is
     // on the chain a listener's registrations came through) is resolved —
     // no deep re-walk, no "never reaches" line against claimed channels.
-    if (state.modRootResolved && state.modRootResolved.has(`${info.className}.${method.method}${method.desc}`)) continue
+    if (rootResolved(`${info.className}.${method.method}${method.desc}`)) continue
     // a lambda body's enclosing entry reports for it — when there IS one: a
     // listener lambda registered from a plain `init(IEventBus)` (the
     // STATIC-REGISTRAR shape: geckolib's `bus.addListener(this::onRegister)`)
@@ -3780,39 +3944,14 @@ function deriveNeoForgeComponents (jarPaths) {
   const markers = discoverFlowMarkers(index, entryMethods)
   const enumComponents = deriveEnumRegistries(index, state, markers)
 
-  // assemble, applying the version rules
-  const byProtocol = { configuration: new Map(), play: new Map() }
-  // HF16 ASSEMBLE CONFLICT GUARD: version sources that are BYTECODE-PROVEN
-  // (a compile-time constant read at/through the registration site) outrank
-  // the mods.toml fallback heuristic. A constant-proven tuple REPLACES a
-  // fallback-sourced one for the same channel; two DISAGREEING constant
-  // proofs drop the channel loudly (mirror of the aggregator conflict law —
-  // a wrong tuple claim fails the negotiation with a worse diagnostic than
-  // an honest miss).
-  const CONSTANT_VERSION_SOURCES = new Set(['constant', 'enum-registry', 'annotation-registry'])
-  const droppedConflicts = new Set()
+  // the unit's CLAIMS: the tuples the pack assembly feeds its conflict guard,
+  // tagged with the assembly phase they belonged to (0 registrations, 1 enum
+  // registries, 2 aggregated rows, 3 annotation registries) so the pack order
+  // is the one the single walk had
+  const claims = []
+  let phaseNow = 0
   const add = (id, version, flow, optional, protocols, source, versionSource, versionFrom = null) => {
-    for (const proto of protocols) {
-      if (!byProtocol[proto]) continue
-      if (droppedConflicts.has(`${proto}:${id}`)) continue
-      const prev = byProtocol[proto].get(id)
-      if (!prev) {
-        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource, versionFrom })
-        continue
-      }
-      const prevConst = CONSTANT_VERSION_SOURCES.has(prev.versionSource)
-      const newConst = CONSTANT_VERSION_SOURCES.has(versionSource)
-      if (newConst && !prevConst) {
-        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource, versionFrom })
-        continue
-      }
-      if (newConst && prevConst && (prev.version !== version || prev.flow !== flow || prev.optional !== optional)) {
-        byProtocol[proto].delete(id)
-        droppedConflicts.add(`${proto}:${id}`)
-        diagnostics.abstains.push(`${id}: constant-proven registrations disagree on version/flow/optionality — unclaimed (a wrong tuple would fail the negotiation)`)
-      }
-      // otherwise the standing claim holds (identical or equally-provenanced)
-    }
+    claims.push({ phase: phaseNow, id, version, flow, optional, protocols, source, versionSource, versionFrom })
   }
   const pendingAgg = []
   // HF15 tier (a): a registration whose ID resolved but whose VERSION did
@@ -3864,6 +4003,7 @@ function deriveNeoForgeComponents (jarPaths) {
     }
     add(reg.id, version, reg.flow, optional, reg.protocols, reg.site, versionSource, versionFrom)
   }
+  phaseNow = 1
   for (const c of enumComponents) {
     add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, 'enum-registry')
   }
@@ -3872,6 +4012,7 @@ function deriveNeoForgeComponents (jarPaths) {
   // population contexts (see the shape header above); leftovers abstain with
   // honest optionality wording so P5 surfaces only real negotiation risk.
   const agg = resolveAggregatedRegistrations(index, state, pendingAgg)
+  phaseNow = 2
   for (const row of agg.rows) {
     let version = row.version
     let versionSource = row.versionSource
@@ -3908,7 +4049,7 @@ function deriveNeoForgeComponents (jarPaths) {
     // HF51: a site the mod-root walk resolved (its registration object
     // iterated with the real elements) is derived, not abstained — the entry
     // pass met it with an empty registration object
-    if (state.modRootResolved && state.modRootResolved.has(sk)) { (diagnostics.modRootCovered = diagnostics.modRootCovered || []).push(sk); continue }
+    if (rootResolved(sk)) { (diagnostics.modRootCovered = diagnostics.modRootCovered || []).push(sk); continue }
     if (abstainedSiteKeys.has(`${sk}#${reg.method}`)) continue
     abstainedSiteKeys.add(`${sk}#${reg.method}`)
     const opt = reg.registrar && reg.registrar.optional && !reg.registrar.optionalUndecided
@@ -3942,30 +4083,25 @@ function deriveNeoForgeComponents (jarPaths) {
   // config responder answers so the mod's blocking configuration tasks can
   // complete. Fail-open: jars without the idiom contribute nothing here.
   const annotationRun = deriveAnnotationRegistries(index, state, entryMethods)
+  phaseNow = 3
   for (const c of annotationRun.components) {
     add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, 'annotation-registry')
   }
 
-  const components = {
-    configuration: [...byProtocol.configuration.values()],
-    play: [...byProtocol.play.values()]
-  }
-
-  // HF15 — the LISTEN-ONLY surface (see listenOnlyDerivation.js header):
-  // named-abstain ids (tier a, collected above) + wrapper-registrar factory
-  // enumerations (tier b, the CreativeCore shape) + connector-served fabric
-  // clientbound ids (tier c). Version-free by construction; declared over
-  // minecraft:register into the server's ad-hoc send-permission tier, never
-  // claimed. Fail-open: a scan failure lands in diagnostics.errors and the
-  // derivation's components are untouched.
-  let listenOnly = []
+  // HF15 - the LISTEN-ONLY surfaces of this unit (see listenOnlyDerivation.js
+  // header): named-abstain ids (tier a, collected above) + wrapper-registrar
+  // factory enumerations (tier b) + connector-served fabric clientbound ids
+  // (tier c) + the container-carried Type shape (tier d). Assembled pack-wide
+  // against the claimed ids (assembleNeoForgeComponents). Fail-open: a scan
+  // failure lands in diagnostics.errors and the unit's claims are untouched.
+  let listen = null
   try {
     const factoryIds = deriveWrapperFactoryListenChannels(index, diagnostics)
     const fabricIds = deriveFabricListenChannels(index, diagnostics)
     // HF15-R tier (d): the container-carried Type shape (a registrar site
     // reading payload Types off container records it iterates; the ids live
     // at the containers' construction sites, several parameter hops up the
-    // caller graph). The walk rides THIS module's evaluator (injected — the
+    // caller graph). The walk rides THIS module's evaluator (injected - the
     // interpreter cannot be required from the listen-only module), with the
     // shared step budget as its ceiling.
     const containerIds = deriveContainerCarriedListenChannels(index, diagnostics, {
@@ -3975,14 +4111,126 @@ function deriveNeoForgeComponents (jarPaths) {
       resolveReslocValue: (v) => resolveReslocValue(index, v, state),
       budgetBlown: () => !!state.aggBudgetBlown
     })
-    const claimedIds = new Set(['configuration', 'play'].flatMap((p) => components[p].map((c) => c.id)))
-    listenOnly = assembleListenOnly({ named: listenOnlyNamed, factory: factoryIds, fabric: fabricIds, container: containerIds, claimedIds, diagnostics })
+    listen = { factory: factoryIds, fabric: fabricIds, container: containerIds }
   } catch (err) {
     diagnostics.errors.push(`listen-only derivation failed (${err.message}) — declaration rides the handler contract alone`)
   }
 
-  debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components + ${listenOnly.length} listen-only ids from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${ackContracts.length} ack contracts, ${Date.now() - started}ms)`)
-  return { components, diagnostics, ackContracts, ackUnprovable: ackCollect.unprovable, syncContracts: annotationRun.syncContracts, listenOnly }
+  return {
+    path: unit.path,
+    label: unit.label,
+    sha1: unit.sha1,
+    trail: [...index.trail].sort(),
+    deps,
+    claims,
+    listenOnlyNamed,
+    listen,
+    ackContracts,
+    ackUnprovable: ackCollect.unprovable,
+    syncContracts: annotationRun.syncContracts,
+    diagnostics: { ...diagnostics, jars: undefined },
+    ms: Date.now() - started
+  }
 }
 
-module.exports = { deriveNeoForgeComponents, deriveAckContracts, resolveAggregatedRegistrations }
+/**
+ * Assembles the pack answer from per-unit results (derived now or served from
+ * a cache): the conflict guard over every unit's claims in phase order, the
+ * listen-only surface against the claimed ids, the contracts and diagnostics
+ * concatenated in unit order. The result shape is deriveNeoForgeComponents'.
+ */
+function assembleNeoForgeComponents (read, perJar) {
+  const diagnostics = { ...read.diagnostics, abstains: [...read.diagnostics.abstains], errors: [...read.diagnostics.errors], registrations: 0, presenceGates: [] }
+  const byProtocol = { configuration: new Map(), play: new Map() }
+  // HF16 ASSEMBLE CONFLICT GUARD: version sources that are BYTECODE-PROVEN
+  // (a compile-time constant read at/through the registration site) outrank
+  // the mods.toml fallback heuristic. A constant-proven tuple REPLACES a
+  // fallback-sourced one for the same channel; two DISAGREEING constant
+  // proofs drop the channel loudly (mirror of the aggregator conflict law —
+  // a wrong tuple claim fails the negotiation with a worse diagnostic than
+  // an honest miss).
+  const CONSTANT_VERSION_SOURCES = new Set(['constant', 'enum-registry', 'annotation-registry'])
+  const droppedConflicts = new Set()
+  const add = (id, version, flow, optional, protocols, source, versionSource, versionFrom = null) => {
+    for (const proto of protocols) {
+      if (!byProtocol[proto]) continue
+      if (droppedConflicts.has(`${proto}:${id}`)) continue
+      const prev = byProtocol[proto].get(id)
+      if (!prev) {
+        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource, versionFrom })
+        continue
+      }
+      const prevConst = CONSTANT_VERSION_SOURCES.has(prev.versionSource)
+      const newConst = CONSTANT_VERSION_SOURCES.has(versionSource)
+      if (newConst && !prevConst) {
+        byProtocol[proto].set(id, { id, version, flow, optional, source, versionSource, versionFrom })
+        continue
+      }
+      if (newConst && prevConst && (prev.version !== version || prev.flow !== flow || prev.optional !== optional)) {
+        byProtocol[proto].delete(id)
+        droppedConflicts.add(`${proto}:${id}`)
+        diagnostics.abstains.push(`${id}: constant-proven registrations disagree on version/flow/optionality — unclaimed (a wrong tuple would fail the negotiation)`)
+      }
+      // otherwise the standing claim holds (identical or equally-provenanced)
+    }
+  }
+  for (const phase of [0, 1, 2, 3]) {
+    for (const u of perJar) for (const c of u.claims || []) if (c.phase === phase) add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, c.versionSource, c.versionFrom)
+  }
+  const ackContracts = []
+  const ackUnprovable = []
+  const syncContracts = { contracts: [], consumeOnly: [], unfinishableTasks: [], registries: [] }
+  const listen = { named: [], factory: [], fabric: [], container: [] }
+  for (const u of perJar) {
+    // every diagnostics field a pass writes (abstains, errors, presenceGates,
+    // listenOnlyNotes, modRootCovered, registrations ...) merges by shape:
+    // arrays concatenate in unit order, numbers add, booleans OR
+    for (const [k, v] of Object.entries(u.diagnostics || {})) {
+      if (k === 'jars' || v == null) continue
+      if (Array.isArray(v)) diagnostics[k] = (diagnostics[k] || []).concat(v)
+      else if (typeof v === 'number') diagnostics[k] = (diagnostics[k] || 0) + v
+      else if (typeof v === 'boolean') diagnostics[k] = !!(diagnostics[k] || v)
+      else if (diagnostics[k] === undefined) diagnostics[k] = v
+    }
+    ackContracts.push(...(u.ackContracts || []))
+    ackUnprovable.push(...(u.ackUnprovable || []))
+    if (u.syncContracts) {
+      syncContracts.contracts.push(...(u.syncContracts.contracts || []))
+      syncContracts.consumeOnly.push(...(u.syncContracts.consumeOnly || []))
+      syncContracts.unfinishableTasks.push(...(u.syncContracts.unfinishableTasks || []))
+      syncContracts.registries.push(...(u.syncContracts.registries || []))
+    }
+    listen.named.push(...(u.listenOnlyNamed || []))
+    if (u.listen) { listen.factory.push(...(u.listen.factory || [])); listen.fabric.push(...(u.listen.fabric || [])); listen.container.push(...(u.listen.container || [])) }
+  }
+  syncContracts.unfinishableTasks = [...new Set(syncContracts.unfinishableTasks)]
+  const components = {
+    configuration: [...byProtocol.configuration.values()],
+    play: [...byProtocol.play.values()]
+  }
+  const claimedIds = new Set(['configuration', 'play'].flatMap((p) => components[p].map((c) => c.id)))
+  const listenOnly = assembleListenOnly({ ...listen, claimedIds, diagnostics })
+  return { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly }
+}
+
+/**
+ * HF73b: the per-jar entry - the read, every unit's result (the pack
+ * pseudo-unit first) and the assembled answer; `perJar` carries each unit's
+ * path, sha1, trail, deps and claims for a caller that caches per jar.
+ */
+function deriveNeoForgeComponentsPerJar (jarPaths) {
+  const started = Date.now()
+  const read = readNeoForgeJarUnits(jarPaths)
+  const perJar = [derivePackUnit(read), ...read.units.map((u) => deriveNeoForgeJarUnit(read, u))]
+  const out = assembleNeoForgeComponents(read, perJar)
+  const { components, diagnostics, ackContracts, listenOnly } = out
+  debug(`neoforge derivation: ${components.configuration.length} configuration + ${components.play.length} play components + ${listenOnly.length} listen-only ids from ${diagnostics.jars.length} jars (${diagnostics.abstains.length} abstains, ${ackContracts.length} ack contracts, ${Date.now() - started}ms)`)
+  return { ...out, perJar, read }
+}
+
+function deriveNeoForgeComponents (jarPaths) {
+  const { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly } = deriveNeoForgeComponentsPerJar(jarPaths)
+  return { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly }
+}
+
+module.exports = { deriveNeoForgeComponents, deriveNeoForgeComponentsPerJar, deriveAckContracts, resolveAggregatedRegistrations, readNeoForgeJarUnits, deriveNeoForgeJarUnit, derivePackUnit, assembleNeoForgeComponents, unitDependenciesHold, censusOfRead, PACK_UNIT_LABEL }

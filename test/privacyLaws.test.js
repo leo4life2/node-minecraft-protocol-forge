@@ -324,7 +324,7 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
       // HF15 (fixed forward at landing): listenOnlyDerivation is a pure local
       // bytecode-walk parser (requires only ../../debug + ./jarAnalysis) —
       // audited by these laws itself via MODULES above
-      const allowed = new Set(['fs', 'path', 'zlib', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation',
+      const allowed = new Set(['fs', 'path', 'zlib', 'crypto', 'debug', '../../debug', './jarAnalysis', './loginAckDerivation', // HF73b: crypto = the jar's content sha1 (a local hash of bytes already read; no network, no write)
         // HF53: the one nested-jar rule (zip entry reads only)
         './nestedJars',
         './loginReplyBoundary', './annotationRegistryDerivation', './listenOnlyDerivation', './data/blockShapeTables.json',

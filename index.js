@@ -45,6 +45,8 @@ module.exports = {
   neoForgeLoaderLocator: require('./src/client/neoForgeLoaderLocator'),
   deriveNeoForgeComponents: require('./src/client/neoForgePayloadDerivation').deriveNeoForgeComponents,
   deriveAckContracts: require('./src/client/neoForgePayloadDerivation').deriveAckContracts,
+  // HF73b: the per-jar derivation (read units / derive a unit / assemble; the trail + deps check) for a caller that caches per jar
+  neoForgePayloadDerivation: require('./src/client/neoForgePayloadDerivation'),
   annotationRegistryDerivation: require('./src/client/annotationRegistryDerivation'),
   listenOnlyDerivation: require('./src/client/listenOnlyDerivation'),
   loaderSpawnDerivation: require('./src/client/loaderSpawnDerivation'),
