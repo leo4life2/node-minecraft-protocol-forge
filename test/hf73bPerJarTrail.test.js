@@ -16,7 +16,8 @@ const path = require('path')
 const { mutateJar } = require('./helpers/jarMutate')
 const D = require('../src/client/neoForgePayloadDerivation')
 
-const { libJar, modJar, soloJar, MOD } = require('./helpers/hf73bJars')
+const { libJar, modJar, soloJar, MOD, LIB } = require('./helpers/hf73bJars')
+const { containerLibJar, populatorJar } = require('./helpers/hf73bAbsenceJars')
 
 const claims = (r) => r.components.play.map((c) => [c.id, c.version, c.flow, c.optional]).sort()
 const unitOf = (r, base) => r.perJar.find((u) => u.path && path.basename(u.path) === base)
@@ -100,5 +101,63 @@ describe('HF73b — the per-jar derivation records, per jar, the jars its cross-
     assert.strictEqual(r.perJar[0].claims.filter((c) => c.id.startsWith('waystones:')).length, 19, 'the library listener iterated the mod\'s registration object under the pack pass')
     assert.strictEqual(unitOf(r, 'hf51-waystones-26.3.0.1.trimmed.jar').claims.length, 0)
     assert.deepStrictEqual(assembled(r), D.deriveNeoForgeComponents(jars))
+  })
+
+  // HF73b r2 THE ABSENCE LAW (verify r1 HIGH): a result depends on what was
+  // NOT in the pack - a pack-wide scan holds only while the pack's class
+  // census is the one it scanned; a lookup that missed holds only while the
+  // class is still absent.
+  it('T7 a library that registers what a MOD populates into its container is slotted alone (its population scan is pack-wide: deps.packCensus); the mod ADDED -> the slot does not hold (the census why), the re-derived pack equals the cold one; the stale unit assembled would have missed the id (the hole, closed)', () => {
+    const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hf73b-absence-')); const box = containerLibJar(d2); const cc = populatorJar(d2)
+    const cold1 = D.deriveNeoForgeComponents([box]); const cold2 = D.deriveNeoForgeComponents([box, cc])
+    assert.deepStrictEqual(cold1.listenOnly, [], 'alone: nothing populates the container (true)')
+    assert.deepStrictEqual(cold2.listenOnly, ['synthcc:real_ping'], 'with the mod: its id')
+    const read1 = D.readNeoForgeJarUnits([box]); const boxUnit = D.deriveNeoForgeJarUnit(read1, read1.units[0])
+    assert.deepStrictEqual(boxUnit.trail, [], 'no other unit to consult')
+    assert.strictEqual(boxUnit.deps.packCensus, D.packCensusOf(read1), 'the population scan is pack-wide: the census it scanned')
+    assert.match(boxUnit.deps.packCensus, /^[0-9a-f]{40}$/)
+    assert.deepStrictEqual(D.unitDependenciesHold(read1, { trailSha1s: [], deps: boxUnit.deps }), { ok: true, why: null }, 'holds on the pack it scanned')
+    const read2 = D.readNeoForgeJarUnits([box, cc])
+    const hold = D.unitDependenciesHold(read2, { trailSha1s: [], deps: boxUnit.deps })
+    assert.strictEqual(hold.ok, false)
+    assert.strictEqual(hold.why, 'the pack\'s class census changed (a jar added, removed or re-shaped) - this unit\'s resolution scanned the whole pack')
+    const ccUnit = D.deriveNeoForgeJarUnit(read2, read2.units[1])
+    const stale = D.assembleNeoForgeComponents(read2, [D.derivePackUnit(read2), boxUnit, ccUnit])
+    assert.deepStrictEqual(stale.listenOnly, [], 'the hole as it was: the stale unit served misses the id')
+    const fresh = D.assembleNeoForgeComponents(read2, [D.derivePackUnit(read2), D.deriveNeoForgeJarUnit(read2, read2.units[0]), ccUnit])
+    assert.deepStrictEqual(fresh.listenOnly, cold2.listenOnly, 're-derived: the cold answer')
+    assert.deepStrictEqual(assembled(D.deriveNeoForgeComponentsPerJar([box, cc])), cold2, 'the per-jar entry equals the legacy one')
+  })
+
+  it('T8 CONTROL: a self-contained unit (no pack-wide scan, no missed class that appears) holds after unrelated jars are added; every missed name it records is absent from the pack', () => {
+    const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hf73b-absence-')); const box = containerLibJar(d2); const cc = populatorJar(d2)
+    const read1 = D.readNeoForgeJarUnits([solo]); const soloUnit = D.deriveNeoForgeJarUnit(read1, read1.units[0])
+    assert.strictEqual(soloUnit.deps.packCensus, null, 'the control scanned nothing pack-wide')
+    for (const name of soloUnit.deps.missed) assert.strictEqual(read1.index.raw.has(name), false, `missed ${name} is absent`)
+    const read2 = D.readNeoForgeJarUnits([solo, box, cc, lib, mod])
+    assert.deepStrictEqual(D.unitDependenciesHold(read2, { trailSha1s: [], deps: soloUnit.deps }), { ok: true, why: null }, 'unrelated jars added: the control holds')
+    assert.deepStrictEqual(D.assembleNeoForgeComponents(read2, [D.derivePackUnit(read2), soloUnit, ...read2.units.slice(1).map((u) => D.deriveNeoForgeJarUnit(read2, u))]).components, D.deriveNeoForgeComponents([solo, box, cc, lib, mod]).components, 'served, the answer is the cold one')
+  })
+
+  it('T9 a lookup that MISSED is recorded: the mod derived without its library names the helper class in deps.missed (0 claims, true for that pack); the library added -> the slot does not hold ("class ... now present"), never a stale 0-claim unit', () => {
+    const read1 = D.readNeoForgeJarUnits([mod]); const modUnit = D.deriveNeoForgeJarUnit(read1, read1.units[0])
+    assert.strictEqual(modUnit.claims.length, 0, 'the helper is absent: nothing derivable')
+    assert.ok(modUnit.deps.missed.includes(LIB), `deps.missed names ${LIB}: ${JSON.stringify(modUnit.deps.missed)}`)
+    assert.deepStrictEqual(modUnit.deps.missed, [...modUnit.deps.missed].sort(), 'sorted (a stable slot)')
+    assert.deepStrictEqual(D.unitDependenciesHold(read1, { trailSha1s: [], deps: modUnit.deps }), { ok: true, why: null })
+    const read2 = D.readNeoForgeJarUnits([lib, mod])
+    const hold = D.unitDependenciesHold(read2, { trailSha1s: [], deps: modUnit.deps })
+    assert.strictEqual(hold.ok, false); assert.strictEqual(hold.why, `class ${LIB} now present (a lookup that missed when derived)`)
+    assert.strictEqual(D.deriveNeoForgeJarUnit(read2, read2.units[1]).claims.length, 1, 're-derived: the claim')
+  })
+
+  it('T10 packCensusOf is the sorted class-name census of the read: order-free, name-free (a renamed byte-identical jar), cached on the read, changed by a class added or removed', () => {
+    const a = D.readNeoForgeJarUnits([lib, mod, solo]); const b = D.readNeoForgeJarUnits([solo, lib, mod])
+    assert.strictEqual(D.packCensusOf(a), D.packCensusOf(b), 'order-free')
+    assert.strictEqual(D.packCensusOf(a), a.packCensusSha1, 'cached on the read')
+    const renamed = path.join(dir, 'renamed-solo.jar'); fs.copyFileSync(solo, renamed)
+    assert.strictEqual(D.packCensusOf(D.readNeoForgeJarUnits([lib, mod, renamed])), D.packCensusOf(a), 'identity by class names, never by file name')
+    assert.notStrictEqual(D.packCensusOf(D.readNeoForgeJarUnits([lib, mod])), D.packCensusOf(a), 'a jar removed')
+    assert.notStrictEqual(D.packCensusOf(D.readNeoForgeJarUnits([lib, mod, solo, containerLibJar(fs.mkdtempSync(path.join(os.tmpdir(), 'hf73b-absence-')))])), D.packCensusOf(a), 'a jar added')
   })
 })

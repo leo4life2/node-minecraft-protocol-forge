@@ -223,23 +223,37 @@ function makeClassIndex () {
     // lands in ANOTHER unit (get / rawBytes / has / jarOf - a parse, a byte
     // scan, an existence test) adds that unit's path to `trail`. A unit's
     // per-jar result is valid only while the unit AND every unit on its
-    // trail are unchanged; a lookup that misses (no such class) consults
-    // nothing. Seed scans (the producers: entry methods, mod roots, enum
-    // registries, ack handlers, listen-only factories) iterate seedNames()
-    // = the focus unit's own classes; resolution scans (subclasses, callers,
-    // population sites) stay pack-wide through allNames() / allClassNames
-    // and record every unit they examine.
+    // trail are unchanged. HF73b r2 THE ABSENCE LAW: a result also depends
+    // on what was NOT there - a lookup that misses (no such class in the
+    // pack) is recorded in `missed` and the result holds only while that
+    // name is still absent; a pack-wide scan (allNames() / the state's
+    // allClassNames) is flagged in `packScanned` and the result then holds
+    // only while the pack's class-name census is unchanged (a jar added or
+    // removed re-derives every unit that scanned the pack; the content of
+    // the classes a scan examined is already on the trail, and the index is
+    // first-wins, so the name census + the trail is the exact dependency).
+    // Seed scans (the producers: entry methods, mod roots, enum registries,
+    // ack handlers, listen-only factories) iterate seedNames() = the focus
+    // unit's own classes; resolution scans (subclasses, callers, population
+    // sites) stay pack-wide through allNames() / allClassNames and record
+    // every unit they examine.
     focus: null,
     trail: null,
+    missed: null,
+    packScanned: false,
     noteUnit (u) { const unit = { ...u, modIds: [], modVersion: null, classNames: [], jars: [] }; units.push(unit); return unit },
-    consult (r) { const f = index.focus; if (f && r && r.unit && r.unit !== f) index.trail.add(r.unit.path) },
-    has (name) { const r = raw.get(name); index.consult(r); return !!r },
-    jarOf (name) { const r = raw.get(name); index.consult(r); return r ? r.jar : null },
+    consult (r, name) {
+      const f = index.focus
+      if (!f) return
+      if (r) { if (r.unit && r.unit !== f) index.trail.add(r.unit.path) } else if (name) index.missed.add(name)
+    },
+    has (name) { const r = raw.get(name); index.consult(r, name); return !!r },
+    jarOf (name) { const r = raw.get(name); index.consult(r, name); return r ? r.jar : null },
     seedNames () { return index.focus ? index.focus.classNames : [...raw.keys()] },
-    allNames () { return [...raw.keys()] },
+    allNames () { if (index.focus) index.packScanned = true; return [...raw.keys()] },
     get (name) {
       if (!name) return null
-      index.consult(raw.get(name))
+      index.consult(raw.get(name), name)
       if (parsed.has(name)) return parsed.get(name)
       const r = raw.get(name)
       let info = null
@@ -254,7 +268,7 @@ function makeClassIndex () {
     },
     rawBytes (name) {
       const r = raw.get(name)
-      index.consult(r)
+      index.consult(r, name)
       if (!r) return null
       try { return zipEntryData(r.buf, r.entry) } catch { return null }
     }
@@ -3671,7 +3685,7 @@ function freshDerivationState (read, diagnostics, deps = null) {
   const versionByModId = deps
     ? new Proxy(read.versionByModId, { get (t, k) { if (typeof k === 'string') deps.versions[k] = t[k] ?? null; return t[k] } })
     : read.versionByModId
-  return {
+  const state = {
     versionByModId,
     fieldValues: Object.create(null),
     typeFieldsResolved: new Set(),
@@ -3681,6 +3695,16 @@ function freshDerivationState (read, diagnostics, deps = null) {
     allClassNames: read.allClassNames,
     diagnostics
   }
+  // HF73b r2: while a unit's deps are recorded, every read of the pack-wide
+  // class list is a pack-wide scan (the absence law above).
+  if (deps) Object.defineProperty(state, 'allClassNames', { enumerable: true, get () { read.index.packScanned = true; return read.allClassNames } })
+  return state
+}
+
+/** THE pack census a pack-wide scan depends on: the sha1 of the sorted class-name list of the read (every top-level and nested class, first-wins). */
+function packCensusOf (read) {
+  if (!read.packCensusSha1) read.packCensusSha1 = crypto.createHash('sha1').update([...read.allClassNames].sort().join('\n')).digest('hex')
+  return read.packCensusSha1
 }
 
 /**
@@ -3748,7 +3772,9 @@ function censusOfRead (read) {
  * HF73b: do a unit's recorded dependencies still hold against a fresh read?
  * `trailSha1s` = the content sha1 of every trail unit when the result was
  * derived; the read must hold a unit with each (identity by content, never by
- * file name); every mod id the unit tested for presence must test the same,
+ * file name); every class lookup that missed must still miss and a pack-wide
+ * scanner's class census must be unchanged (HF73b r2, the absence law);
+ * every mod id the unit tested for presence must test the same,
  * every namespace version it looked up must read the same, and every entry's
  * presence-gate verdict must read the same. Returns { ok, why }.
  */
@@ -3756,6 +3782,11 @@ function unitDependenciesHold (read, { trailSha1s = [], deps = null } = {}) {
   const have = new Set(read.units.map((u) => u.sha1).filter(Boolean))
   for (const h of trailSha1s) if (!have.has(h)) return { ok: false, why: `trail jar ${String(h).slice(0, 12)} changed or gone` }
   if (deps) {
+    // HF73b r2 the absence law: a class the derivation looked up and missed
+    // must still be absent; a unit that scanned the whole pack holds only
+    // while the pack's class-name census is the one it scanned.
+    for (const name of deps.missed || []) if (read.index.raw.has(name)) return { ok: false, why: `class ${name} now present (a lookup that missed when derived)` }
+    if (deps.packCensus && deps.packCensus !== packCensusOf(read)) return { ok: false, why: 'the pack\'s class census changed (a jar added, removed or re-shaped) - this unit\'s resolution scanned the whole pack' }
     const census = censusOfRead(read)
     for (const [id, present] of Object.entries(deps.present || {})) {
       const now = ALWAYS_PRESENT_MOD_IDS.has(id) || (id in census)
@@ -3786,7 +3817,7 @@ function deriveNeoForgeJarUnit (read, unit, { seedRegistrations = [], modRootPas
   const started = Date.now()
   const { index } = read
   const diagnostics = { jars: read.diagnostics.jars, abstains: [], errors: [], registrations: 0, presenceGates: [] }
-  const deps = { present: Object.create(null), versions: Object.create(null), gates: Object.create(null), rootResolved: Object.create(null) }
+  const deps = { present: Object.create(null), versions: Object.create(null), gates: Object.create(null), rootResolved: Object.create(null), missed: [], packCensus: null }
   const state = freshDerivationState(read, diagnostics, deps)
   const versionByModId = state.versionByModId
   // HF37: a runtime-versioned registrar falls back to the mods.toml version of
@@ -3794,11 +3825,15 @@ function deriveNeoForgeJarUnit (read, unit, { seedRegistrations = [], modRootPas
   const metaVersionFor = (namespace, jar) => (namespace && versionByModId[namespace]) || (jar && jar.modVersion) || null
   index.focus = unit
   index.trail = new Set()
+  index.missed = new Set()
+  index.packScanned = false
   try {
     return deriveUnitBody(read, unit, state, diagnostics, deps, metaVersionFor, started, seedRegistrations, modRootPass)
   } finally {
     index.focus = null
     index.trail = null
+    index.missed = null
+    index.packScanned = false
   }
 }
 
@@ -4116,6 +4151,9 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     diagnostics.errors.push(`listen-only derivation failed (${err.message}) — declaration rides the handler contract alone`)
   }
 
+  // HF73b r2 the absence facts (the index's law above)
+  deps.missed = [...index.missed].sort()
+  deps.packCensus = index.packScanned ? packCensusOf(read) : null
   return {
     path: unit.path,
     label: unit.label,
@@ -4233,4 +4271,4 @@ function deriveNeoForgeComponents (jarPaths) {
   return { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly }
 }
 
-module.exports = { deriveNeoForgeComponents, deriveNeoForgeComponentsPerJar, deriveAckContracts, resolveAggregatedRegistrations, readNeoForgeJarUnits, deriveNeoForgeJarUnit, derivePackUnit, assembleNeoForgeComponents, unitDependenciesHold, censusOfRead, PACK_UNIT_LABEL }
+module.exports = { deriveNeoForgeComponents, deriveNeoForgeComponentsPerJar, deriveAckContracts, resolveAggregatedRegistrations, readNeoForgeJarUnits, deriveNeoForgeJarUnit, derivePackUnit, assembleNeoForgeComponents, unitDependenciesHold, censusOfRead, packCensusOf, PACK_UNIT_LABEL }
