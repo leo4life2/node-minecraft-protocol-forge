@@ -43,7 +43,15 @@ function varintRead (b, o) { let v = 0; let s = 0; let i = o; for (;;) { if (i >
 function varintSize (v) { let n = 0; v = v >>> 0; do { v >>>= 7; n++ } while (v); return n }
 function varintWrite (v, b, o) { v = v >>> 0; do { let x = v & 0x7f; v >>>= 7; if (v) x |= 0x80; b[o++] = x } while (v); return o }
 
-function tailTypeName (type) { return `pbw_tail_${type}` }
+// HF77: the vanilla resource-key string — writeResourceKey(key) = writeResourceLocation(key.location()) =
+// writeUtf(location.toString()): a varint byte length + the utf8 bytes (the value is the key string the client stands in).
+function utf8Read (b, o) { const len = varintRead(b, o); if (!len || o + len.size + len.value > b.length) return null; return { value: b.toString('utf8', o + len.size, o + len.size + len.value), size: len.size + len.value } }
+function utf8Write (v, b, o) { const bytes = Buffer.from(String(v), 'utf8'); o = varintWrite(bytes.length, b, o); bytes.copy(b, o); return o + bytes.length }
+function utf8Size (v) { const n = Buffer.byteLength(String(v), 'utf8'); return varintSize(n) + n }
+// a head-anchored field rides as the protocol's own type of the same encoding (minecraft's `string` = varint-counted utf8)
+const HEAD_TYPES = { 'resource-key': 'string' }
+
+function tailTypeName (type) { return `pbw_tail_${String(type).replace(/-/g, '_')}` } // a protodef type name is a JS identifier (resource-key -> resource_key)
 
 function tailTypes (types) {
   const out = { Read: {}, Write: {}, SizeOf: {} }
@@ -58,6 +66,10 @@ function tailTypes (types) {
       out.Read[name] = ['native', (buffer, offset) => (offset < buffer.length ? (varintRead(buffer, offset) || { value: null, size: 0 }) : { value: null, size: 0 })]
       out.Write[name] = ['native', (value, buffer, offset) => (value == null ? offset : varintWrite(value, buffer, offset))]
       out.SizeOf[name] = ['native', (value) => (value == null ? 0 : varintSize(value))]
+    } else if (type === 'resource-key') {
+      out.Read[name] = ['native', (buffer, offset) => (offset < buffer.length ? (utf8Read(buffer, offset) || { value: null, size: 0 }) : { value: null, size: 0 })]
+      out.Write[name] = ['native', (value, buffer, offset) => (value == null ? offset : utf8Write(value, buffer, offset))]
+      out.SizeOf[name] = ['native', (value) => (value == null ? 0 : utf8Size(value))]
     } else {
       throw new Error(`packet-body wire: no optional-tail codec for ${type}`)
     }
@@ -81,7 +93,7 @@ function compileFor (version, exts, { slotExt = null } = {}) {
     const typeName = `packet_${ext.packet}`
     const t = protocol.play && protocol.play[ext.direction] && protocol.play[ext.direction].types[typeName]
     if (!Array.isArray(t) || t[0] !== 'container' || !Array.isArray(t[1])) throw new Error(`packet-shape-unsupported: ${version} has no container type ${typeName} in play ${ext.direction}`)
-    const add = ext.fields.map((f) => ({ name: f.name, type: ext.anchor === 'head' ? f.type : tailTypeName(f.type) }))
+    const add = ext.fields.map((f) => ({ name: f.name, type: ext.anchor === 'head' ? (HEAD_TYPES[f.type] || f.type) : tailTypeName(f.type) }))
     if (ext.anchor === 'head') t[1].unshift(...add); else t[1].push(...add)
     ;(ext.direction === 'toServer' ? outgoing : incoming).set(ext.packet, ext)
   }
@@ -109,19 +121,78 @@ function compileFor (version, exts, { slotExt = null } = {}) {
 // keyed by). A source this table lacks installs nothing (the deriver already
 // abstained by name); the installer never assumes the world name.
 const KEY_SOURCES = {
-  'world-key': (state, receipt) => (data, meta) => {
-    if ((meta.name === 'login' || meta.name === 'respawn') && data && typeof data.worldName === 'string') { state.dimension = data.worldName; receipt.provider.dimension = data.worldName }
+  'world-key': (state, receipt, observer) => observer.onKey((key) => { state.dimension = key; receipt.provider.dimension = key })
+}
+
+// HF77: WHERE the world key rides in the clientbound login / respawn packet is
+// read from the version's own protocol definition (minecraft-data), never
+// assumed: the top-level `worldName` string (<= 1.20.4), or the string `name`
+// beside `dimension` inside a container-typed field (SpawnInfo, 1.20.5+). The
+// path is per version and per packet; a version without either shape yields
+// null and the observer learns nothing (the value is never guessed).
+const worldKeyPaths = new Map()
+function worldKeyFieldOf (version, packet) {
+  const key = `${version}|${packet}`
+  if (worldKeyPaths.has(key)) return worldKeyPaths.get(key)
+  let found = null
+  try {
+    const protocol = require('minecraft-data')(version).protocol
+    const types = protocol.play.toClient.types
+    const t = types[`packet_${packet}`]
+    const fields = Array.isArray(t) && t[0] === 'container' ? t[1] : []
+    found = worldKeyPathIn(fields, (name) => types[name] || (protocol.types || {})[name])
+  } catch { found = null }
+  worldKeyPaths.set(key, found)
+  return found
+}
+function worldKeyPathIn (fields, typeOf) {
+  const direct = fields.find((f) => f.type === 'string' && f.name === 'worldName')
+  if (direct) return [direct.name]
+  for (const f of fields) {
+    const inner = typeof f.type === 'string' ? typeOf(f.type) : f.type
+    if (!Array.isArray(inner) || inner[0] !== 'container' || !Array.isArray(inner[1])) continue
+    const name = inner[1].find((g) => g.type === 'string' && g.name === 'name')
+    if (name && inner[1].some((g) => g.name === 'dimension')) return [f.name, name.name]
   }
+  return null
+}
+// the same two shapes read off the PARSED packet when the version's protocol is not at hand (a client without a version)
+function worldKeyIn (data) {
+  if (!data || typeof data !== 'object') return null
+  if (typeof data.worldName === 'string') return { key: data.worldName, path: ['worldName'] }
+  for (const [k, v] of Object.entries(data)) if (v && typeof v === 'object' && typeof v.name === 'string' && 'dimension' in v) return { key: v.name, path: [k, 'name'] }
+  return null
+}
+
+// THE ONE observer of the world key this client stands in: the login / respawn
+// packet's key string at the protocol-derived path. Both the int-record
+// provider (its map is keyed by this string) and a resource-key field (its
+// value IS this string) read it here; the receipt names the field and the key.
+function createWorldKeyObserver (client, receipt) {
+  const state = { key: null, field: null, seen: 0 }
+  const subs = []
+  receipt.worldKey = { field: null, key: null, seen: 0 }
+  client.on('packet', (data, meta) => {
+    if (!meta || (meta.name !== 'login' && meta.name !== 'respawn') || (meta.state && meta.state !== 'play') || !data) return
+    const path = client.version ? worldKeyFieldOf(client.version, meta.name) : null
+    let key = null; let at = null
+    if (path) { let v = data; for (const p of path) v = v == null ? undefined : v[p]; if (typeof v === 'string') { key = v; at = path } } else { const w = worldKeyIn(data); if (w) { key = w.key; at = w.path } }
+    if (key == null) return
+    state.key = key; state.field = `${meta.name}.${at.join('.')}`; state.seen += 1
+    Object.assign(receipt.worldKey, { field: state.field, key, seen: state.seen })
+    for (const fn of subs) fn(key, state.field)
+  })
+  return { key: () => state.key, state, onKey: (fn) => { subs.push(fn); return true } }
 }
 
 // The derived provider: parses the record the server syncs (an NBT compound
 // with a `compoundKey` map of key -> value on one of the derived channels,
 // with the channel's framing) and answers the value for THIS client's key,
 // selected by the derived keySource.
-function createProvider (client, spec, receipt) {
+function createProvider (client, spec, receipt, observer = null) {
   const state = { ids: null, dimension: null, channel: null, framing: null, index: null, rejected: 0, synced: 0 }
-  const observeKey = KEY_SOURCES[spec.keySource] ? KEY_SOURCES[spec.keySource](state, receipt) : null
   receipt.provider = { kind: spec.kind, compoundKey: spec.compoundKey, valueType: spec.valueType, keySource: KEY_SOURCES[spec.keySource] ? spec.keySource : null, channels: spec.channels.map((c) => c.id), synced: 0, rejected: 0, channel: null, dimension: null, ids: null }
+  const observeKey = KEY_SOURCES[spec.keySource] ? KEY_SOURCES[spec.keySource](state, receipt, observer || createWorldKeyObserver(client, receipt)) : null
   const byId = new Map(spec.channels.map((c) => [c.id, c]))
   const parse = (chan, data) => {
     if (!Buffer.isBuffer(data)) return
@@ -142,7 +213,6 @@ function createProvider (client, spec, receipt) {
   client.on('packet', (data, meta) => {
     if (!meta || (meta.state !== 'play' && meta.state !== 'configuration')) return
     if (meta.name === 'custom_payload' && data && byId.has(data.channel)) parse(byId.get(data.channel), data.data)
-    else if (observeKey) observeKey(data, meta)
   })
   return {
     value: () => (observeKey && state.ids && state.dimension != null && Number.isFinite(state.ids[state.dimension]) ? state.ids[state.dimension] : null),
@@ -194,7 +264,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
     version: client.version,
     swaps: 0,
     armed: false,
-    exts: spec.exts.map((e) => ({ direction: e.direction, packet: e.packet, packetClass: e.packetClass, anchor: e.anchor, optional: e.optional, fields: e.fields.map((f) => f.type), guard: e.guard ? `${e.guard.className}.${e.guard.method} armed by ${e.guard.armedBy.direction}/${e.guard.armedBy.packet}` : null })),
+    exts: spec.exts.map((e) => ({ direction: e.direction, packet: e.packet, packetClass: e.packetClass, anchor: e.anchor, optional: e.optional, fields: e.fields.map((f) => f.type), sources: e.fields.map((f) => f.source || 'provider'), keyEvidence: e.keyEvidence || null, guard: e.guard ? `${e.guard.className}.${e.guard.method} armed by ${armedByLabel(e.guard.armedBy)}` : null })),
     mixin: spec.exts[0].mixin,
     mod: spec.mod || null,
     jar: spec.jar || null,
@@ -204,8 +274,13 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
     lastIncoming: null
   }
   client.minepalPacketBodyWire = receipt
-  if (!spec.provider) { receipt.reason = 'no-value-provider'; return receipt }
-  if (!KEY_SOURCES[spec.provider.keySource]) { receipt.reason = `unknown-value-key-source: ${spec.provider.keySource ?? 'none'} (${spec.provider.record || '?'}.${spec.provider.getter || '?'}${spec.provider.getterDesc || ''})`; return receipt }
+  // HF77: a field's VALUE SOURCE is data on the extension — 'provider' (the int record the server syncs) or 'world-key'
+  // (the key string the client stands in); the record provider is required only where a field is sourced from it
+  const needsProvider = spec.exts.some((e) => e.fields.some((f) => (f.source || 'provider') === 'provider'))
+  const usesWorldKey = spec.exts.some((e) => e.fields.some((f) => f.source === 'world-key'))
+  receipt.heldMoves = 0
+  if (needsProvider && !spec.provider) { receipt.reason = 'no-value-provider'; return receipt }
+  if (needsProvider && !KEY_SOURCES[spec.provider.keySource]) { receipt.reason = `unknown-value-key-source: ${spec.provider.keySource ?? 'none'} (${spec.provider.record || '?'}.${spec.provider.getter || '?'}${spec.provider.getterDesc || ''})`; return receipt }
   // the slot extension (HF35) is read at EVERY swap, not baked at install: on
   // 1.20.2+ this install runs in configuration, before the item-stack install
   // at play, so the play swap recompiles from the CURRENT slot extension and
@@ -218,10 +293,29 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
     log(`[packet-wire] extension from ${spec.exts[0].mixin?.className} (${spec.jar}) NOT installed: ${receipt.reason}`)
     return receipt
   }
-  const provider = createProvider(client, spec.provider, receipt)
+  const observer = createWorldKeyObserver(client, receipt)
+  const provider = needsProvider ? createProvider(client, spec.provider, receipt, observer) : null
   const guarded = spec.exts.filter((e) => e.direction === 'toServer' && e.guard && e.guard.armedBy)
   receipt.armed = guarded.length === 0
-  const unwrap = spec.redirect ? redirectUnwrapper(spec.redirect, protos, provider, receipt) : null
+  const unwrap = spec.redirect && provider ? redirectUnwrapper(spec.redirect, protos, provider, receipt) : null
+  // HF77: a guard the jar arms by a custom payload (the mod's own config handshake) is armed here by the same payload's
+  // arrival, or by the server's register frame naming the handshake's channel (the server declares it runs the mod)
+  const armingChannels = guarded.map((e) => e.guard.armedBy).filter((a) => a && a.channel)
+  if (armingChannels.length) {
+    client.on('packet', (data, meta) => {
+      if (receipt.armed || !meta || meta.name !== 'custom_payload' || !data || typeof data.channel !== 'string') return
+      let by = armingChannels.some((a) => a.channel === data.channel) ? `payload ${data.channel}` : null
+      if (!by && data.channel === 'minecraft:register' && Buffer.isBuffer(data.data)) {
+        const names = data.data.toString('utf8').split('\0').filter(Boolean)
+        const a = armingChannels.find((x) => names.includes(x.reply) || names.includes(x.channel))
+        if (a) by = `register ${names.includes(a.reply) ? a.reply : a.channel}`
+      }
+      if (!by) return
+      receipt.armed = true; receipt.armedBy = by
+      log(`[packet-wire] armed: the server's ${by} (${meta.state}) says it runs the mod; ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${valueWords()}`)
+    })
+  }
+  const valueWords = () => (usesWorldKey ? `world key the client stands in${observer.state.field ? ` (${observer.state.field})` : ''}${observer.key() != null ? ` = ${observer.key()}` : ''}` : `${spec.provider.compoundKey} value`)
   const wrapDeserializer = (des) => {
     if (!unwrap || des._pbwRedirect) return
     des._pbwRedirect = true
@@ -258,26 +352,35 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
     receipt.installed = true
     const names = (m) => [...m.keys()].join(',')
     log(`[packet-wire] play protocol extended: toServer {${names(protos.outgoing)}} toClient {${names(protos.incoming)}} += ${spec.exts[0].fields.map((f) => f.type).join(',')} at ${spec.exts[0].anchor} ` +
-      `(derived from ${spec.mod?.name || spec.jar}: ${spec.exts[0].mixin?.className} in ${spec.jar}${spec.exts[0].mixin?.nested ? ` nested ${spec.exts[0].mixin.nested}` : ''}; value = ${spec.provider.compoundKey}[dimension] synced on ${spec.provider.channels.map((c) => c.id).join(' | ')}` +
+      `(derived from ${spec.mod?.name || spec.jar}: ${spec.exts[0].mixin?.className} in ${spec.jar}${spec.exts[0].mixin?.nested ? ` nested ${spec.exts[0].mixin.nested}` : ''}; value = ${provider ? `${spec.provider.compoundKey}[dimension] synced on ${spec.provider.channels.map((c) => c.id).join(' | ')}` : `the ${valueWords()} as the vanilla resource-key string`}` +
       (spec.redirect ? `; world packets wrapped in custom_payload ${spec.redirect.channel} [${spec.redirect.header.map((h) => h.source).join(',')}] are unwrapped for this dimension` : '') + ')')
   }
   client.on('state', swap)
   swap()
-  let warnedUnfilled = false
+  let warnedUnfilled = false; let warnedHeld = false
   const write = client.write.bind(client)
   client.write = (name, params) => {
     if (client.state === 'play' && client.serializer && client.serializer.proto !== protos.toServer) swap() // a later swap by another install: re-assert the merged protocol before the bytes go out
     if (client.state === 'play' && protos.outgoing.has(name)) {
       const ext = protos.outgoing.get(name)
-      const v = receipt.armed ? provider.value() : null
-      if (v == null) {
+      const valueOf = (f) => (f.source === 'world-key' ? observer.key() : (provider ? provider.value() : null))
+      const values = receipt.armed ? ext.fields.map(valueOf) : ext.fields.map(() => null)
+      const missing = values.some((v) => v == null)
+      if (missing && receipt.armed && ext.fields.some((f, i) => values[i] == null && f.source === 'world-key')) {
+        // HF77: the shape needs the world key and login / respawn has not named it yet — the packet is HELD (dropped;
+        // movement is periodic), never sent in a shape the server cannot read, never with a guessed key
+        receipt.heldMoves += 1
+        if (!warnedHeld) { warnedHeld = true; log(`[packet-wire] ${name} held: the world key is not known yet (no login / respawn carried it at ${worldKeyFieldOf(client.version, 'login')?.join('.') ?? 'a path this protocol names'})`) }
+        return undefined
+      }
+      if (missing) {
         receipt.unfilled += 1
         if (!warnedUnfilled && receipt.armed) { warnedUnfilled = true; log(`[packet-wire] ${name} sent in the vanilla shape: the provider has no ${spec.provider.compoundKey} value for ${provider.state.dimension ?? 'an unknown dimension'} yet (synced ${provider.state.synced}x)`) }
       } else {
         params = { ...(params || {}) }
-        for (const f of ext.fields) params[f.name] = v
+        ext.fields.forEach((f, i) => { params[f.name] = values[i] })
         receipt.fills += 1
-        receipt.lastFill = { packet: name, value: v, dimension: provider.state.dimension }
+        receipt.lastFill = { packet: name, value: values.length === 1 ? values[0] : values, dimension: provider ? provider.state.dimension : observer.key() }
       }
     }
     return write(name, params)
@@ -292,15 +395,15 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
     receipt.lastIncoming = { packet: meta.name, value: v }
     if (!receipt.armed && guarded.some((e) => e.guard.armedBy.direction === 'toClient' && e.guard.armedBy.packet === meta.name)) {
       receipt.armed = true
-      log(`[packet-wire] armed: the server's ${meta.name} carried the extension (value ${v}); ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${spec.provider.compoundKey} value`)
+      log(`[packet-wire] armed: the server's ${meta.name} carried the extension (value ${v}); ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${valueWords()}`)
     }
   })
-  receipt.value = () => provider.value()
+  receipt.value = () => (provider ? provider.value() : observer.key())
   // two bounded receipt lines (30 s and 120 s after install): what was filled, what was unwrapped, what was not
   for (const ms of [30000, 120000]) {
     const t = setTimeout(() => {
       const rd = receipt.redirect
-      log(`[packet-wire] receipt +${ms / 1000}s: armed=${receipt.armed} fills=${receipt.fills} unfilled=${receipt.unfilled} incoming=${receipt.incoming} provider={synced:${provider.state.synced},dimension:${provider.state.dimension},value:${provider.value()}}` +
+      log(`[packet-wire] receipt +${ms / 1000}s: armed=${receipt.armed} fills=${receipt.fills} unfilled=${receipt.unfilled} held=${receipt.heldMoves} incoming=${receipt.incoming} ` + (provider ? `provider={synced:${provider.state.synced},dimension:${provider.state.dimension},value:${provider.value()}}` : `worldKey={field:${observer.state.field},key:${observer.key()}}`) +
         (rd ? ` redirect={unwrapped:${rd.unwrapped},otherDimension:${rd.otherDimension},unparsed:${rd.unparsed},noDimension:${rd.noDimension},top:${Object.entries(rd.names).sort((x, y) => y[1] - x[1]).slice(0, 6).map(([n, c]) => n + ':' + c).join(',')}}` : ''))
     }, ms)
     if (t.unref) t.unref()
@@ -308,4 +411,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
   return receipt
 }
 
-module.exports = { installPacketBodyWireExtension, compileFor, createProvider, tailTypes, redirectUnwrapper, KEY_SOURCES }
+// the guard's arming as a receipt word: a clientbound extension (direction/packet) or a payload channel (+ its reply)
+function armedByLabel (a) { return a ? (a.direction ? `${a.direction}/${a.packet}` : `payload ${a.channel}${a.reply ? ` (reply ${a.reply})` : ''}`) : 'nothing' }
+
+module.exports = { installPacketBodyWireExtension, compileFor, createProvider, createWorldKeyObserver, worldKeyFieldOf, tailTypes, redirectUnwrapper, KEY_SOURCES }

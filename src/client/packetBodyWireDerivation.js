@@ -62,6 +62,12 @@ const VANILLA = {
   resourceKey: new Set(['net/minecraft/resources/ResourceKey', 'net/minecraft/class_5321']),
   level: new Set(['net/minecraft/world/level/Level', 'net/minecraft/class_1937'])
 }
+// HF77: the registry-key constant a ResourceKey READ hands the buffer
+// (`buf.readResourceKey(Registries.DIMENSION)`), Mojang and intermediary
+// spellings — the one registry whose keys ARE the worlds (a Level key). Any
+// other registry constant, or a generic Signature naming another type
+// argument, is a named stop: the world key is never sent for a biome key.
+const DIMENSION_REGISTRY_KEY = new Set(['net/minecraft/core/registries/Registries.DIMENSION', 'net/minecraft/class_7924.field_41223'])
 const isBuf = (c) => VANILLA.buf.has(c)
 const isCompound = (c) => VANILLA.compound.has(c)
 const isResLoc = (c) => VANILLA.resourceLocation.has(c)
@@ -250,6 +256,46 @@ const isInvoke = (row) => row.ref && (row.op === 0xb6 || row.op === 0xb7 || row.
 const isGetStatic = (row) => row.op === 0xb2 && row.ref
 const isPutStatic = (row) => row.op === 0xb3 && row.ref
 
+// HF77: a FriendlyByteBuf member that reads or writes a ResourceKey, recognised by
+// DESCRIPTOR SHAPE (Mojang or intermediary class names), never by method name:
+// read = (ResourceKey registry) -> ResourceKey; write = (ResourceKey) -> void | buf.
+function resourceKeyMemberOf (row) {
+  if (!isBuf(row.ref.owner)) return null
+  const m = String(row.ref.desc).match(/^\(L([^;]+);\)(V|L([^;]+);)$/)
+  if (!m || !isResKey(m[1])) return null
+  if (m[2] === 'V' || isBuf(m[3])) return 'write'
+  return isResKey(m[3]) ? 'read' : null
+}
+const strip = (d) => String(d || '').replace(/^L|;$/g, '')
+// the type argument of a `ResourceKey<X>` generic Signature (a method's return / parameter, a field's type); null when none
+function resKeyTypeArgOf (signature) {
+  for (const m of String(signature || '').matchAll(/L([^<;]+)<L([^<;]+);>;/g)) if (isResKey(m[1])) return m[2]
+  return null
+}
+// The registry evidence around one ResourceKey buffer member, all class-file data: the registry-key constant the read hands
+// the buffer (the nearest ResourceKey getstatic before it), and the generic type argument of the in-jar method / field that
+// produced (write) or consumed (read) the value — the nearest ResourceKey-typed invoke / field access carrying a Signature.
+function resourceKeyEvidence (rows, i, side, load, cls) {
+  const ev = { side, registry: null, typeArg: null, typedBy: null }
+  const sigOfInvoke = (b) => { const o = load(b.ref.owner); const m = o && o.methods.find((x) => x.name === b.ref.name && x.desc === b.ref.desc); return m ? m.signature : null }
+  const sigOfField = (b) => { const o = load(b.ref.owner); const f = o && (o.fields || []).find((x) => x.name === b.ref.name && x.desc === b.ref.desc); return f ? f.signature : null }
+  if (side === 'read') {
+    for (let j = i - 1; j >= 0; j--) { const b = rows[j]; if (isGetStatic(b) && isResKey(strip(b.ref.desc))) { ev.registry = `${b.ref.owner}.${b.ref.name}`; break } }
+    for (let j = i + 1; j < rows.length; j++) {
+      const b = rows[j]
+      if (isInvoke(b) && !isBuf(b.ref.owner) && handlerParams(b.ref.desc).some((p) => isResKey(strip(p)))) { const t = resKeyTypeArgOf(sigOfInvoke(b)); if (t) { ev.typeArg = t; ev.typedBy = `${b.ref.owner}.${b.ref.name}${b.ref.desc}`; break } }
+      if ((b.op === 0xb5 || b.op === 0xb3) && b.ref && isResKey(strip(b.ref.desc))) { const t = resKeyTypeArgOf(sigOfField(b)); if (t) { ev.typeArg = t; ev.typedBy = `${b.ref.owner}.${b.ref.name}`; break } }
+    }
+  } else {
+    for (let j = i - 1; j >= 0; j--) {
+      const b = rows[j]
+      if (isInvoke(b) && !isBuf(b.ref.owner) && /\)L([^;]+);$/.test(b.ref.desc) && isResKey(b.ref.desc.slice(b.ref.desc.lastIndexOf(')') + 2, -1))) { const t = resKeyTypeArgOf(sigOfInvoke(b)); if (t) { ev.typeArg = t; ev.typedBy = `${b.ref.owner}.${b.ref.name}${b.ref.desc}`; break } }
+      if ((b.op === 0xb4 || b.op === 0xb2) && b.ref && isResKey(strip(b.ref.desc))) { const t = resKeyTypeArgOf(sigOfField(b)); if (t) { ev.typeArg = t; ev.typedBy = `${b.ref.owner}.${b.ref.name}`; break } }
+    }
+  }
+  return ev
+}
+
 function primOf (row, table) {
   const key = `${row.ref.name}:${row.ref.desc}`
   const hit = Object.keys(table).find((k) => key.startsWith(k))
@@ -279,15 +325,26 @@ function classLoader (units) {
 // source) + the calls seen before the first prim (guards).
 function primsInDeep (parsed, name, desc, table, load) {
   const seen = new Set()
-  const out = { fields: [], sources: [], source: null, preCalls: [], bufCalls: [], calls: [] }
+  const out = { fields: [], sources: [], source: null, preCalls: [], bufCalls: [], calls: [], keys: [] }
+  const side = table === WRITE_PRIMS ? 'write' : 'read'
   const walk = (cls, mName, mDesc, hops, via) => {
     const key = `${cls.className}.${mName}${mDesc}`
     if (seen.has(key)) return
     seen.add(key)
     const rows = instructions(cls, mName, mDesc)
     if (!rows) return
-    for (const row of rows) {
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i]
       if (!isInvoke(row)) continue
+      // HF77: a ResourceKey read/write on the packet buffer is a field of its own type; the registry it belongs to rides as evidence
+      const rk = resourceKeyMemberOf(row)
+      if (rk === side) {
+        out.keys.push({ index: out.fields.length, member: `${row.ref.name}${row.ref.desc}`, ...resourceKeyEvidence(rows, i, side, load, cls) })
+        out.fields.push('resource-key')
+        out.sources.push(via || null)
+        if (!out.source) out.source = via || { className: cls.className, method: mName, desc: mDesc }
+        continue
+      }
       const prim = primOf(row, table)
       if (prim && (isBuf(row.ref.owner) || /^io\/netty\/buffer\//.test(row.ref.owner) || row.ref.owner === cls.className)) {
         out.fields.push(prim)
@@ -392,6 +449,7 @@ function scanClass (parsed, aliases, unit, load) {
           anchor,
           at: value,
           fields: deep.fields,
+          keys: deep.keys,
           bufCalls: deep.bufCalls,
           source: deep.source,
           preCalls: deep.preCalls,
@@ -601,7 +659,61 @@ function deriveProvider (source, load, units) {
 
 function where (row, m) { return `${m.className} (${row.target} of ${row.owner}) in ${m.jar}${m.nested ? ` nested ${m.nested}` : ''}` }
 
-function deriveSpec (mixins, version) {
+// HF77: the registry verdict over every ResourceKey member's evidence (both sides of one packet class).
+function resourceKeyRegistryVerdict (keys) {
+  const named = (k) => k.typeArg ? `ResourceKey<${vanillaName(k.typeArg)}>${k.typedBy ? ` by ${k.typedBy}` : ''}` : (k.registry ? `a key of ${k.registry}` : null)
+  // any evidence naming another registry — a Signature's type argument or the registry constant handed to the read — is a stop,
+  // even beside evidence naming Level: the two must agree before the world key is sent
+  const other = keys.find((k) => (k.typeArg && !isLevel(k.typeArg)) || (k.registry && !DIMENSION_REGISTRY_KEY.has(k.registry)))
+  if (other) return { level: false, named: (other.registry && !DIMENSION_REGISTRY_KEY.has(other.registry) ? `a key of ${other.registry}` : named(other)) + (other.typeArg && other.registry ? ` (typed ${named(other)})` : ''), evidence: `${other.side} side ${other.member}` }
+  const level = keys.filter((k) => (k.typeArg && isLevel(k.typeArg)) || (k.registry && DIMENSION_REGISTRY_KEY.has(k.registry)))
+  if (!level.length) return { level: false, named: 'a ResourceKey of a registry this walk could not read', evidence: keys.map((k) => `${k.side} side ${k.member} carries no registry constant and no ResourceKey<...> Signature`).join('; ') }
+  return { level: true, evidence: level.map((k) => `${k.side} side ${k.member}: ${k.registry && DIMENSION_REGISTRY_KEY.has(k.registry) ? `registry ${k.registry}` : named(k)}`).join('; ') }
+}
+
+// HF77: a write guard ((){Z}) nobody's clientbound read arms is armed the way
+// the jar arms it: the flag the predicate reads (a static field of the jar) is
+// written by a method of a class that declares a custom-payload id in its
+// <clinit> (`new Type(ResourceLocation("modid:name"))`) — the payload whose
+// arrival sets the flag. The reply payload the writer sends back (another
+// in-jar class with its own id) is derived too: a server that announces it in
+// its register frame runs the mod. All of it is class-file data; nothing found
+// stays the existing 'guard-not-derivable' stop.
+function payloadIdOf (cls) {
+  const rows = instructions(cls, '<clinit>', '()V') || []
+  let last = null
+  for (const row of rows) {
+    if (row.str != null) { last = row.str; continue }
+    if (!isInvoke(row) || last == null || !last.includes(':')) continue
+    const d = row.ref.desc || ''
+    if ((/^\(Ljava\/lang\/String;\)L[^;]+;$/.test(d) && isResLoc(d.slice(d.indexOf(')L') + 2, -1))) || (row.ref.name === '<init>' && d === '(Ljava/lang/String;)V' && isResLoc(row.ref.owner))) return last
+  }
+  return null
+}
+function deriveGuardArming (guard, load, units) {
+  const gCls = load(guard.className)
+  const body = gCls ? instructions(gCls, guard.method, '()Z') : null
+  const flag = (body || []).find((r) => isGetStatic(r) && load(r.ref.owner))
+  if (!flag) return null
+  for (const unit of units || []) {
+    for (const cname of unit.classes.keys()) {
+      const cls = load(cname); if (!cls) continue
+      for (const m of cls.methods) {
+        if (m.name === '<clinit>') continue
+        const rows = instructions(cls, m.name, m.desc); if (!rows) continue
+        if (!rows.some((r) => isPutStatic(r) && r.ref.owner === flag.ref.owner && r.ref.name === flag.ref.name)) continue
+        const channel = payloadIdOf(cls)
+        if (!channel) continue
+        let reply = null
+        for (const r of rows) { if (isInvoke(r) && r.ref.name === '<init>' && r.ref.owner !== cname) { const o = load(r.ref.owner); const id = o && payloadIdOf(o); if (id) { reply = id; break } } }
+        return { channel, reply, from: `${cname}.${m.name}` }
+      }
+    }
+  }
+  return null
+}
+
+function deriveSpec (mixins, version, load, units) {
   const table = packetTableFor(version)
   const all = mixins.flatMap((m) => m.injections.map((r) => ({ ...r, mixin: m })))
   // injections into a TABLED packet class outside the read/write/ctor law (resolved names only: an intermediary owner no refmap maps is not a table class)
@@ -648,6 +760,15 @@ function deriveSpec (mixins, version) {
         : 'the injection bodies write/read no buffer primitive this walk recognises', rows)
     }
     if (r.fields.join(',') !== w.fields.join(',')) return abstain('field-mismatch', `read side [${r.fields.join(',')}] vs write side [${w.fields.join(',')}]`, rows)
+    // HF77: a resource-key field's value is the world the client stands in ONLY when the key is a Level key (the
+    // dimension registry constant the read hands the buffer, or a ResourceKey<Level> Signature on the in-jar member that
+    // produced / consumed it); another registry — or no registry evidence at all — is a named stop, never the world key
+    let keyEvidence = null
+    if (w.fields.includes('resource-key')) {
+      const verdict = resourceKeyRegistryVerdict([...(r.keys || []), ...(w.keys || [])])
+      if (!verdict.level) return abstain('resource-key-registry-not-derivable', `${cls.split('/').pop()}: the ResourceKey the read/write sides carry is ${verdict.named} (${verdict.evidence}), not the world the client is in — which key to send is not derivable`, rows)
+      keyEvidence = verdict.evidence
+    }
     // the guard: a write conditioned on a jar flag ((){Z} before any primitive) armed by a clientbound read's (Z)V setter
     const guardCall = w.preCalls.find((c) => c.op === 0xb8 && /^\(\)Z$/.test(c.desc) && !isBuf(c.owner) && !/^(?:java|org\/apache|org\/spongepowered)\//.test(c.owner))
     exts.push({
@@ -656,7 +777,8 @@ function deriveSpec (mixins, version) {
       packetClass: cls,
       anchor: w.anchor,
       optional: direction === 'toClient' ? r.optional : false,
-      fields: w.fields.map((t, i) => ({ name: `packetBodyWire${i}`, type: t, source: 'provider' })),
+      fields: w.fields.map((t, i) => ({ name: `packetBodyWire${i}`, type: t, source: t === 'resource-key' ? 'world-key' : 'provider' })),
+      keyEvidence,
       source: direction === 'toServer' ? w.source : r.source,
       guard: guardCall ? { className: guardCall.owner, method: guardCall.name, armedBy: null } : null,
       mixin: { className: w.mixin.className, readClass: r.mixin.className, jar: w.mixin.jar, nested: w.mixin.nested || null, write: w.handler, read: r.handler }
@@ -668,6 +790,7 @@ function deriveSpec (mixins, version) {
     if (!ext.guard) continue
     const readRow = packetRows.find((r) => r.side === 'read' && r.owner !== ext.packetClass && r.optional && instructionsSet(r).has(`${ext.guard.className}.(Z)V`))
     if (readRow) { const armed = exts.find((o) => o.packetClass === readRow.owner); if (armed) ext.guard.armedBy = { direction: armed.direction, packet: armed.packet } }
+    if (!ext.guard.armedBy && load) ext.guard.armedBy = deriveGuardArming(ext.guard, load, units)
     if (!ext.guard.armedBy) return abstain('guard-not-derivable', `${ext.packetClass}'s write is conditioned on ${ext.guard.className}.${ext.guard.method} and nothing in the jar this walk reads arms it`, packetRows.filter((r) => r.owner === ext.packetClass))
   }
   return { exts, provider: null, abstain: null }
@@ -729,12 +852,15 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
     if (!mixins.length) continue
     // the receipt lists the mixins that inject into a (de)serializer; a class whose only injections are outside the law is named by the abstain it causes, if any
     receipts.mixins.push(...mixins.filter((m) => m.injections.length || m.payloadInjections.length).map((m) => ({ className: m.className, jar: m.jar, nested: m.nested, mod: m.mod, injections: m.injections.length })))
-    const spec = deriveSpec(mixins, version)
+    const spec = deriveSpec(mixins, version, load, units)
     if (spec.abstain) { result = { ...spec, mod: spec.abstain.mod }; break }
     if (!spec.exts.length) continue
     const wraps = mixins.some((m) => (m.payloadInjections || []).length > 0)
     if (result.exts.length) { result = { exts: [], provider: null, abstain: { reason: 'multiple-packet-wire-mods', detail: `${result.mod?.name || result.jar} and ${path.basename(jarPath)} both extend packet bodies — their order on the wire is not derivable`, packets: extPackets([...result.exts, ...spec.exts]), wraps: wraps || !!result.redirect, mixins: [] }, mod: result.mod }; break }
-    const prov = deriveProvider(spec.exts.find((e) => e.direction === 'toServer')?.source || spec.exts[0].source, load, units)
+    // HF77: a resource-key extension's value is the world key the client stands in — no record, no channel; the
+    // int-record provider is derived only where a field is provider-sourced (5.x / 3.x derive byte for byte as before)
+    const needsProvider = spec.exts.some((e) => e.fields.some((f) => f.source === 'provider'))
+    const prov = needsProvider ? deriveProvider(spec.exts.find((e) => e.direction === 'toServer')?.source || spec.exts[0].source, load, units) : { provider: null, abstain: null }
     const mod = mixins.find((m) => m.injections.length && m.mod)?.mod || units[0].mod || null
     if (prov.abstain) { result = { exts: [], provider: null, abstain: { ...prov.abstain, mixins: mixins.map((m) => `${m.className} in ${m.jar}${m.nested ? ` nested ${m.nested}` : ''}`), mod, jar: path.basename(jarPath), packets: extPackets(spec.exts), wraps }, mod }; break }
     const rd = deriveRedirect(mixins, load, prov.provider)
@@ -744,4 +870,4 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
   return { ...result, ...receipts }
 }
 
-module.exports = { scanPacketBodyWireExtensions, packetTableFor, PACKET_CLASS_TABLE, LOADER_TRANSPORTS, buildAliases, collectUnits, splitRef, _internals: { scanClass, classLoader, deriveSpec, deriveProvider, deriveRedirect, primsInDeep, modIdentity, abstainPackets, bufMemberLabel, vanillaName } }
+module.exports = { scanPacketBodyWireExtensions, packetTableFor, PACKET_CLASS_TABLE, LOADER_TRANSPORTS, buildAliases, collectUnits, splitRef, _internals: { scanClass, classLoader, deriveSpec, deriveProvider, deriveRedirect, deriveGuardArming, payloadIdOf, resourceKeyMemberOf, resourceKeyRegistryVerdict, primsInDeep, modIdentity, abstainPackets, bufMemberLabel, vanillaName, DIMENSION_REGISTRY_KEY } }

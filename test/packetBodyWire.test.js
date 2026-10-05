@@ -541,23 +541,129 @@ describe('HF41-r: the value key is derived, StreamCodec-era buffer members and n
     assert.equal(r.reason, 'unknown-value-key-source: entity-id (a/B.g(I)I)')
   })
 
-  it('1.21.1 evidence (Immersive Portals 6.0.6, real trimmed jar): the refmap resolves to the tabled classes, the injections ARE the read/write/ctor law, but the buffer members are ResourceKey read/write (method_44112 / method_44116) — a NAMED stop with the members, never a silent vanilla shape', function () {
+  it('1.21.1 evidence (Immersive Portals 6.0.6, real trimmed jar): the refmap resolves to the tabled classes, the injections ARE the read/write/ctor law, the buffer members are ResourceKey read/write (method_44112 / method_44116) — HF77: a ResourceKey<Level> member is a resource-key field sourced from the world key the client stands in; no abstain, no record provider', function () {
     const r = scanPacketBodyWireExtensions([FABRIC_121], { version: '1.21.1' })
-    assert.equal(r.exts.length, 0)
-    assert.equal(r.provider, null)
-    assert.equal(r.abstain.reason, 'buffer-member-not-derivable')
-    assert.equal(r.abstain.detail, 'ClientboundPlayerPositionPacket: the read side calls FriendlyByteBuf.method_44112(ResourceKey) on the packet buffer; the write side calls FriendlyByteBuf.method_44116(ResourceKey) on the packet buffer — not a wire primitive this build can follow')
-    assert.deepEqual(r.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ClientboundPlayerPositionPacket', direction: 'toClient', packet: 'position', sides: ['read', 'write'] }])
-    assert.deepEqual(r.abstain.mod, { id: 'immersive_portals', name: 'Immersive Portals', version: '6.0.6', descriptor: 'fabric.mod.json' })
-    assert.equal(r.abstain.mixins.length, 2)
-    assert.ok(r.abstain.mixins.every((m) => /ClientboundPlayerPositionPacket\)/.test(m)), r.abstain.mixins.join(' | '))
-    // the serverbound move mixins of the same jar are resolved table classes with law targets (the walk got there; the stop is the members, not the table)
+    assert.equal(r.abstain, null, JSON.stringify(r.abstain))
+    assert.equal(r.provider, null, 'the value is the world key itself — no int record, no channel')
+    assert.equal(r.redirect, null)
+    assert.deepEqual(r.mod, { id: 'immersive_portals', name: 'Immersive Portals', version: '6.0.6', descriptor: 'fabric.mod.json' })
+    assert.equal(r.exts.length, 5, 'four serverbound move packets + the clientbound position')
+    assert.deepEqual(r.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).sort(), [...MOVES].sort())
+    const posRot = r.exts.find((e) => e.packet === 'position_look')
+    assert.equal(posRot.packetClass, 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$PosRot')
+    for (const e of r.exts) {
+      assert.equal(e.anchor, 'tail')
+      assert.deepEqual(e.fields, [{ name: 'packetBodyWire0', type: 'resource-key', source: 'world-key' }])
+      // the Level evidence is class-file data: the dimension registry constant the read hands the buffer + the ResourceKey<Level> Signature on the in-jar member that produced the written value
+      assert.match(e.keyEvidence, /read side method_44112\(Lnet\/minecraft\/class_5321;\)Lnet\/minecraft\/class_5321;: registry net\/minecraft\/class_7924\.field_41223/)
+      assert.match(e.keyEvidence, /write side method_44116\(Lnet\/minecraft\/class_5321;\)V: ResourceKey<Level> by qouteall\/imm_ptl\/core\/(ducks\/IEPlayerMoveC2SPacket\.ip_getPlayerDimension\(\)|mixin\/common\/position_sync\/MixinPlayerPositionLookS2CPacket\.playerDimension)/)
+    }
+    // the write guard (doesServerHaveImmPtl) is armed the way the jar arms it: the flag is written by the handler of the mod's config-phase payload; the reply payload is derived with it
+    for (const e of r.exts.filter((e) => e.direction === 'toServer')) {
+      assert.equal(e.guard.className, 'qouteall/imm_ptl/core/network/ImmPtlNetworkConfig')
+      assert.equal(e.guard.method, 'doesServerHaveImmPtl')
+      assert.deepEqual(e.guard.armedBy, { channel: 'iportal:config_packet', reply: 'iportal:configure_complete', from: 'qouteall/imm_ptl/core/network/ImmPtlNetworkConfig$S2CConfigStartPacket.handle' })
+    }
+    assert.equal(r.exts.find((e) => e.direction === 'toClient').guard, null)
+    const owners = new Set()
     const units = collectUnits(FABRIC_121); const aliases = buildAliases(units); const load = require('../src/client/packetBodyWireDerivation')._internals.classLoader(units)
     const { scanClass } = require('../src/client/packetBodyWireDerivation')._internals
     const { parseClassFile } = require('../src/client/jarAnalysis')
-    const owners = new Set()
     for (const u of units) for (const e of u.classes.values()) { let p; try { p = parseClassFile(zipEntryData(u.buf, e)) } catch { continue } const f = p && scanClass(p, aliases, u, load); if (f) for (const i of f.injections) owners.add(`${i.owner.split('/').pop()}.${i.target}`) }
     for (const o of ['ServerboundMovePlayerPacket$Pos.write', 'ServerboundMovePlayerPacket$Pos.read', 'ServerboundMovePlayerPacket$PosRot.write', 'ServerboundMovePlayerPacket$StatusOnly.read']) assert.ok(owners.has(o), o)
+  })
+
+  it('HF77 control (resource-key-registry-not-derivable): the same jar with the ResourceKey typed by ANOTHER registry (Signature class_1959 + a non-dimension registry constant) → a named stop, never the world key for a biome key', function () {
+    const p = bend('immersive-portals-6.0.6-biome-key.jar', FABRIC_121, { rewrite: (f, s) => (s.includes('class_5321<Lnet/minecraft/class_1937;>') ? s.split('class_5321<Lnet/minecraft/class_1937;>').join('class_5321<Lnet/minecraft/class_1959;>') : (s === 'field_41223' ? 'field_41236' : undefined)) })
+    const r = scanPacketBodyWireExtensions([p], { version: '1.21.1' })
+    assert.equal(r.exts.length, 0)
+    assert.equal(r.provider, null)
+    assert.equal(r.abstain.reason, 'resource-key-registry-not-derivable')
+    assert.match(r.abstain.detail, /^ClientboundPlayerPositionPacket: the ResourceKey the read\/write sides carry is a key of net\/minecraft\/class_7924\.field_41236 \(typed ResourceKey<class_1959> by qouteall\/imm_ptl\/core\/ducks\/IEPlayerPositionLookS2CPacket\.ip_setPlayerDimension/)
+    assert.match(r.abstain.detail, /not the world the client is in — which key to send is not derivable$/)
+    assert.equal(r.abstain.mod.version, '6.0.6')
+    // only the registry constant bent (the Signatures still say Level): the constant names another registry → still a named stop (the two evidences must agree on Level)
+    const p2 = bend('immersive-portals-6.0.6-other-constant.jar', FABRIC_121, { rewrite: (f, s) => (s === 'field_41223' ? 'field_41236' : undefined) })
+    assert.equal(scanPacketBodyWireExtensions([p2], { version: '1.21.1' }).abstain.reason, 'resource-key-registry-not-derivable')
+    // the Level evidence gone entirely (no Signature, a registry constant this walk does not know) → named as unreadable, never derived
+    const p3 = bend('immersive-portals-6.0.6-no-evidence.jar', FABRIC_121, { rewrite: (f, s) => (s.includes('class_5321<Lnet/minecraft/class_1937;>') ? s.split('class_5321<Lnet/minecraft/class_1937;>').join('class_5321<Ljava/lang/Object;>') : (s === 'field_41223' ? 'field_41236' : undefined)) })
+    const r3 = scanPacketBodyWireExtensions([p3], { version: '1.21.1' })
+    assert.equal(r3.abstain.reason, 'resource-key-registry-not-derivable')
+  })
+
+  it('HF77 control (guard-not-derivable): the arming classes dropped from the jar (the HF41-r trim) → the write guard has no derivable arming → the named stop stands, never an unarmed install', function () {
+    const p = bend('immersive-portals-6.0.6-no-netconfig.jar', FABRIC_121, { drop: (f) => /network\/ImmPtlNetworkConfig/.test(f) })
+    const r = scanPacketBodyWireExtensions([p], { version: '1.21.1' })
+    assert.equal(r.exts.length, 0)
+    assert.equal(r.abstain.reason, 'guard-not-derivable')
+    assert.match(r.abstain.detail, /ServerboundMovePlayerPacket\$PosRot's write is conditioned on qouteall\/imm_ptl\/core\/network\/ImmPtlNetworkConfig\.doesServerHaveImmPtl/)
+  })
+
+  it('HF77 install (1.21.1): a resource-key field is written as the vanilla resource-key string (varint length + utf8) of the world key login / respawn named at the protocol-derived path; moves are HELD until the key is known; the guard arms on the derived payload or the server\'s register frame naming its reply', function () {
+    const { createWorldKeyObserver, worldKeyFieldOf } = require('../src/client/packetBodyWireInstall')
+    const mc = require('minecraft-protocol')
+    assert.deepEqual(worldKeyFieldOf('1.21.1', 'login'), ['worldState', 'name'])
+    assert.deepEqual(worldKeyFieldOf('1.21.1', 'respawn'), ['worldState', 'name'])
+    assert.deepEqual(worldKeyFieldOf('1.20.1', 'login'), ['worldName'])
+    assert.deepEqual(worldKeyFieldOf('1.20.1', 'respawn'), ['worldName'])
+    assert.equal(worldKeyFieldOf('1.12.2', 'login'), null, 'a version naming neither shape (1.12.2: an i32 dimension, no world key) yields nothing — never a guess')
+    const spec = scanPacketBodyWireExtensions([FABRIC_121], { version: '1.21.1' })
+    const c = new EventEmitter(); c.version = '1.21.1'; c.state = 'configuration'
+    c.serializer = mc.createSerializer({ state: 'configuration', isServer: false, version: '1.21.1' }); c.deserializer = mc.createDeserializer({ state: 'configuration', isServer: false, version: '1.21.1' })
+    const writes = []; c.write = (name, params) => writes.push({ name, params })
+    const logs = []
+    const r = installPacketBodyWireExtension(c, spec, { log: (m) => logs.push(m) })
+    assert.equal(r.reason, undefined, r.reason)
+    assert.deepEqual(r.exts.find((e) => e.packet === 'position_look').sources, ['world-key'])
+    assert.equal(r.exts.find((e) => e.packet === 'position_look').guard, 'qouteall/imm_ptl/core/network/ImmPtlNetworkConfig.doesServerHaveImmPtl armed by payload iportal:config_packet (reply iportal:configure_complete)')
+    assert.equal(r.armed, false)
+    // the server's configuration-phase register frame names the handshake's reply channel: it runs the mod → armed
+    c.emit('packet', { channel: 'minecraft:register', data: Buffer.from('fabric:registry/sync\0iportal:configure_complete\0', 'utf8') }, { state: 'configuration', name: 'custom_payload' })
+    assert.equal(r.armed, true); assert.equal(r.armedBy, 'register iportal:configure_complete')
+    c.state = 'play'; c.serializer = mc.createSerializer({ state: 'play', isServer: false, version: '1.21.1' }); c.deserializer = mc.createDeserializer({ state: 'play', isServer: false, version: '1.21.1' }); c.emit('state', 'play')
+    assert.equal(r.installed, true)
+    const bytes = (i) => c.serializer.proto.createPacketBuffer('packet', writes[i])
+    // before login names the world: the move is HELD (never the vanilla shape, never a guessed key)
+    c.write('position_look', { x: 1.5, y: 64, z: -2.25, yaw: 90, pitch: 0, flags: { onGround: true, hasHorizontalCollision: false } })
+    assert.equal(writes.length, 0); assert.equal(r.heldMoves, 1); assert.equal(r.unfilled, 0)
+    assert.ok(logs.some((m) => /position_look held: the world key is not known yet/.test(m)), logs.join('\n'))
+    // login (1.21.1: worldState.name) names it
+    c.emit('packet', { entityId: 1, worldState: { dimension: 0, name: 'minecraft:overworld' } }, { state: 'play', name: 'login' })
+    assert.deepEqual(r.worldKey, { field: 'login.worldState.name', key: 'minecraft:overworld', seen: 1 })
+    c.write('position_look', { x: 1.5, y: 64, z: -2.25, yaw: 90, pitch: 0, flags: { onGround: true, hasHorizontalCollision: false } })
+    assert.equal(writes.length, 1); assert.equal(r.fills, 1)
+    const b = bytes(0)
+    const key = Buffer.from('minecraft:overworld', 'utf8')
+    assert.equal(b.length, 34 + 1 + key.length, 'the vanilla 34 bytes + varint(len) + utf8')
+    assert.equal(b[34], key.length)
+    assert.equal(b.subarray(35).toString('utf8'), 'minecraft:overworld')
+    // a respawn into another world changes the key
+    c.emit('packet', { worldState: { dimension: 1, name: 'minecraft:the_nether' }, copyMetadata: 0 }, { state: 'play', name: 'respawn' })
+    c.write('position', { x: 1, y: 2, z: 3, flags: { onGround: true, hasHorizontalCollision: false } })
+    assert.equal(bytes(1).subarray(26 + 1).toString('utf8'), 'minecraft:the_nether')
+    assert.equal(r.worldKey.key, 'minecraft:the_nether')
+    // a flying packet (no coordinates) carries the same tail
+    c.write('flying', { flags: { onGround: false, hasHorizontalCollision: false } })
+    assert.equal(bytes(2).length, 2 + 1 + Buffer.byteLength('minecraft:the_nether'))
+    // the clientbound position with the key appended parses with no bytes left
+    const s2c = mc.createSerializer({ state: 'play', isServer: true, version: '1.21.1' })
+    const vanillaPos = s2c.proto.createPacketBuffer('packet', { name: 'position', params: { x: 1, y: 2, z: 3, yaw: 0, pitch: 0, flags: 0, teleportId: 7 } })
+    const parsed = c.deserializer.proto.parsePacketBuffer('packet', Buffer.concat([vanillaPos, Buffer.from([key.length]), key]))
+    assert.equal(parsed.data.params.packetBodyWire0, 'minecraft:overworld')
+    assert.equal(parsed.metadata.size, vanillaPos.length + 1 + key.length)
+    assert.equal(c.deserializer.proto.parsePacketBuffer('packet', vanillaPos).data.params.packetBodyWire0, null, 'without the tail the vanilla shape still parses')
+    // the other arming: the derived payload itself (a second client)
+    const d = new EventEmitter(); d.version = '1.21.1'; d.state = 'configuration'; d.write = () => {}
+    const rd = installPacketBodyWireExtension(d, spec, { log: () => {} })
+    d.emit('packet', { channel: 'imm_ptl:other', data: Buffer.alloc(1) }, { state: 'configuration', name: 'custom_payload' })
+    assert.equal(rd.armed, false)
+    d.emit('packet', { channel: 'iportal:config_packet', data: Buffer.alloc(3) }, { state: 'configuration', name: 'custom_payload' })
+    assert.equal(rd.armed, true); assert.equal(rd.armedBy, 'payload iportal:config_packet')
+    // an observer without a version reads the same two shapes off the parsed packet
+    const e = new EventEmitter(); const rec = {}
+    const obs = createWorldKeyObserver(e, rec)
+    e.emit('packet', { worldName: 'minecraft:the_end' }, { state: 'play', name: 'respawn' })
+    assert.equal(obs.key(), 'minecraft:the_end'); assert.equal(rec.worldKey.field, 'respawn.worldName')
   })
 
   it('abstain (packet-target-not-derivable): a tabled packet class whose only injections are outside the law (Pos write/read renamed to a codec member) → named with the member and injector; the jar with no injection into any tabled class stays exts=[]', function () {

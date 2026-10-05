@@ -118,7 +118,11 @@ function parseClassFile (b) {
     }
     return undefined
   }
-  const fields = readMembers().map((f) => ({ name: f.name, desc: f.desc, flags: f.flags, constValue: constValueOf(f.attrs) }))
+  // HF77: a member's generic Signature attribute (ResourceKey<Level> on a
+  // field or a method) is class-file DATA the packet-body walk reads to learn
+  // WHICH registry a resource key belongs to; null when javac emitted none.
+  const signatureOf = (attrs) => { const sig = attrs.find((a) => a.name === 'Signature'); return sig && sig.len >= 2 ? cpUtf8(cp, b.readUInt16BE(sig.start)) : null }
+  const fields = readMembers().map((f) => ({ name: f.name, desc: f.desc, flags: f.flags, constValue: constValueOf(f.attrs), signature: signatureOf(f.attrs) }))
   const codes = []
   // HF15-R: the full method table (name/desc/flags — ABSTRACT and interface
   // members included, which carry no Code attribute and so never appear in
@@ -134,8 +138,7 @@ function parseClassFile (b) {
     // HF41-r: the member's generic Signature (the erased descriptor's type
     // arguments, e.g. a getter keyed by ResourceKey<Level>) — class-file data
     // the value-key derivation reads; null when the compiler emitted none.
-    const sig = m.attrs.find((a) => a.name === 'Signature')
-    const signature = sig && sig.len >= 2 ? cpUtf8(cp, b.readUInt16BE(sig.start)) : null
+    const signature = signatureOf(m.attrs)
     methods.push({ name: m.name, desc: m.desc, flags: m.flags, signature, annotationsAt: ann ? ann.start : null, invisibleAnnotationsAt: inv ? inv.start : null })
     const code = m.attrs.find((a) => a.name === 'Code')
     if (!code) continue
