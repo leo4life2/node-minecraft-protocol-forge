@@ -666,6 +666,57 @@ describe('HF41-r: the value key is derived, StreamCodec-era buffer members and n
     assert.equal(obs.key(), 'minecraft:the_end'); assert.equal(rec.worldKey.field, 'respawn.worldName')
   })
 
+  it('HF77 r2 (the field order): the server\'s register frame and the login packet both precede the install (the off-loop scan settles late) → the guard arms at install from the census the embedder holds and the first move carries the key login named (no hold, no vanilla shape); a string[] register frame (nmp\'s parser) arms a later install; an int provider created after login knows its dimension at once', function () {
+    const { createWorldKeyObserver, observeWorldKey, createProvider } = require('../src/client/packetBodyWireInstall')
+    const mc = require('minecraft-protocol')
+    const spec = scanPacketBodyWireExtensions([FABRIC_121], { version: '1.21.1' })
+    const c = new EventEmitter(); c.version = '1.21.1'; c.state = 'configuration'
+    c.serializer = mc.createSerializer({ state: 'configuration', isServer: false, version: '1.21.1' }); c.deserializer = mc.createDeserializer({ state: 'configuration', isServer: false, version: '1.21.1' })
+    const writes = []; c.write = (name, params) => writes.push({ name, params })
+    // hook time (configuration, before login): the ONE observer exists from here on
+    const early = observeWorldKey(c)
+    assert.equal(c.minepalWorldKeyObserver, early)
+    // the server's configuration-phase register frame is counted by the embedder's census (not by us: the install has not run)
+    const census = new Set(['fabric:registry/sync', 'iportal:configure_complete', 'imm_ptl:dim_sync'])
+    // login names the world BEFORE the install
+    c.state = 'play'; c.serializer = mc.createSerializer({ state: 'play', isServer: false, version: '1.21.1' }); c.deserializer = mc.createDeserializer({ state: 'play', isServer: false, version: '1.21.1' }); c.emit('state', 'play')
+    c.emit('packet', { entityId: 1, worldState: { dimension: 0, name: 'minecraft:overworld' } }, { state: 'play', name: 'login' })
+    assert.equal(early.key(), 'minecraft:overworld')
+    const logs = []
+    const r = installPacketBodyWireExtension(c, spec, { log: (m) => logs.push(m), announcedChannels: () => census })
+    assert.equal(r.reason, undefined, r.reason)
+    assert.equal(c.minepalWorldKeyObserver, early, 'the install reuses the hook\'s observer')
+    assert.equal(r.installed, true)
+    assert.equal(r.armed, true); assert.equal(r.armedBy, 'register iportal:configure_complete')
+    assert.ok(logs.some((m) => /armed: the server's register iportal:configure_complete \(announced before this install\)/.test(m)), logs.join('\n'))
+    assert.deepEqual(r.worldKey, { field: 'login.worldState.name', key: 'minecraft:overworld', seen: 1 }, 'the key seen before the install rides the receipt')
+    c.write('position_look', { x: 1.5, y: 64, z: -2.25, yaw: 90, pitch: 0, flags: { onGround: true, hasHorizontalCollision: false } })
+    assert.equal(writes.length, 1, 'the FIRST move leaves'); assert.equal(r.heldMoves, 0); assert.equal(r.unfilled, 0); assert.equal(r.fills, 1)
+    const b = c.serializer.proto.createPacketBuffer('packet', writes[0])
+    const key = Buffer.from('minecraft:overworld', 'utf8')
+    assert.equal(b.length, 34 + 1 + key.length); assert.equal(b[34], key.length); assert.equal(b.subarray(35).toString('utf8'), 'minecraft:overworld')
+    // a respawn after the install still follows
+    c.emit('packet', { worldState: { dimension: 1, name: 'minecraft:the_nether' }, copyMetadata: 0 }, { state: 'play', name: 'respawn' })
+    assert.equal(r.worldKey.key, 'minecraft:the_nether'); assert.equal(r.worldKey.seen, 2)
+    // a census naming neither the channel nor the reply arms nothing at install; nmp's string[] register frame arms later
+    const d = new EventEmitter(); d.version = '1.21.1'; d.state = 'configuration'; d.write = () => {}
+    const rd = installPacketBodyWireExtension(d, spec, { log: () => {}, announcedChannels: ['fabric:registry/sync', 'imm_ptl:dim_sync'] })
+    assert.equal(rd.armed, false)
+    d.emit('packet', { channel: 'minecraft:register', data: ['imm_ptl:dim_sync', 'iportal:config_packet'] }, { state: 'configuration', name: 'custom_payload' })
+    assert.equal(rd.armed, true); assert.equal(rd.armedBy, 'register iportal:config_packet')
+    // a census that throws or is absent: as before (the listener alone)
+    const e = new EventEmitter(); e.version = '1.21.1'; e.state = 'configuration'; e.write = () => {}
+    assert.equal(installPacketBodyWireExtension(e, spec, { log: () => {}, announcedChannels: () => { throw new Error('no census') } }).armed, false)
+    // the int-record provider path (5.x) created after login: its dimension is the key already seen (the same ONE observer)
+    const f = new EventEmitter(); f.version = '1.20.1'
+    const obs = createWorldKeyObserver(f)
+    f.emit('packet', { worldName: 'minecraft:the_end' }, { state: 'play', name: 'login' })
+    const rec = {}
+    const prov = createProvider(f, { kind: 'nbt-compound', compoundKey: 'intId', valueType: 'int', channels: [], keySource: 'world-key' }, rec, obs)
+    assert.equal(prov.state.dimension, 'minecraft:the_end'); assert.equal(rec.provider.dimension, 'minecraft:the_end')
+    assert.deepEqual(rec.worldKey, undefined, 'a provider handed the observer attaches no receipt of its own (the install does)')
+  })
+
   it('abstain (packet-target-not-derivable): a tabled packet class whose only injections are outside the law (Pos write/read renamed to a codec member) → named with the member and injector; the jar with no injection into any tabled class stays exts=[]', function () {
     const p = bend('immersive-portals-3.0.7-all.jar', FORGE, { rewrite: (f, s) => (/ServerboundMovePlayerPacket\$Pos;(write|read)\(/.test(s) ? s.replace(/;(write|read)\(/, ';codec(') : undefined) })
     const r = scanPacketBodyWireExtensions([p], { version: '1.20.1' })

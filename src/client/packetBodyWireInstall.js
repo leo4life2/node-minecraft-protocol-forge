@@ -165,24 +165,52 @@ function worldKeyIn (data) {
 }
 
 // THE ONE observer of the world key this client stands in: the login / respawn
-// packet's key string at the protocol-derived path. Both the int-record
-// provider (its map is keyed by this string) and a resource-key field (its
-// value IS this string) read it here; the receipt names the field and the key.
-function createWorldKeyObserver (client, receipt) {
-  const state = { key: null, field: null, seen: 0 }
-  const subs = []
-  receipt.worldKey = { field: null, key: null, seen: 0 }
-  client.on('packet', (data, meta) => {
-    if (!meta || (meta.name !== 'login' && meta.name !== 'respawn') || (meta.state && meta.state !== 'play') || !data) return
-    const path = client.version ? worldKeyFieldOf(client.version, meta.name) : null
-    let key = null; let at = null
-    if (path) { let v = data; for (const p of path) v = v == null ? undefined : v[p]; if (typeof v === 'string') { key = v; at = path } } else { const w = worldKeyIn(data); if (w) { key = w.key; at = w.path } }
-    if (key == null) return
-    state.key = key; state.field = `${meta.name}.${at.join('.')}`; state.seen += 1
-    Object.assign(receipt.worldKey, { field: state.field, key, seen: state.seen })
-    for (const fn of subs) fn(key, state.field)
-  })
-  return { key: () => state.key, state, onKey: (fn) => { subs.push(fn); return true } }
+// packet's key string at the protocol-derived path — ONE per client, created
+// by its first caller and reused by every later one (HF77 r2: the embedder's
+// hook observes before login; the install runs after the off-loop scan settles,
+// often past login, and reads the key already seen instead of waiting for a
+// respawn). Both the int-record provider (its map is keyed by this string) and
+// a resource-key field (its value IS this string) read it here; every receipt
+// attached names the field and the key.
+function createWorldKeyObserver (client, receipt = null) {
+  let obs = client.minepalWorldKeyObserver
+  if (!obs) {
+    const state = { key: null, field: null, seen: 0 }
+    const subs = []
+    client.on('packet', (data, meta) => {
+      if (!meta || (meta.name !== 'login' && meta.name !== 'respawn') || (meta.state && meta.state !== 'play') || !data) return
+      const path = client.version ? worldKeyFieldOf(client.version, meta.name) : null
+      let key = null; let at = null
+      if (path) { let v = data; for (const p of path) v = v == null ? undefined : v[p]; if (typeof v === 'string') { key = v; at = path } } else { const w = worldKeyIn(data); if (w) { key = w.key; at = w.path } }
+      if (key == null) return
+      state.key = key; state.field = `${meta.name}.${at.join('.')}`; state.seen += 1
+      for (const fn of subs) fn(key, state.field)
+    })
+    obs = {
+      key: () => state.key,
+      state,
+      // a subscriber learns a key already observed at once (an install that runs after login)
+      onKey: (fn) => { subs.push(fn); if (state.key != null) fn(state.key, state.field); return true },
+      attach: (r) => { r.worldKey = { field: state.field, key: state.key, seen: state.seen }; subs.push((key, field) => Object.assign(r.worldKey, { field, key, seen: state.seen })); return r.worldKey }
+    }
+    client.minepalWorldKeyObserver = obs
+  }
+  if (receipt) obs.attach(receipt)
+  return obs
+}
+// the embedder's early call (before login): the observer exists from here on; the install reuses it
+function observeWorldKey (client) { return client && typeof client.on === 'function' ? createWorldKeyObserver(client) : null }
+
+// the channel names a minecraft:register frame carries: node-minecraft-protocol's parser delivers string[]
+// ('registerarr'); a raw Buffer is Fabric's NUL-separated identifiers
+function registerNames (data) {
+  if (Array.isArray(data)) return data.map(String).map((n) => n.trim()).filter(Boolean)
+  if (Buffer.isBuffer(data)) return data.toString('utf8').split('\0').map((n) => n.trim()).filter(Boolean)
+  return []
+}
+// the channels the server already registered before this install (the embedder's census: an iterable or a function returning one)
+function announcedNames (src) {
+  try { const v = typeof src === 'function' ? src() : src; return v && typeof v[Symbol.iterator] === 'function' ? [...v].map(String).map((n) => n.trim()).filter(Boolean) : [] } catch { return [] }
 }
 
 // The derived provider: parses the record the server syncs (an NBT compound
@@ -256,7 +284,7 @@ function redirectUnwrapper (redirect, protos, provider, receipt) {
 }
 
 // Returns the receipt ({ installed, reason }); idempotent per client.
-function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
+function installPacketBodyWireExtension (client, spec, { log = debug, announcedChannels = null } = {}) {
   if (!client || !spec || !spec.exts || !spec.exts.length) return { installed: false, reason: 'no-extension' }
   if (client.minepalPacketBodyWire) return client.minepalPacketBodyWire
   const receipt = {
@@ -298,24 +326,29 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
   const guarded = spec.exts.filter((e) => e.direction === 'toServer' && e.guard && e.guard.armedBy)
   receipt.armed = guarded.length === 0
   const unwrap = spec.redirect && provider ? redirectUnwrapper(spec.redirect, protos, provider, receipt) : null
+  const valueWords = () => (usesWorldKey ? `world key the client stands in${observer.state.field ? ` (${observer.state.field})` : ''}${observer.key() != null ? ` = ${observer.key()}` : ''}` : `${spec.provider.compoundKey} value`)
   // HF77: a guard the jar arms by a custom payload (the mod's own config handshake) is armed here by the same payload's
-  // arrival, or by the server's register frame naming the handshake's channel (the server declares it runs the mod)
+  // arrival, or by the server's register frame naming the handshake's channel (the server declares it runs the mod).
+  // HF77 r2: the register frame rides the configuration phase and this install may run after it (the off-loop scan
+  // settles late) — the channels the embedder already counted arm the guard at install; the listener covers later frames.
   const armingChannels = guarded.map((e) => e.guard.armedBy).filter((a) => a && a.channel)
+  const registerArm = (names) => { const a = armingChannels.find((x) => names.includes(x.reply) || names.includes(x.channel)); return a ? `register ${names.includes(a.reply) ? a.reply : a.channel}` : null }
+  const arm = (by, where) => {
+    receipt.armed = true; receipt.armedBy = by
+    log(`[packet-wire] armed: the server's ${by} (${where}) says it runs the mod; ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${valueWords()}`)
+  }
   if (armingChannels.length) {
+    const known = announcedNames(announcedChannels)
+    const early = known.length ? registerArm(known) : null
+    if (early) arm(early, 'announced before this install')
     client.on('packet', (data, meta) => {
       if (receipt.armed || !meta || meta.name !== 'custom_payload' || !data || typeof data.channel !== 'string') return
       let by = armingChannels.some((a) => a.channel === data.channel) ? `payload ${data.channel}` : null
-      if (!by && data.channel === 'minecraft:register' && Buffer.isBuffer(data.data)) {
-        const names = data.data.toString('utf8').split('\0').filter(Boolean)
-        const a = armingChannels.find((x) => names.includes(x.reply) || names.includes(x.channel))
-        if (a) by = `register ${names.includes(a.reply) ? a.reply : a.channel}`
-      }
+      if (!by && (data.channel === 'minecraft:register' || data.channel === 'REGISTER')) by = registerArm(registerNames(data.data))
       if (!by) return
-      receipt.armed = true; receipt.armedBy = by
-      log(`[packet-wire] armed: the server's ${by} (${meta.state}) says it runs the mod; ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${valueWords()}`)
+      arm(by, meta.state)
     })
   }
-  const valueWords = () => (usesWorldKey ? `world key the client stands in${observer.state.field ? ` (${observer.state.field})` : ''}${observer.key() != null ? ` = ${observer.key()}` : ''}` : `${spec.provider.compoundKey} value`)
   const wrapDeserializer = (des) => {
     if (!unwrap || des._pbwRedirect) return
     des._pbwRedirect = true
@@ -414,4 +447,4 @@ function installPacketBodyWireExtension (client, spec, { log = debug } = {}) {
 // the guard's arming as a receipt word: a clientbound extension (direction/packet) or a payload channel (+ its reply)
 function armedByLabel (a) { return a ? (a.direction ? `${a.direction}/${a.packet}` : `payload ${a.channel}${a.reply ? ` (reply ${a.reply})` : ''}`) : 'nothing' }
 
-module.exports = { installPacketBodyWireExtension, compileFor, createProvider, createWorldKeyObserver, worldKeyFieldOf, tailTypes, redirectUnwrapper, KEY_SOURCES }
+module.exports = { installPacketBodyWireExtension, compileFor, createProvider, createWorldKeyObserver, observeWorldKey, worldKeyFieldOf, tailTypes, redirectUnwrapper, KEY_SOURCES }
