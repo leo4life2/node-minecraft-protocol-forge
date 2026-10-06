@@ -3246,69 +3246,319 @@ function classTypeId (index, state, cls) {
   return null
 }
 
-// HF55: `collect.unprovable` (optional) receives the rows the proof REFUSES —
-// a finish handler whose ack codec is NOT unit (the reply has a body this
-// responder cannot invent) — so the acquire-to-prove path can say WHY a
-// channel stays unanswered instead of guessing. The returned contracts are
-// unchanged.
+// HF81: the shapes a configuration-task finish takes beyond the payload's
+// own (IPayloadContext)V method (Combat Roll 3.0.1 / Better Combat 3.2.2 on
+// NeoForge 26.1.2, field F18): the finishing handler is a LAMBDA (or a
+// method reference) handed to the registrar through invokedynamic — its
+// body lives in a synthetic `(L<Ack>;L<IPayloadContext>;)V` method of the
+// registering class; the ack is NOT unit: a record whose codec is
+// StreamCodec.ofMember(write, read) and whose write() is a sequence of
+// buffer writes of its fields; the client's reply constructs that record
+// from JAR CONSTANTS (an ldc, a static String, a static Identifier's
+// toString()) at ITS handler for the trigger; and the server's finish is
+// GUARDED by String.equals of the ack's accessor against the same constant.
+// Every row carries `proof` (what was followed) and a bodied row carries
+// `body` (field, wire kind, the proven value) the responder encodes. A shape
+// these reads do not prove is REFUSED with the exact reason — never guessed.
+const HANDLER_2ARG_RE = new RegExp(`^\\(L([^;]+);L${IPAYLOAD_CONTEXT.replace(/\//g, '\\/')};\\)V$`)
+const STRING_DESC = 'Ljava/lang/String;'
+
+function ldcStringAt (cp, code, op, pc) {
+  const idx = op === 0x12 ? code[pc + 1] : code.readUInt16BE(pc + 1)
+  const c = cp[idx]
+  return c && c.tag === 8 ? cpUtf8(cp, c.strIndex) : null
+}
+
+// A constant tracker over a linear walk: ldc strings, static String fields
+// and static Identifier fields followed by toString() — the three constant
+// forms the jars prove. Returns the last constant string seen, or null.
+function constantTracker (index, state) {
+  const t = { last: null, pendingResloc: null }
+  t.visit = (op, pc, cp, code) => {
+    if (op === 0x12 || op === 0x13) { const s = ldcStringAt(cp, code, op, pc); if (s !== null) t.last = s; return true }
+    if (op === 0xb2) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (!ref) return false
+      if (ref.desc === STRING_DESC) { const v = resolveStringValue(index, { k: 'field', ...ref }, state); if (v !== null) t.last = v; return true }
+      if (isReslocDesc(ref.desc)) { t.pendingResloc = resolveReslocValue(index, { k: 'field', ...ref }, state); return true }
+      return false
+    }
+    if (op === 0xb6 || op === 0xb9) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (ref && ref.name === 'toString' && ref.desc === `()${STRING_DESC}` && t.pendingResloc) { t.last = t.pendingResloc; t.pendingResloc = null; return true }
+    }
+    return false
+  }
+  return t
+}
+
+// The finish sites of one handler body: every finishCurrentTask call with
+// the Type static read last before it, and the string guard (an accessor of
+// the ack compared by String.equals to a constant) seen since the previous
+// finish — null when the finish is unguarded.
+function finishSitesOf (index, state, info, m, payloadCls) {
+  const sites = []
+  const consts = constantTracker(index, state)
+  let lastType = null
+  let accessor = null
+  let guard = null
+  walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+    if (op === 0xb2) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (ref && ref.desc === `L${CONFIG_TASK_TYPE};`) { lastType = ref; return }
+    }
+    if (consts.visit(op, pc, cp, code)) return
+    if (op === 0xb6 || op === 0xb9) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (!ref) return
+      if (ref.owner === payloadCls && ref.desc === `()${STRING_DESC}`) { accessor = ref.name; return }
+      if (ref.owner === 'java/lang/String' && ref.name === 'equals' && accessor && consts.last !== null) { guard = { accessor, value: consts.last }; return }
+      if (ref.name === 'finishCurrentTask' && lastType) { sites.push({ type: lastType, guard }); guard = null; accessor = null; consts.last = null }
+    }
+  })
+  return sites
+}
+
+// The invokedynamic that hands `target` (owner/name/desc) to a registrar:
+// scanned over the classes whose bytes name the target's owner. Returns the
+// site `cls.method` or null — a handler nobody registers is not a handler.
+function lambdaRegistrationSiteOf (index, state, target) {
+  for (const cls of seedNamesOf(index, state)) {
+    const bytes = index.rawBytes(cls)
+    if (!bytes || !bytes.includes(target.owner) || !bytes.includes(target.name)) continue
+    const info = index.get(cls)
+    if (!info || !info.bootstrapMethods) continue
+    for (const m of info.codes) {
+      let hit = null
+      walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+        if (hit || op !== 0xba) return
+        const c = cp[code.readUInt16BE(pc + 1)]
+        const impl = c && resolveLambdaImpl(info, c.bsmIndex)
+        if (impl && impl.owner === target.owner && impl.name === target.name && impl.desc === target.desc) hit = `${cls}.${m.method}`
+      })
+      if (hit) return hit
+    }
+  }
+  return null
+}
+
+// The handler bodies of payload class P: its own (IPayloadContext)V (HF11)
+// and every registered `(LP;LIPayloadContext;)V` lambda / method-reference
+// target in the classes that name P (HF81). Each: { info, m, site }.
+function handlerBodiesOf (index, state, payloadCls) {
+  const out = []
+  const own = index.get(payloadCls)
+  const ownHandler = own && own.codes.find((c) => c.desc === `(L${IPAYLOAD_CONTEXT};)V`)
+  if (ownHandler) out.push({ info: own, m: ownHandler, cls: payloadCls, site: `${payloadCls}.${ownHandler.method}`, registration: 'own-method' })
+  for (const cls of seedNamesOf(index, state)) {
+    const bytes = index.rawBytes(cls)
+    if (!bytes || !bytes.includes(payloadCls) || !bytes.includes(IPAYLOAD_CONTEXT)) continue
+    const info = index.get(cls)
+    if (!info) continue
+    for (const m of info.codes) {
+      const mm = m.desc.match(HANDLER_2ARG_RE)
+      if (!mm || mm[1] !== payloadCls) continue
+      const registration = lambdaRegistrationSiteOf(index, state, { owner: cls, name: m.method, desc: m.desc })
+      if (!registration) continue
+      out.push({ info, m, cls, site: `${cls}.${m.method}`, registration: `invokedynamic@${registration}` })
+    }
+  }
+  return out
+}
+
+// The ack's wire body read out of its codec: `unit` (empty) or `ofMember`
+// whose encoder writes the record's fields with buffer writes this
+// responder can encode (writeUtf = VarInt length + UTF-8 — the one write
+// the jars prove). Anything else is named and refused.
+function ackBodySchemaOf (index, state, info) {
+  const clinit = info.codes.find((c) => c.method === '<clinit>')
+  if (!clinit) return { kind: 'unknown', reason: 'ack-has-body' }
+  let unit = false
+  let encoder = null
+  const indys = []
+  walkLinear(clinit.code, info.cp, (op, pc, cp, code) => {
+    if (op === 0xba) {
+      const c = cp[code.readUInt16BE(pc + 1)]
+      const impl = (c && info.bootstrapMethods) ? resolveLambdaImpl(info, c.bsmIndex) : null
+      if (impl) indys.push(impl)
+    } else if (op === 0xb8 || op === 0xb9) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (!ref || ref.owner !== STREAM_CODEC_TYPE) return
+      if (ref.name === 'unit') unit = true
+      else if (ref.name === 'ofMember' && indys.length >= 2 && !encoder) encoder = indys[indys.length - 2]
+    }
+  })
+  if (unit) return { kind: 'unit', fields: [] }
+  if (!encoder) return { kind: 'unknown', reason: 'ack-has-body' } // not unit, no member encoder to read: a body this responder cannot read
+  const encInfo = index.get(encoder.owner)
+  const enc = encInfo && encInfo.codes.find((c) => c.method === encoder.name && c.desc === encoder.desc)
+  if (!enc) return { kind: 'unknown', reason: `ack-body-unprovable:encoder:${encoder.owner}.${encoder.name}` }
+  const fields = []
+  let pendingField = null
+  let refusal = null
+  walkLinear(enc.code, encInfo.cp, (op, pc, cp, code) => {
+    if (refusal) return
+    if (op === 0xb4) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (ref && ref.owner === info.className) pendingField = ref
+      return
+    }
+    if (op === 0xb6 || op === 0xb9 || op === 0xb8 || op === 0xb7) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (!ref || ref.name === '<init>') return
+      if (ref.name === 'writeUtf' && ref.desc.startsWith(`(${STRING_DESC})`) && pendingField && pendingField.desc === STRING_DESC) {
+        fields.push({ field: pendingField.name, kind: 'utf' })
+        pendingField = null
+        return
+      }
+      refusal = `ack-body-unprovable:write:${ref.name}`
+    }
+  })
+  if (refusal) return { kind: 'unknown', reason: refusal }
+  if (fields.length === 0) return { kind: 'unknown', reason: 'ack-body-unprovable:encoder:no-field-write' }
+  return { kind: 'member', fields, encoder: `${encoder.owner}.${encoder.name}` }
+}
+
+// Constructor parameter -> record field, read out of P.<init> (aload_N then
+// putfield P.f). Returns [fieldName per parameter index] or null.
+function ctorFieldsOf (info, ctorDesc) {
+  const ctor = info.codes.find((c) => c.method === '<init>' && c.desc === ctorDesc)
+  if (!ctor) return null
+  const byParam = []
+  let lastLocal = null
+  walkLinear(ctor.code, info.cp, (op, pc, cp, code) => {
+    if (op >= 0x2a && op <= 0x2d) lastLocal = op - 0x2a
+    else if (op === 0x19) lastLocal = code[pc + 1]
+    else if (op === 0xb5) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (ref && ref.owner === info.className && lastLocal !== null && lastLocal > 0) byParam[lastLocal - 1] = ref.name
+    }
+  })
+  return byParam
+}
+
+// A record accessor `name()` -> the field it returns (aload_0 getfield).
+function accessorFieldOf (info, name) {
+  const m = info.codes.find((c) => c.method === name && c.desc === `()${STRING_DESC}`)
+  if (!m) return null
+  let field = null
+  walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+    if (op === 0xb4 && field === null) { const ref = cpRef(cp, code.readUInt16BE(pc + 1)); if (ref && ref.owner === info.className) field = ref.name }
+  })
+  return field
+}
+
+// The client's reply at ITS handler for the trigger: `new Ack(<constants>)`
+// handed to IPayloadContext.reply. Returns { values: {field: string}, site }
+// when every constructor argument is a jar constant, else { reason }.
+function replyValuesOf (index, state, triggerCls, ackInfo) {
+  const handlers = handlerBodiesOf(index, state, triggerCls)
+  if (handlers.length === 0) return { reason: 'ack-reply-unproven:no-trigger-handler' }
+  let found = null
+  for (const h of handlers) {
+    const consts = constantTracker(index, state)
+    const args = []
+    let constructing = false
+    let built = null
+    let replied = null
+    walkLinear(h.m.code, h.info.cp, (op, pc, cp, code) => {
+      if (replied) return
+      if (op === 0xbb) { const c = cpClassName(cp, code.readUInt16BE(pc + 1)); if (c === ackInfo.className) { constructing = true; args.length = 0; consts.last = null } return }
+      if (consts.visit(op, pc, cp, code)) { if (constructing && consts.last !== null) { args.push(consts.last); consts.last = null } return }
+      if (op === 0xb7) {
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (constructing && ref && ref.owner === ackInfo.className && ref.name === '<init>') {
+          const n = argSlots(ref.desc).length
+          built = { desc: ref.desc, args: args.slice(), slots: n }
+          constructing = false
+        }
+        return
+      }
+      if ((op === 0xb9 || op === 0xb6) && built) {
+        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+        if (ref && ref.owner === IPAYLOAD_CONTEXT && ref.name === 'reply') replied = built
+      }
+    })
+    if (replied) { found = { ...replied, site: h.site, registration: h.registration }; break }
+  }
+  if (!found) return { reason: 'ack-reply-unproven:no-reply-site' }
+  const byParam = ctorFieldsOf(ackInfo, found.desc)
+  if (!byParam || byParam.length !== found.slots) return { reason: 'ack-body-unprovable:ctor-fields-unread' }
+  if (found.args.length !== found.slots) return { reason: `ack-body-unprovable:field:${byParam[found.args.length] || '?'}` }
+  const values = {}
+  byParam.forEach((f, i) => { values[f] = found.args[i] })
+  return { values, site: found.site, registration: found.registration }
+}
+
 function deriveAckContracts (index, state, collect = null) {
   const contracts = []
+  const refuse = (row) => { if (collect && Array.isArray(collect.unprovable)) collect.unprovable.push(row) }
+  const seenAck = new Set()
   for (const cls of seedNamesOf(index, state)) {
     const bytes = index.rawBytes(cls)
     if (!bytes || !bytes.includes('finishCurrentTask')) continue
     const info = index.get(cls)
     if (!info) continue
-    const handler = info.codes.find((c) => c.desc === `(L${IPAYLOAD_CONTEXT};)V`)
-    if (!handler) continue
-    // proof 1: the handler finishes a configuration task
-    let taskOwner = null
-    let lastTypeField = null
-    walkLinear(handler.code, info.cp, (op, pc, cp, code) => {
-      if (op === 0xb2) {
-        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-        if (ref && ref.desc === `L${CONFIG_TASK_TYPE};`) lastTypeField = ref
-      } else if (op === 0xb9 || op === 0xb6) {
-        const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-        if (ref && ref.name === 'finishCurrentTask' && lastTypeField) taskOwner = lastTypeField.owner
-      }
-    })
-    if (!taskOwner) continue
-    // proof 2: the ack payload's codec is unit (empty wire body)
-    const clinit = info.codes.find((c) => c.method === '<clinit>')
-    let unitCodec = false
-    if (clinit) {
-      walkLinear(clinit.code, info.cp, (op, pc, cp, code) => {
-        if (op === 0xb8 || op === 0xb9) {
-          const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-          if (ref && ref.owner === STREAM_CODEC_TYPE && ref.name === 'unit') unitCodec = true
+    // the ack payload classes whose finish handler lives in `cls`: its own
+    // (HF11) or the P of a registered (LP;LIPayloadContext;)V body (HF81)
+    const ackClasses = new Set()
+    if (info.codes.some((c) => c.desc === `(L${IPAYLOAD_CONTEXT};)V`)) ackClasses.add(cls)
+    for (const m of info.codes) { const mm = m.desc.match(HANDLER_2ARG_RE); if (mm && index.get(mm[1])) ackClasses.add(mm[1]) }
+    for (const ackCls of ackClasses) {
+      if (seenAck.has(ackCls)) continue
+      const ackInfo = index.get(ackCls)
+      const handlers = handlerBodiesOf(index, state, ackCls).filter((h) => h.cls === cls)
+      // proof 1: a registered handler of the ack finishes a configuration task
+      const sites = []
+      for (const h of handlers) for (const s of finishSitesOf(index, state, h.info, h.m, ackCls)) sites.push({ ...s, handler: h })
+      if (sites.length === 0) continue
+      seenAck.add(ackCls)
+      // proof 2: the ack's wire body — unit, or fields this responder encodes
+      const schema = ackBodySchemaOf(index, state, ackInfo)
+      const ackId = classTypeId(index, state, ackCls)
+      for (const site of sites) {
+        const taskOwner = site.type.owner
+        // proof 3: the task's run() constructs the triggering payload
+        const taskInfo = index.get(taskOwner)
+        if (!taskInfo) continue
+        const run = taskInfo.codes.find((c) => c.method === 'run' && c.desc === '(Ljava/util/function/Consumer;)V')
+        if (!run) continue
+        const constructed = []
+        walkLinear(run.code, taskInfo.cp, (op, pc, cp, code) => {
+          if (op === 0xbb) {
+            const c = cpClassName(cp, code.readUInt16BE(pc + 1))
+            if (c && c !== ackCls && index.get(c)) constructed.push(c)
+          }
+        })
+        for (const triggerCls of constructed) {
+          const triggerId = classTypeId(index, state, triggerCls)
+          if (!triggerId || triggerId === ackId) continue
+          const base = { trigger: triggerId, ack: ackId, task: taskOwner, source: site.handler.cls }
+          if (!ackId) { refuse({ ...base, reason: 'ack-id-unresolved' }); continue }
+          if (schema.kind === 'unknown') { refuse({ ...base, reason: schema.reason }); continue }
+          if (schema.kind === 'unit') {
+            if (site.handler.registration === 'own-method') { contracts.push(base); continue }
+            contracts.push({ ...base, proof: { handler: site.handler.site, registration: site.handler.registration, finish: site.guard ? `guard:${site.guard.accessor}` : 'unguarded', codec: 'unit' } })
+            continue
+          }
+          // a bodied ack: every field a jar constant at the client's reply,
+          // and the finisher's guard met by that reply
+          const reply = replyValuesOf(index, state, triggerCls, ackInfo)
+          if (reply.reason) { refuse({ ...base, reason: reply.reason }); continue }
+          const body = []
+          let missing = null
+          for (const f of schema.fields) {
+            if (typeof reply.values[f.field] !== 'string') { missing = f.field; break }
+            body.push({ field: f.field, kind: f.kind, value: reply.values[f.field] })
+          }
+          if (missing) { refuse({ ...base, reason: `ack-body-unprovable:field:${missing}` }); continue }
+          if (site.guard) {
+            const guardField = accessorFieldOf(ackInfo, site.guard.accessor) || site.guard.accessor
+            if (reply.values[guardField] !== site.guard.value) { refuse({ ...base, reason: `ack-guard-mismatch:${guardField}` }); continue }
+          }
+          contracts.push({ ...base, body, proof: { handler: site.handler.site, registration: site.handler.registration, finish: site.guard ? `guard:${site.guard.accessor}=${site.guard.value}` : 'unguarded', codec: `ofMember:${schema.encoder}`, reply: `${reply.site} (${reply.registration})` } })
         }
-      })
-    }
-    const ackId = classTypeId(index, state, cls)
-    // proof 3: the task's run() constructs the triggering payload
-    const taskInfo = index.get(taskOwner)
-    if (!taskInfo) continue
-    const run = taskInfo.codes.find((c) => c.method === 'run' && c.desc === '(Ljava/util/function/Consumer;)V')
-    if (!run) continue
-    const constructed = []
-    walkLinear(run.code, taskInfo.cp, (op, pc, cp, code) => {
-      if (op === 0xbb) {
-        const c = cpClassName(cp, code.readUInt16BE(pc + 1))
-        if (c && c !== cls && index.get(c)) constructed.push(c)
       }
-    })
-    for (const triggerCls of constructed) {
-      const triggerId = classTypeId(index, state, triggerCls)
-      if (!triggerId || triggerId === ackId) continue
-      if (!unitCodec || !ackId) {
-        // HF55: the task is real (proof 1 + 3) but its ack is not an empty
-        // body (or its id is unresolved) — refused, and SAID so.
-        if (collect && Array.isArray(collect.unprovable)) {
-          collect.unprovable.push({ trigger: triggerId, ack: ackId, task: taskOwner, source: cls, reason: !unitCodec ? 'ack-has-body' : 'ack-id-unresolved' })
-        }
-        continue
-      }
-      contracts.push({ trigger: triggerId, ack: ackId, task: taskOwner, source: cls })
     }
   }
   return contracts

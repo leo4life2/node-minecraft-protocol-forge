@@ -264,6 +264,19 @@ function readString (buf, offset) {
   return { value: buf.toString('utf8', start, start + len.value), size: len.size + len.value }
 }
 
+// HF81: a bodied ack — the derived body rows {field, kind, value} the
+// contract carries (every value a jar constant, proven at the client's reply
+// site and against the finisher's guard). One wire kind the jars prove:
+// 'utf' (FriendlyByteBuf.writeUtf = VarInt length + UTF-8). A row of any
+// other kind is not a contract this responder can answer (validAckBody).
+const ACK_BODY_KINDS = new Set(['utf'])
+function validAckBody (body) {
+  return Array.isArray(body) && body.every((f) => f && typeof f.field === 'string' && ACK_BODY_KINDS.has(f.kind) && typeof f.value === 'string')
+}
+function encodeAckBody (body) {
+  if (!Array.isArray(body) || body.length === 0) return Buffer.alloc(0)
+  return Buffer.concat(body.map((f) => writeString(f.value)))
+}
 function writeString (str) {
   const bytes = Buffer.from(str, 'utf8')
   return Buffer.concat([writeVarInt(bytes.length), bytes])
@@ -592,7 +605,7 @@ function encodeKnownDataMapsReply (maps) {
  *     // is truthful tolerance, never a claim; a server-side mod's
  *     // unconditional send (checkPacket, the HF15 placement-abort receipt)
  *     // becomes lawful instead of killing the placement.
- *   ackContracts: Array<{trigger: string, ack: string}> | undefined,
+ *   ackContracts: Array<{trigger: string, ack: string, body?: Array<{field, kind: 'utf', value}>}> | undefined, // HF81: body = the derived reply (absent = the empty ack)
  *     // HF11: jar-proven blocking-task rows — on receiving `trigger` during
  *     // configuration, send `ack` with an EMPTY body (the derivation proved
  *     // the ack's codec is StreamCodec.unit and its handler is what calls
@@ -657,9 +670,14 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   // HF55-R MED-2: the host key a remembered (contract-cache) row was proven
   // for — the refusal receipt names it.
   const contractHosts = new Map()
+  // HF81: the derived reply body of a bodied contract (absent = the empty
+  // ack); a row whose body this responder cannot encode is not a contract.
+  const contractBodies = new Map()
+  const bodyOf = (row) => (Array.isArray(row.body) && row.body.length ? row.body : null)
   for (const row of options.ackContracts || []) {
-    if (row && typeof row.trigger === 'string' && typeof row.ack === 'string') {
+    if (row && typeof row.trigger === 'string' && typeof row.ack === 'string' && (bodyOf(row) === null || validAckBody(row.body))) {
       ackContracts.set(row.trigger, row.ack)
+      if (bodyOf(row)) contractBodies.set(row.trigger, row.body)
       if (typeof row.source === 'string' && row.source) contractSources.set(row.trigger, row.source)
       if (typeof row.host === 'string' && row.host) contractHosts.set(row.trigger, row.host)
     }
@@ -851,6 +869,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     ackContracts.delete(channel)
     contractSources.delete(channel)
     contractHosts.delete(channel)
+    contractBodies.delete(channel)
     const row = { trigger: channel, ack, host, reason: 'ack-not-declared' }
     state.cacheRefused.push(row)
     debug(`neoforge config: the contract remembered for ${host || 'this host'} on ${channel} names ack ${ack}, a channel this server did not declare — the remembered row is refused, proving afresh`)
@@ -860,10 +879,13 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
   const answerProvenTrigger = (channel, bytes) => {
     const ack = ackContracts.get(channel)
     const source = contractSources.get(channel) || null
-    debug(`neoforge config: blocking-task trigger ${channel} (${bytes} bytes) — sending its ${source ? source + '-proven' : 'jar-proven'} empty ack ${ack}`)
+    const body = contractBodies.get(channel) || null
+    const data = encodeAckBody(body)
+    debug(`neoforge config: blocking-task trigger ${channel} (${bytes} bytes) — sending its ${source ? source + '-proven' : 'jar-proven'} ${body ? `${data.length}-byte ack ${ack} (${body.map((f) => `${f.field}=${JSON.stringify(f.value)}`).join(', ')} — every value a constant of the mod's own code)` : `empty ack ${ack}`}`)
     const row = source ? { trigger: channel, ack, source } : { trigger: channel, ack }
+    if (body) row.bodyBytes = data.length // HF81: a bodied ack says its size; the empty row stays as HF11/HF55 pinned it
     state.acked.push(row)
-    send(ack, Buffer.alloc(0))
+    send(ack, data)
     client.emit('neoForgeConfigAck', { ...row })
   }
   // HF55 — the parked read: every non-keep-alive configuration packet bumps
@@ -898,6 +920,13 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     return { stop: () => { clearInterval(timer); hold.until = Date.now() } }
   }
   const pendingByNamespace = new Map()
+  // HF81: the refusal said by its reason — a body the codec hides
+  // (ack-has-body, HF55) or a shape the derivation read and could not prove
+  // (a write it cannot encode, a field that is no constant, no reply site,
+  // a guard the reply would not meet) — never a guess either way.
+  const refusedAckWords = (refused) => refused.reason === 'ack-has-body'
+    ? `the jar proves a blocking task on this channel whose ack ${refused.ack || '(unresolved)'} is not an empty body (${refused.reason}) — a reply this client cannot invent`
+    : `the jar proves a blocking task on this channel whose ack ${refused.ack || '(unresolved)'} carries a reply this client could not derive from the mod's code (${refused.reason}) — nothing is guessed`
   const settleProof = (channel, result, hold) => {
     hold.stop()
     const receipt = state.proofs[channel]
@@ -915,9 +944,11 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
       // corroboration at the wire boundary: an ack the server never declared
       // is not an ack this server can finish a task on — refused, named.
       if (declared && !declared.has(row.ack)) { uncorroborated.push(row.ack); continue }
+      if (bodyOf(row) !== null && !validAckBody(row.body)) continue // HF81: a body of a kind this responder cannot encode is no contract
       if (!ackContracts.has(row.trigger)) {
         ackContracts.set(row.trigger, row.ack)
         contractSources.set(row.trigger, receipt.source || 'proven')
+        if (bodyOf(row)) contractBodies.set(row.trigger, row.body)
       }
     }
     if (uncorroborated.length > 0) receipt.uncorroborated = uncorroborated
@@ -931,7 +962,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     if (refused) receipt.refused = { ack: refused.ack || null, reason: refused.reason || 'refused' }
     receipt.status = refused ? 'unprovable' : (rows.length > 0 ? 'no-contract-for-channel' : 'unprovable')
     receipt.reason = (result && typeof result.reason === 'string' && result.reason) ||
-      (refused ? `the jar proves a blocking task on this channel whose ack ${refused.ack || '(unresolved)'} is not an empty body (${refused.reason}) — a reply this client cannot invent` : null) ||
+      (refused ? refusedAckWords(refused) : null) ||
       (uncorroborated.length > 0 ? `the proven ack ${uncorroborated.join(', ')} is not a channel this server declared` : null) ||
       'the jar proves no blocking-task contract for this channel'
     debug(`neoforge config: no proven contract for ${channel} (${receipt.status}: ${receipt.reason}) — watching whether the phase moved on`)
