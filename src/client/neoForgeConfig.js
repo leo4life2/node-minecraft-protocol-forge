@@ -822,6 +822,20 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
       : null
   }
   client.neoForgeConfig = state
+  // HF81 r2 — ONE answerer per configuration-task trigger on this wire: the
+  // responder publishes which triggers its own answer path covers (a
+  // contract held — jar-derived, proven this phase or remembered —, an
+  // answer already sent, a proof in flight or settled, a content-mod sync
+  // contract, a consume-only channel the jar says is never answered), so a
+  // static gate table riding the same client (the fabric lib's config gates
+  // install on every wire, keyed by channel name) yields instead of sending
+  // a second ack (the field: two acks per trigger -> the server's
+  // 'Unexpected request for task finish' -> the kick). Read synchronously on
+  // the named event: node-minecraft-protocol emits 'packet' (this
+  // responder's seat) before 'custom_payload' (the gate's).
+  client.minepalConfigTaskOwned = (channel) => typeof channel === 'string' && (
+    ackContracts.has(channel) || !!state.proofs[channel] || state.acked.some((r) => r.trigger === channel) ||
+    contractByChannel.has(channel) || consumeOnlyChannels.has(channel))
   if (learnedChannelIds.size > 0) {
     debug(`neoforge config: ${learnedChannelIds.size} channel(s) ride the claim as LEARNED from this server's own negotiation (not jar-derived): ${[...learnedChannelIds].join(', ')}`)
     // play-phase payloads on learned channels: counted and dropped (the
