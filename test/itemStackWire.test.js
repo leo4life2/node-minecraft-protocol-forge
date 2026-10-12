@@ -256,3 +256,85 @@ describe('HF49 - ItemStack count REPLACE shape (a widened count in place of the 
     assert.strictEqual(r.abstain.reason, 'field-mismatch')
   })
 })
+
+// HF92 — identical mixins collapse to one before the pairing law. Ground
+// truth: a 428-mod Forge 1.20.1 (Connector) pack whose mods folder holds
+// stacc-api 1.7.0 standalone AND nested inside numismatic-overhaul
+// (META-INF/jars/stacc-api-1.7.0.jar; the DesyncFixin class bytes are
+// identical, sha256 equal) — the loader loads ONE copy, the HF35 walk saw
+// two and abstained (multiple-item-wire-mixins), the vanilla slot went out
+// and the server kicked at window_click ("readerIndex(14) + length(4)
+// exceeds writerIndex(15)"). The wrapper jar is built here from the
+// standalone fixture (the nesting is the only difference).
+const { buildJar } = require('./helpers/synthJar')
+describe('HF92 - identical item-wire mixins collapse to one (a jar and its nested copy)', function () {
+  const sha = (o) => require('crypto').createHash('sha256').update(JSON.stringify(o)).digest('hex')
+  const wrapperJar = (dir, name, inner, innerName = 'stacc-api-1.7.0.jar') => {
+    const buf = buildJar([
+      { name: 'fabric.mod.json', data: Buffer.from(JSON.stringify({ schemaVersion: 1, id: 'wrapper', version: '1.0.0', jars: [{ file: `META-INF/jars/${innerName}` }] })) },
+      { name: `META-INF/jars/${innerName}`, data: fs.readFileSync(inner) }
+    ])
+    const p = path.join(dir, name); fs.writeFileSync(p, buf); return p
+  }
+  it('d1: the standalone jar + a wrapper nesting the same jar derive the standalone spec (RED on the base: the multiplicity abstain); the receipt names the duplicate', () => {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf92-two-'))
+    fs.copyFileSync(STACC, path.join(dir, 'stacc-api-1.7.0.jar'))
+    wrapperJar(dir, 'wrapper-0.2.19.jar', STACC)
+    const r = scanItemStackWireExtensions([dir])
+    assert.ok(r.ext, JSON.stringify(r.abstain))
+    const alone = scanItemStackWireExtensions([STACC])
+    const { duplicates, ...mixin } = r.ext.mixin
+    assert.deepStrictEqual({ ...r.ext, mixin }, alone.ext, 'the derived spec equals the standalone fixture\'s spec')
+    assert.deepStrictEqual(duplicates, [{ jar: 'wrapper-0.2.19.jar', nested: 'META-INF/jars/stacc-api-1.7.0.jar' }])
+    assert.deepStrictEqual(r.duplicates, ['net/devtech/stacc/mixin/DesyncFixin in wrapper-0.2.19.jar (nested META-INF/jars/stacc-api-1.7.0.jar) = stacc-api-1.7.0.jar'])
+    assert.strictEqual(r.jars, 2)
+    assert.deepStrictEqual(r.mixins.map((m) => [m.jar, m.nested, m.duplicate]).sort(), [['stacc-api-1.7.0.jar', null, false], ['wrapper-0.2.19.jar', 'META-INF/jars/stacc-api-1.7.0.jar', true]])
+    // the install log names the duplicate; the compiled wire is the standalone one (the 19-byte pickup window_click the server reads)
+    const EventEmitter = require('events'); const mc = require('minecraft-protocol')
+    const client = new EventEmitter(); client.version = '1.20.1'; client.state = 'play'
+    client.serializer = mc.createSerializer({ state: 'play', isServer: false, version: '1.20.1' }); client.deserializer = mc.createDeserializer({ state: 'play', isServer: false, version: '1.20.1' })
+    const seen = []; client.write = (name, params) => seen.push({ name, params }); const logs = []
+    assert.strictEqual(installItemStackWireExtension(client, r.ext, { log: (m) => logs.push(m) }).installed, true)
+    assert.ok(logs.some((l) => /derived from net\/devtech\/stacc\/mixin\/DesyncFixin in stacc-api-1\.7\.0\.jar \(duplicate in wrapper-0\.2\.19\.jar \(nested META-INF\/jars\/stacc-api-1\.7\.0\.jar\)\)/.test(l)), logs.join('\n'))
+    client.write('window_click', { windowId: 0, stateId: 1, slot: 36, mouseButton: 0, mode: 0, changedSlots: [{ location: 36, item: { present: false } }], cursorItem: { present: true, itemId: 300, itemCount: 1 } })
+    const bytes = client.serializer.proto.createPacketBuffer('packet', seen[0])
+    assert.strictEqual(bytes.toString('hex'), '0b0001002400000100240001ac02010000000100')
+    assert.strictEqual(bytes.length - 1, 19, 'the vanilla body is 15 (the field kick: readerIndex(14) + length(4) exceeds writerIndex(15)); the derived one carries the i32')
+  })
+  it('d1 (nested only): the wrapper alone derives too, naming the nested copy as the source (no duplicates key)', () => {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf92-nested-'))
+    wrapperJar(dir, 'wrapper-0.2.19.jar', STACC)
+    const r = scanItemStackWireExtensions([dir])
+    assert.ok(r.ext, JSON.stringify(r.abstain))
+    assert.deepStrictEqual(r.ext.mixin, { ...scanItemStackWireExtensions([STACC]).ext.mixin, jar: 'wrapper-0.2.19.jar', nested: 'META-INF/jars/stacc-api-1.7.0.jar' })
+    assert.deepStrictEqual(r.duplicates, [])
+  })
+  it('d2 CONTROL: two DIFFERENT injections still abstain multiple-item-wire-mixins by name — the same class name with different bytes (a bent copy), and two different mods', () => {
+    const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf92-bent-'))
+    fs.copyFileSync(STACC, path.join(dir, 'stacc-api-1.7.0.jar'))
+    const { buf } = mutateJar(fs.readFileSync(STACC), { rewrite: (p, s) => (/DesyncFixin\.class$/.test(p) && s === 'readInt' ? 'readShort' : (/DesyncFixin\.class$/.test(p) && s === '()I' ? '()S' : undefined)) })
+    const bentDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf92-bentjar-')); const bent = path.join(bentDir, 'bent.jar'); fs.writeFileSync(bent, buf)
+    wrapperJar(dir, 'wrapper-bent.jar', bent)
+    const r = scanItemStackWireExtensions([dir])
+    assert.strictEqual(r.ext, null)
+    assert.strictEqual(r.abstain.reason, 'multiple-item-wire-mixins')
+    assert.deepStrictEqual(r.abstain.mixins.slice().sort(), ['net/devtech/stacc/mixin/DesyncFixin in stacc-api-1.7.0.jar', 'net/devtech/stacc/mixin/DesyncFixin in stacc-api-1.7.0.jar', 'net/devtech/stacc/mixin/DesyncFixin in wrapper-bent.jar (nested META-INF/jars/stacc-api-1.7.0.jar)', 'net/devtech/stacc/mixin/DesyncFixin in wrapper-bent.jar (nested META-INF/jars/stacc-api-1.7.0.jar)'])
+    assert.deepStrictEqual(r.duplicates, [])
+    const two = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf92-twomods-'))
+    fs.copyFileSync(BIGGER, path.join(two, 'a.jar')); fs.copyFileSync(STACC, path.join(two, 'b.jar'))
+    assert.strictEqual(scanItemStackWireExtensions([two]).abstain.reason, 'multiple-item-wire-mixins')
+  })
+  it('d3: the existing fixtures derive byte-identical specs (sha256 of the derived JSON pinned on the base e956c914)', () => {
+    assert.strictEqual(sha(scanItemStackWireExtensions([STACC]).ext), '0c3a300cb196228fb9e2b30c2318b038ffbbbdb982e9d0424f8b88b1810bb3f0')
+    assert.strictEqual(sha(scanItemStackWireExtensions([BIGGER]).ext), 'aeb5a333829def26a185b1cd12f527475bb8e84727cba6e8f4c2807d90bc76d3')
+  })
+  it('the vanilla slot-bearing serverbound packets are read from the protocol JSON per version (the refusal seat\'s list; 1.20.1 and 1.21.1 both: window_click + set_creative_slot)', () => {
+    const { vanillaSlotBearingPackets } = require('../src/client/itemStackWireInstall')
+    for (const v of ['1.20.1', '1.21.1']) {
+      const p = vanillaSlotBearingPackets(v)
+      assert.deepStrictEqual([...p.toServer].sort(), ['set_creative_slot', 'window_click'], v)
+      assert.ok(p.toClient.has('window_items') && p.toClient.has('set_slot'), v)
+    }
+    assert.strictEqual(vanillaSlotBearingPackets('0.0.0'), null)
+  })
+})

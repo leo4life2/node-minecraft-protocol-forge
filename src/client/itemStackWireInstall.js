@@ -162,8 +162,12 @@ function installItemStackWireExtension (client, ext, { log = debug } = {}) {
     const what = ext.shape === 'replace'
       ? `slot ${ext.fields[0].name} ${ext.replaces} -> ${ext.fields[0].type} (shape=replace)`
       : `slot += ${ext.fields.map((f) => `${f.type}(${f.source})`).join(',')} ${ext.anchor} (shape=append)`
+    // HF92: the collapsed copies are named (the same class in another jar / nested) so the receipt is true to the folder
+    const dups = Array.isArray(ext.mixin?.duplicates) && ext.mixin.duplicates.length
+      ? ` (duplicate in ${ext.mixin.duplicates.map((d) => `${d.jar}${d.nested ? ` (nested ${d.nested})` : ''}`).join(', ')})`
+      : ''
     log(`[item-wire] play protocol extended: ${what} ` +
-      `(derived from ${ext.mixin?.className} in ${ext.mixin?.jar}${ext.mixin?.nested ? ` nested ${ext.mixin.nested}` : ''})`)
+      `(derived from ${ext.mixin?.className} in ${ext.mixin?.jar}${ext.mixin?.nested ? ` nested ${ext.mixin.nested}` : ''}${dups})`)
   }
   client.on('state', swap)
   swap()
@@ -182,4 +186,21 @@ function installItemStackWireExtension (client, ext, { log = debug } = {}) {
   return receipt
 }
 
-module.exports = { installItemStackWireExtension, compileFor, fillOutgoing, reconcileIncoming, slotBearingPackets }
+// HF92: the packet names whose fields carry a slot, per direction, read from
+// minecraft-data's OWN protocol for `version` (the vanilla slot type; no
+// extension compiled) — the names a caller refuses to send while the item
+// wire is underived. null when the version has no slot type.
+const vanillaSlotPacketsCache = new Map()
+function vanillaSlotBearingPackets (version) {
+  if (vanillaSlotPacketsCache.has(version)) return vanillaSlotPacketsCache.get(version)
+  let out = null
+  try {
+    const mcData = require('minecraft-data')(version)
+    const slotName = mcData.protocol.types.slot ? 'slot' : (mcData.protocol.types.Slot ? 'Slot' : null)
+    if (slotName) out = { slotName, toServer: slotBearingPackets(mcData.protocol, 'toServer', slotName), toClient: slotBearingPackets(mcData.protocol, 'toClient', slotName) }
+  } catch (err) { debug(`[item-wire] slot-bearing packets for ${version} unreadable (${err.message})`) }
+  vanillaSlotPacketsCache.set(version, out)
+  return out
+}
+
+module.exports = { installItemStackWireExtension, compileFor, fillOutgoing, reconcileIncoming, slotBearingPackets, vanillaSlotBearingPackets }

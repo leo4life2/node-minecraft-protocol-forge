@@ -2,6 +2,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, readAnnotationsAttr, decodeInstructions } = require('./jarAnalysis')
 const { nestedJarEntriesOf, MAX_NESTED_DEPTH } = require('./nestedJars') // HF53 rider: the one nested-jar rule
@@ -52,6 +53,17 @@ const { nestedJarEntriesOf, MAX_NESTED_DEPTH } = require('./nestedJars') // HF53
 // 'replace', replaces: 'i8', fields: [{ i32, source count }] }. A handler with
 // more than one primitive, a redirect on a non-count primitive, a read
 // redirect that still reads the buffer, or an unpaired half = named abstain.
+//
+// HF92 — IDENTICAL mixins collapse to one before the pairing law. A mods
+// folder may hold the same mixin class twice: a library jar standing alone
+// AND the same jar nested inside a mod that bundles it (the loader itself
+// loads ONE copy per mod id). Two byte-identical classes (same class name,
+// same class bytes) are one injection on the wire, never two — they count
+// once, the representative is the standalone copy when there is one, and
+// the collapsed copies are named on the receipt (which jar, nested where) so
+// the install says "derived from <jar> (duplicate in <jar> (nested ...))".
+// Two classes of the same name with DIFFERENT bytes are two injections whose
+// order on the wire is not derivable -> the multiplicity abstain stays.
 
 const MIXIN_ANN = 'Lorg/spongepowered/asm/mixin/Mixin;'
 const INJECTOR_RE = /^L(?:org\/spongepowered\/asm\/mixin\/injection|com\/llamalad7\/mixinextras\/injector(?:\/v1)?)\/([A-Za-z]+);$/
@@ -199,7 +211,7 @@ function scanClass (parsed, aliases, source) {
   const mixin = annsAt(parsed.classInvisibleAnnotationsAt, parsed.classAnnotationsAt).find((a) => a.type === MIXIN_ANN)
   if (!mixin) return null
   const targets = [].concat(mixin.elements.value || [], mixin.elements.targets || []).filter((t) => typeof t === 'string')
-  const found = { writes: [], reads: [], className: parsed.className, targets, source }
+  const found = { writes: [], reads: [], className: parsed.className, targets, source, classSha: crypto.createHash('sha256').update(parsed.bytes).digest('hex') }
   for (const m of parsed.methods) {
     for (const a of annsAt(m.annotationsAt, m.invisibleAnnotationsAt)) {
       const inj = String(a.type).match(INJECTOR_RE)
@@ -311,15 +323,47 @@ function deriveReplaceSpec (writes, reads, abstain) {
   }
 }
 
-// paths: mods folders and/or jar files. Returns { ext, abstain, jars, mixins }.
+// HF92: byte-identical mixin classes (name + class sha) are ONE injection.
+// Returns the representatives (standalone copy preferred, else the first
+// seen) and the collapsed copies, each naming the representative it equals.
+function collapseIdenticalMixins (mixins) {
+  const groups = new Map()
+  for (const m of mixins) {
+    const key = `${m.className}|${m.classSha}`
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(m)
+  }
+  const kept = []; const duplicates = []
+  for (const rows of groups.values()) {
+    const rep = rows.find((r) => !r.source.nested) || rows[0]
+    kept.push(rep)
+    for (const r of rows) if (r !== rep) duplicates.push({ className: r.className, jar: path.basename(r.source.jarPath), nested: r.source.nested || null, of: { jar: path.basename(rep.source.jarPath), nested: rep.source.nested || null } })
+  }
+  // the walk order is kept (a folder's order, then nested) so abstain rows read the same as before
+  kept.sort((a, b) => mixins.indexOf(a) - mixins.indexOf(b))
+  return { kept, duplicates }
+}
+
+// paths: mods folders and/or jar files. Returns { ext, abstain, jars, mixins, duplicates }.
 function scanItemStackWireExtensions (paths) {
   const jars = listJars(paths)
   const mixins = []
   for (const jarPath of jars) {
     try { scanJar(readJar(jarPath), { jarPath }, mixins, 0) } catch (err) { debug(`item-wire scan: unreadable jar ${jarPath} (${err.message})`) }
   }
-  const spec = deriveSpec(mixins)
-  return { ...spec, jars: jars.length, mixins: mixins.map((m) => ({ className: m.className, jar: path.basename(m.source.jarPath), nested: m.source.nested || null, writes: m.writes.length, reads: m.reads.length })) }
+  const { kept, duplicates } = collapseIdenticalMixins(mixins)
+  const spec = deriveSpec(kept)
+  if (spec.ext && duplicates.length) {
+    // the receipt on the spec names the copies collapsed into ITS mixin (never added when there are none: the spec stays byte-identical)
+    const mine = duplicates.filter((d) => d.className === spec.ext.mixin.className && d.of.jar === spec.ext.mixin.jar && d.of.nested === spec.ext.mixin.nested)
+    if (mine.length) spec.ext.mixin.duplicates = mine.map((d) => ({ jar: d.jar, nested: d.nested }))
+  }
+  return {
+    ...spec,
+    jars: jars.length,
+    mixins: mixins.map((m) => ({ className: m.className, jar: path.basename(m.source.jarPath), nested: m.source.nested || null, writes: m.writes.length, reads: m.reads.length, duplicate: !kept.includes(m) })),
+    duplicates: duplicates.map((d) => `${d.className} in ${d.jar}${d.nested ? ` (nested ${d.nested})` : ''} = ${d.of.jar}${d.of.nested ? ` (nested ${d.of.nested})` : ''}`)
+  }
 }
 
 // The vanilla `slot` protodef type with the extension spliced in at its
@@ -361,4 +405,4 @@ function extendSlotType (slotType, ext) {
   return visit(clone) ? clone : null
 }
 
-module.exports = { scanItemStackWireExtensions, extendSlotType, WRITE_PRIMS, READ_PRIMS }
+module.exports = { scanItemStackWireExtensions, collapseIdenticalMixins, extendSlotType, WRITE_PRIMS, READ_PRIMS }
