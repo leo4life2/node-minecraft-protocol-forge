@@ -46,6 +46,7 @@
 
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const debug = require('debug')('minecraft-protocol-forge')
 const { zipCentralEntries, zipEntryData, parseClassFile, walkBytecode, resolveLambdaImpl, cpUtf8, cpRef } = require('./jarAnalysis')
 const { NESTED_JAR_RE, forEachNestedJar } = require('./nestedJars')
@@ -238,9 +239,249 @@ function newFacts () {
     helperProof: new Map(), // Rider-2: 'owner.name' -> {className, method, returnType, chain} for a resolved id helper
     nsOwners: [], // HF69a: {jarPath, chain, by, className?} jars that own the namespace
     jarHints: new Set(), // HF69a: top-level jars the strict pass saw the namespace in (mods.toml or class bytes)
-    abstains: [] // HF69a: named reasons a derivation stopped, for the receipt
+    abstains: [], // HF69a: named reasons a derivation stopped, for the receipt
+    bufs: new Map() // HF93: jar bytes read for THIS assessment (jarPath + nested chain -> { buf, entries }), so a nested jar inflates once per assessment
   }
 }
+
+// ---------------------------------------------------------------------------
+// HF93: THE PER-JAR DIGEST. The field (f27): a 428-mod pack walked INLINE on
+// the login packet turn - 32 s with the loop held - and walked again for
+// every further channel. The walk's cost is inflating every class of every
+// jar (nested jars included) to ask two substring questions per channel,
+// and every channel's answers are spelled by the same bytes. So a jar is
+// read ONCE per content sha1 into a channel-independent digest - per class,
+// the ids of the maximal runs of needle-alphabet characters in its
+// constant-pool strings - and each channel asks the digest. A jar nested in
+// another is digested inside its parent's digest (the parent's sha1 covers
+// its bytes: the nested trail IS the chain). The store keeps `slots`
+// digests, least recently used out first; the embedder passes its own
+// per-jar slot count (the hf73b number) through configureJarDigestCache,
+// and the default mirrors that number - never a new one. In-process only:
+// across launches the embedder's verdict store (exportLoginAssessments)
+// already carries every channel's answer, and a digest is an INPUT index
+// sized like the pack, not a verdict.
+//
+// Exactness: `data.includes(needle)` over raw class bytes is answered as
+// "a constant-pool string of the class carries a run that includes the
+// needle". The two agree wherever the needle is spelled by the alphabet
+// below and lives in a constant - a channel id, a mod id, a class name:
+// every site the derivation reads. A needle the alphabet cannot spell takes
+// the raw walk (indexJar) exactly as before. Pinned byte-for-byte against
+// the raw walk on the fixtures (hf93 m4).
+const NEEDLE_ALPHABET = /^[A-Za-z0-9_.\-:/$]+$/
+const RUN_RE = /[A-Za-z0-9_.\-:/$]+/g
+const DEFAULT_DIGEST_SLOTS = 1024 // = the embedder's per-jar slot count (hf73b JAR_CACHE_SLOTS); configureJarDigestCache sets the real one
+const digestStore = { slots: DEFAULT_DIGEST_SLOTS, bySha: new Map(), identity: new Map(), rawWalk: false, stats: { built: 0, hits: 0, rawWalks: 0 } }
+
+/** The embedder's per-jar slot count (and a read of the store's shape). */
+function configureJarDigestCache ({ slots } = {}) {
+  const n = Number(slots)
+  if (Number.isFinite(n) && n >= 1) { digestStore.slots = Math.floor(n); pruneDigests() }
+  return { slots: digestStore.slots, held: digestStore.bySha.size }
+}
+
+function pruneDigests () {
+  while (digestStore.bySha.size > digestStore.slots) digestStore.bySha.delete(digestStore.bySha.keys().next().value)
+  for (const [identity, sha] of digestStore.identity) if (!digestStore.bySha.has(sha)) digestStore.identity.delete(identity)
+}
+
+function recallDigest (sha) {
+  const d = digestStore.bySha.get(sha)
+  if (!d) return null
+  digestStore.bySha.delete(sha)
+  digestStore.bySha.set(sha, d) // most recently used last
+  return d
+}
+
+// The runs of one class: every CONSTANT_Utf8 of its constant pool, cut into
+// maximal alphabet runs, each interned per jar (`runs` / `runIds`). Returns
+// the class's distinct run ids. A pool the parser cannot walk ends the read
+// where it stands (the raw bytes past it carry no constant).
+function classRunIds (data, runs, runIds) {
+  const ids = new Set()
+  const consts = new Set() // the static String ConstantValues that are whole runs (namespaceOwnership's `MOD_ID = "x"` fact)
+  const intern = (run) => { let id = runIds.get(run); if (id == null) { id = runs.length; runs.push(run); runIds.set(run, id) }; return id }
+  try {
+    const utf8 = []
+    const strRef = []
+    let off = 8
+    const n = data.readUInt16BE(off)
+    off += 2
+    let i = 1
+    for (; i < n; i++) {
+      const tag = data[off++]
+      if (tag === 1) {
+        const len = data.readUInt16BE(off)
+        const text = data.latin1Slice(off + 2, off + 2 + len)
+        utf8[i] = text
+        off += 2 + len
+        const found = text.match(RUN_RE)
+        if (found) for (const run of found) ids.add(intern(run))
+      } else if (tag === 8) { strRef[i] = data.readUInt16BE(off); off += 2 } else if (tag === 7 || tag === 16 || tag === 19 || tag === 20) off += 2
+      else if (tag === 15) off += 3
+      else if (tag === 3 || tag === 4 || tag === 9 || tag === 10 || tag === 11 || tag === 12 || tag === 17 || tag === 18) off += 4
+      else if (tag === 5 || tag === 6) { off += 8; i++ } else break
+    }
+    if (i === n) {
+      // the fields table: a static String field with a ConstantValue (read exactly as parseClassFile reads it)
+      off += 6 // access, this, super
+      off += 2 + 2 * data.readUInt16BE(off) // interfaces
+      const fields = data.readUInt16BE(off)
+      off += 2
+      for (let f = 0; f < fields; f++) {
+        const flags = data.readUInt16BE(off)
+        const descIndex = data.readUInt16BE(off + 4)
+        let attrs = data.readUInt16BE(off + 6)
+        off += 8
+        while (attrs-- > 0) {
+          const name = utf8[data.readUInt16BE(off)]
+          const len = data.readUInt32BE(off + 2)
+          if (name === 'ConstantValue' && len === 2 && (flags & ACC_STATIC) && utf8[descIndex] === JAVA_STRING) {
+            const value = utf8[strRef[data.readUInt16BE(off + 6)]]
+            if (typeof value === 'string' && NEEDLE_ALPHABET.test(value)) consts.add(intern(value))
+          }
+          off += 6 + len
+        }
+      }
+    }
+  } catch { /* a truncated class: what was read stands */ }
+  return { runs: Uint32Array.from(ids), consts: consts.size ? Uint32Array.from(consts) : null }
+}
+
+/** One jar's digest (nested jars inside, depth-bounded exactly as the raw walk is). */
+function digestJar (buf, depth) {
+  let entries
+  try { entries = zipCentralEntries(buf) } catch (err) { return { unreadable: err.message, runs: [], classes: [], tomls: [], nested: [] } }
+  const runs = []
+  const runIds = new Map()
+  const d = { unreadable: null, runs, classes: [], tomls: [], nested: [] }
+  for (const entry of entries) {
+    if (!MODS_TOML_ENTRIES.has(entry.name)) continue
+    try { d.tomls.push(zipEntryData(buf, entry).toString('utf8')) } catch { /* an unreadable toml declares nothing */ }
+  }
+  forEachNestedJar(buf, entries, depth, ({ entry, data, artifact }) => {
+    d.nested.push({ entryName: entry.name, artifact, digest: digestJar(data, depth + 1) })
+  })
+  for (const entry of entries) {
+    if (NESTED_JAR_RE.test(entry.name) || !entry.name.endsWith('.class') || entry.name.startsWith('META-INF/')) continue
+    let data
+    try { data = zipEntryData(buf, entry) } catch { d.classes.push({ entryName: entry.name, unreadable: true, runs: null, consts: null }); continue }
+    const read = classRunIds(data, runs, runIds)
+    d.classes.push({ entryName: entry.name, unreadable: false, runs: read.runs, consts: read.consts })
+  }
+  return d
+}
+
+/** The digest of a jar file: the store by content sha1 (a stat identity spares the hash on every read after the first). */
+function digestOfJar (jar) {
+  let st
+  try { st = fs.statSync(jar) } catch { return null }
+  const identity = `${jar}|${st.size}|${st.mtimeMs}`
+  const known = digestStore.identity.get(identity)
+  if (known) { const d = recallDigest(known); if (d) { digestStore.stats.hits++; return d } }
+  const buf = fs.readFileSync(jar)
+  const sha = crypto.createHash('sha1').update(buf).digest('hex')
+  digestStore.identity.set(identity, sha)
+  const held = recallDigest(sha)
+  if (held) { digestStore.stats.hits++; return held }
+  const d = digestJar(buf, 0)
+  digestStore.stats.built++
+  digestStore.bySha.set(sha, d)
+  pruneDigests()
+  return d
+}
+
+function runIdsMatching (d, needle) {
+  const ids = new Set()
+  for (let i = 0; i < d.runs.length; i++) if (d.runs[i].includes(needle)) ids.add(i)
+  return ids
+}
+
+function classCarries (row, ids) {
+  if (!ids || ids.size === 0 || !row.runs) return false
+  for (let i = 0; i < row.runs.length; i++) if (ids.has(row.runs[i])) return true
+  return false
+}
+
+// The jar's bytes for THIS assessment, read once per (jar, nested chain).
+function jarBytesOf (facts, jarPath, chain) {
+  const key = `${jarPath}\u0000${(chain || []).join('\u0000')}`
+  if (facts.bufs.has(key)) return facts.bufs.get(key)
+  let held = null
+  try {
+    let buf = fs.readFileSync(jarPath)
+    for (const link of chain || []) buf = zipEntryData(buf, zipCentralEntries(buf).find((e) => e.name === link))
+    held = { buf, entries: zipCentralEntries(buf) }
+  } catch (err) {
+    debug(`login-ack scan: failed to read ${jarPath}${chain && chain.length ? ` -> ${chain.join(' -> ')}` : ''} (${err.message})`)
+  }
+  facts.bufs.set(key, held)
+  return held
+}
+
+function classBytesOf (facts, source, entryName) {
+  const held = jarBytesOf(facts, source.jarPath, source.chain)
+  if (!held) return null
+  try {
+    const entry = held.entries.find((e) => e.name === entryName)
+    return entry ? zipEntryData(held.buf, entry) : null
+  } catch { return null }
+}
+
+// indexJar's twin over a digest: the same facts, the same hot set, in the
+// same order (owner, hints, nested jars first, then the classes).
+function indexDigest (d, source, facts, depth, ns, pathPart, hot, wide) {
+  if (d.unreadable) { debug(`login-ack scan: unreadable jar ${source.jarPath} (${d.unreadable})`); return }
+  const nsIds = runIdsMatching(d, ns)
+  const pathIds = runIdsMatching(d, pathPart)
+  const tomlOwns = d.tomls.some((text) => tomlTextDeclares(text, ns))
+  let owner = null
+  if (wide) {
+    if (tomlOwns) owner = { jarPath: source.jarPath, chain: source.chain, by: 'mods.toml' }
+    else {
+      // the first class (entry order) whose static String constant IS the namespace - the digest names the candidates, the parse confirms
+      const nsExact = d.runs.indexOf(ns)
+      for (const row of d.classes) {
+        if (row.unreadable || nsExact < 0 || !row.consts || !row.consts.includes(nsExact)) continue
+        const className = row.entryName.slice(0, -6)
+        let parsed = facts.parsed.get(className)
+        if (!parsed) { const data = classBytesOf(facts, source, row.entryName); parsed = data ? parseClassFile(data) : null }
+        if (!parsed) continue
+        facts.parsed.set(parsed.className, parsed)
+        if (parsed.fields.some((f) => (f.flags & ACC_STATIC) && f.desc === JAVA_STRING && f.constValue === ns)) { owner = { jarPath: source.jarPath, chain: source.chain, by: 'string-constant', className: parsed.className }; break }
+      }
+    }
+    if (owner) facts.nsOwners.push(owner)
+  }
+  if (!wide && tomlOwns) facts.jarHints.add(source.jarPath)
+  for (const n of d.nested) {
+    indexDigest(n.digest, { jarPath: source.jarPath, chain: [...source.chain, n.entryName], artifacts: [...(source.artifacts || []), n.artifact] }, facts, depth + 1, ns, pathPart, hot, wide)
+  }
+  let rlIds = null
+  if (owner) { rlIds = new Set(); for (const rl of RL_CLASSES) for (const id of runIdsMatching(d, rl)) rlIds.add(id) }
+  for (const row of d.classes) {
+    const className = row.entryName.slice(0, -6)
+    if (!facts.classIndex.has(className)) facts.classIndex.set(className, { ...source, entryName: row.entryName })
+    if (row.unreadable) continue
+    const hasNs = classCarries(row, nsIds)
+    if (!wide && hasNs) facts.jarHints.add(source.jarPath)
+    const strict = hasNs && classCarries(row, pathIds)
+    const widened = !strict && owner && classCarries(row, pathIds) && classCarries(row, rlIds)
+    if (strict || widened) {
+      if (hot.some((h) => h.className === className)) continue
+      let parsed = facts.parsed.get(className)
+      if (!parsed) { const data = classBytesOf(facts, source, row.entryName); parsed = data ? parseClassFile(data) : null }
+      if (parsed) {
+        facts.parsed.set(parsed.className, parsed)
+        hot.push(parsed)
+      }
+    }
+  }
+}
+
+function jarDigestStats () { return { ...digestStore.stats, held: digestStore.bySha.size, slots: digestStore.slots } }
+function __clearJarDigests () { digestStore.bySha.clear(); digestStore.identity.clear(); digestStore.stats = { built: 0, hits: 0, rawWalks: 0 } }
 
 // HF69a (A): does this (possibly nested) jar OWN the channel's namespace?
 // Two class-file/descriptor facts say so, no name list: the mods.toml /
@@ -251,18 +492,22 @@ function newFacts () {
 // Rider HF69a: only a `[[mods]]` table's modId is the jar's OWN id — a
 // `[[dependencies.<x>]]` table names ANOTHER mod's id (forge, minecraft, a
 // library), which this jar does not own.
+function tomlTextDeclares (text, ns) {
+  let table = null
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.match(/^\s*\[\[\s*([^\]\s]+)\s*\]\]/)
+    if (t) { table = t[1]; continue }
+    const m = line.match(/^\s*modId\s*=\s*"([^"]+)"/)
+    if (m && table === 'mods' && m[1] === ns) return true
+  }
+  return false
+}
 function modsTomlDeclares (buf, entries, ns) {
   for (const entry of entries) {
     if (!MODS_TOML_ENTRIES.has(entry.name)) continue
     let text = ''
     try { text = zipEntryData(buf, entry).toString('utf8') } catch { continue }
-    let table = null
-    for (const line of text.split(/\r?\n/)) {
-      const t = line.match(/^\s*\[\[\s*([^\]\s]+)\s*\]\]/)
-      if (t) { table = t[1]; continue }
-      const m = line.match(/^\s*modId\s*=\s*"([^"]+)"/)
-      if (m && table === 'mods' && m[1] === ns) return true
-    }
+    if (tomlTextDeclares(text, ns)) return true
   }
   return false
 }
@@ -373,12 +618,9 @@ function lazyClass (facts, className) {
   const loc = facts.classIndex.get(className)
   if (!loc) return null
   try {
-    let buf = fs.readFileSync(loc.jarPath)
-    for (const link of loc.chain) {
-      buf = zipEntryData(buf, zipCentralEntries(buf).find((e) => e.name === link))
-    }
-    const entry = zipCentralEntries(buf).find((e) => e.name === loc.entryName)
-    const parsed = entry && parseClassFile(zipEntryData(buf, entry))
+    // HF93: through the assessment's own read memo (a nested jar inflates once per assessment)
+    const data = classBytesOf(facts, loc, loc.entryName)
+    const parsed = data && parseClassFile(data)
     if (parsed) facts.parsed.set(parsed.className, parsed)
     return parsed || null
   } catch (err) {
@@ -1137,6 +1379,10 @@ function findCreations (facts, hotClasses, ns, pathPart) {
 // --- public API -------------------------------------------------------------
 
 const assessCache = new Map()
+// HF93: where a cached verdict came from - 'assessed' here, or the label the
+// importer gave (the embedder's store, the login-lane worker) - so a reply
+// receipt can say it (never a guess)
+const assessSources = new Map()
 
 /**
  * Statically ASSESSES a mod's wrapped login channel against the local mod
@@ -1190,8 +1436,17 @@ function assessLoginChannel (channelId, modsPaths) {
     debug(`login-ack derivation for ${channelId}: no local knowledge (${Date.now() - started}ms)`)
   }
   assessCache.set(cacheKey, result)
+  assessSources.set(cacheKey, 'assessed')
   return result
 }
+
+/** The cache key assessLoginChannel files a verdict under (the embedder's store keys on it too). */
+function loginAssessmentKeyOf (channelId, modsPaths) {
+  return `${(modsPaths || []).filter(Boolean).join('|')}::${channelId}`
+}
+
+/** 'assessed' | the importer's label | null (not cached). */
+function loginAssessmentSource (key) { return assessSources.get(key) || null }
 
 /**
  * HF12: warm the assessment cache OFF the login path. The receipt's killer
@@ -1317,12 +1572,13 @@ function exportLoginAssessments () {
 }
 
 /** Seeds the cache from an export; existing in-memory verdicts win. @returns {number} entries imported */
-function importLoginAssessments (entries) {
+function importLoginAssessments (entries, source) {
   let n = 0
   for (const e of Array.isArray(entries) ? entries : []) {
     if (!e || typeof e.key !== 'string' || !e.result || typeof e.result.verdict !== 'string') continue
     if (assessCache.has(e.key)) continue
     assessCache.set(e.key, reviveAssessment(e.result))
+    assessSources.set(e.key, typeof source === 'string' && source ? source : 'imported')
     n++
   }
   return n
@@ -1350,6 +1606,8 @@ function assessUncached (channelId, paths) {
   const hot = []
   const nsNeedle = Buffer.from(ns, 'utf8')
   const pathNeedle = Buffer.from(pathPart, 'utf8')
+  // HF93: the digest answers both halves when the alphabet spells them; else the raw walk, as before
+  const digestable = !digestStore.rawWalk && NEEDLE_ALPHABET.test(ns) && NEEDLE_ALPHABET.test(pathPart)
   const scan = (wide) => {
     for (const p of paths) {
       let jars = []
@@ -1364,6 +1622,9 @@ function assessUncached (channelId, paths) {
       for (const jar of jars) {
         if (wide && !facts.jarHints.has(jar)) continue // the strict pass saw no trace of the namespace here
         try {
+          const d = digestable ? digestOfJar(jar) : null
+          if (d) { indexDigest(d, { jarPath: jar, chain: [], artifacts: [] }, facts, 0, ns, pathPart, hot, wide); continue }
+          digestStore.stats.rawWalks++
           indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [], artifacts: [] }, facts, 0, nsNeedle, pathNeedle, hot, wide)
         } catch (err) {
           debug(`login-ack scan: skipping ${jar} (${err.message})`)
@@ -1477,4 +1738,4 @@ function corroborationOf (facts, className) {
   }
 }
 
-module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, _internal: { extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor, isRlClass, ctorChainNs, helperNsOf, methodWritesNothing, encoderProofOf, indySitesOf, namespaceOwnership, namespaceProofOf } }
+module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, loginAssessmentKeyOf, loginAssessmentSource, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, configureJarDigestCache, _internal: { jarDigestStats, __clearJarDigests, digestStore, digestJar, indexDigest, classRunIds, extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor, isRlClass, ctorChainNs, helperNsOf, methodWritesNothing, encoderProofOf, indySitesOf, namespaceOwnership, namespaceProofOf } }

@@ -1,5 +1,7 @@
 const debug = require('debug')('minecraft-protocol-forge')
-const { assessLoginChannel } = require('./loginAckDerivation')
+const { assessLoginChannel, isLoginAssessmentCached, loginAssessmentKeyOf, loginAssessmentSource } = require('./loginAckDerivation')
+// HF93: the label the pre-login derivation gives verdicts the embedder's off-thread warm delivered (autoVersionForge)
+const LOGIN_LANE_WORKER = 'login-lane worker'
 const { writeLoginReplyNow, writeLoginReplyDeferred, registerLoginQuery } = require('./loginReplyBoundary')
 const { installLoaderSpawnDecoder } = require('./loaderSpawnDecoder')
 const loginWindow = require('./loginWindow')
@@ -449,7 +451,7 @@ function conventionAckOnFml2 (client, channel, assessed, attribution, acquisitio
 
 function isFml2Era (era) { return era === 'fml2' || era === 2 }
 
-function resolveWrappedModLogin (client, channel, disc, body, options, era) {
+function resolveWrappedModLogin (client, channel, disc, body, options, era, afterWorker) {
   if (WRAPPED_LOGIN_PROTOCOLS[channel]) {
     try {
       const reply = WRAPPED_LOGIN_PROTOCOLS[channel](disc, body)
@@ -459,13 +461,28 @@ function resolveWrappedModLogin (client, channel, disc, body, options, era) {
     }
     return null // table channel declining this message: FML 99 convention
   }
+  // HF93: a verdict the login-lane worker is computing for THIS channel is
+  // awaited, never recomputed on the loop (the field: a 428-jar walk held
+  // the loop 32 s inside this handler while the worker was computing the
+  // same answer). The ladder re-enters when it lands: a cache hit then, or
+  // - the worker gone - the inline walk, exactly as a client with no worker.
+  const modsPaths = modsPathsFor(options)
+  const assessmentKey = loginAssessmentKeyOf(channel, modsPaths)
+  const inFlight = !afterWorker && client && client.forgeLoginAssessmentsInFlight instanceof Map ? client.forgeLoginAssessmentsInFlight.get(channel) : null
+  if (inFlight && typeof inFlight.then === 'function' && !isLoginAssessmentCached(assessmentKey)) {
+    // the re-entry never consults the map again: one wait per query, then the ladder as it stands
+    const again = () => resolveWrappedModLogin(client, channel, disc, body, options, era, true)
+    return { pending: inFlight.then(again, again), awaiting: LOGIN_LANE_WORKER }
+  }
   let assessed = null
   try {
-    assessed = assessLoginChannel(channel, modsPathsFor(options))
+    assessed = assessLoginChannel(channel, modsPaths)
   } catch (err) {
     debug(`assessment for ${channel} failed (${err.message})`)
     return null
   }
+  const source = loginAssessmentSource(assessmentKey)
+  const fromElsewhere = source && source !== 'assessed' ? ` (verdict from the ${source})` : ''
   if (assessed.verdict === 'ack') {
     // HF13 corroboration receipt: record the announced owner facts NEXT TO
     // the jar evidence, so a version-mismatched-but-present jar is visible
@@ -486,12 +503,13 @@ function resolveWrappedModLogin (client, channel, disc, body, options, era) {
           announcedChannel: attribution.announcedChannel,
           ownerMod: attribution.ownerMod,
           ownerVersion: attribution.ownerVersion,
+          verdictSource: source,
           ...nestingFacts(assessed)
         })
       }
       noteNestedAnswer(channel, assessed)
     } catch { /* receipts never break the reply path */ }
-    return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}` }
+    return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}${fromElsewhere}${assessed.jarName ? ` from ${assessed.jarName}${assessed.nestedArtifact ? ` -> ${assessed.nestedArtifact}` : ''}` : ''}` }
   }
   if (assessed.verdict === 'underivable') {
     if (assessed.reason === 'substantive-reply') {
@@ -875,6 +893,13 @@ module.exports = function (client, options) {
     if (context && context.awaited) writeLoginReplyNow(client, params, context)
     else writeLoginReplyDeferred(client, params, context || {})
   }
+  // The FML convention acknowledge (99) on the ORIGINATING inner channel -
+  // the synchronous ladder's floor and (HF93) the late floor after a
+  // worker verdict that knows nothing of the channel.
+  function conventionAcknowledge (messageId, channel, why) {
+    respond(messageId, wrapLoginPayload(channel, encodeAcknowledgement()),
+      { channel, kind: why ? `convention ack (${why})` : 'convention ack', awaited: channel === 'fml:handshake' })
+  }
 
   client.on('login_plugin_request', (packet) => {
     // HF36: every query is owed exactly one reply — register it before any
@@ -956,11 +981,19 @@ module.exports = function (client, options) {
         const resolved = loginWindow.timeDerivation(client, messageId, `wrapped login resolution ${channel}`, () => resolveWrappedModLogin(client, channel, discValue, wrapper.data.slice(disc.size), options))
         if (resolved && resolved.pending) {
           // HF23: the answer is deferred behind the announced-mod acquisition;
-          // the server waits for a needsResponse reply (see resolveWrappedModLogin)
-          loginWindow.noteAsyncDerivation(client, messageId, `announced-mod acquisition for ${channel}`)
-          resolved.pending.then((late) => dispatch(late, true)).catch((err) => {
-            console.warn(`[forge] announced-mod acquisition for ${channel} threw (${err && err.message}) — answering with the protocol's not-understood decline`)
-            writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition error)' })
+          // the server waits for a needsResponse reply (see resolveWrappedModLogin).
+          // HF93: or behind the login-lane worker's verdict for this channel -
+          // the same deferral, the same dispatch; a null late answer takes the
+          // convention acknowledge the synchronous ladder falls through to.
+          const awaiting = resolved.awaiting ? `wrapped login verdict for ${channel} from the ${resolved.awaiting}` : `announced-mod acquisition for ${channel}`
+          loginWindow.noteAsyncDerivation(client, messageId, awaiting)
+          resolved.pending.then((late) => {
+            if (dispatch(late, !resolved.awaiting)) return
+            if (late == null && resolved.awaiting) { conventionAcknowledge(messageId, channel, `after the ${resolved.awaiting}`); return }
+            writeLoginReplyDeferred(client, { messageId }, { channel, kind: 'wrapped decline (acquisition fallback)' })
+          }).catch((err) => {
+            console.warn(`[forge] ${awaiting} threw (${err && err.message}) — answering with the protocol's not-understood decline`)
+            writeLoginReplyDeferred(client, { messageId }, { channel, kind: resolved.awaiting ? 'wrapped decline (worker verdict error)' : 'wrapped decline (acquisition error)' })
           })
           return
         }
@@ -1063,8 +1096,7 @@ module.exports = function (client, options) {
       // channel's reply in fml:handshake would deliver it to the FML handshake
       // handler ("unexpected index") while the real channel waits forever.
       debug(`acknowledging loginwrapper message channel=${wrapper.channel} discriminator=${disc.value} length=${wrapper.data.length}`)
-      respond(packet.messageId, wrapLoginPayload(wrapper.channel, encodeAcknowledgement()),
-        { channel: wrapper.channel, kind: 'convention ack', awaited: wrapper.channel === 'fml:handshake' })
+      conventionAcknowledge(packet.messageId, wrapper.channel)
     } catch (err) {
       // A request left unanswered hangs the login until the server times us
       // out, so an acknowledgement is always the least-bad answer. If even the

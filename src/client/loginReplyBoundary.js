@@ -203,6 +203,13 @@ function writeLoginReplyNow (client, params, context) {
         dropWithReceipt(client, params, context, `late-reply: window closed (endedBy=${loginWindow.windowEndedBy(client) || boundaryObserved(client) || 'unknown'})`)
         return false
       }
+      // HF93: a reply that lands after OUR OWN budget stop closed the query
+      // is LATE, never a duplicate of an answer (nothing answered it): the
+      // stop's verdict stands, the receipt says what ended the query first.
+      if (prior && (prior.outcome === 'budget-ended' || prior.outcome === 'budget-declined')) {
+        refuseWithReceipt(client, params, context, `late-reply: the budget stop closed the query first (${prior.outcome}${prior.kind ? ` by ${prior.kind}` : ''})`)
+        return false
+      }
       const why = prior
         ? `duplicate-reply: already-closed-${prior.outcome}${prior.kind ? ` (first answered by ${prior.kind})` : ''}`
         : 'unknown-transaction'
@@ -259,6 +266,7 @@ function afterNextInboundOrBound (client, ms, fn) {
  * bound; then applies the same guard as writeLoginReplyNow.
  */
 function writeLoginReplyDeferred (client, params, context) {
+  loginWindow.noteDecided(client, params && params.messageId, context) // HF93: decided now; the write follows
   setImmediate(() => setImmediate(() => {
     // hold only while the outcome is still undecided: an already-observed
     // end of login (success / end processed during the hops) drops now

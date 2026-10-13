@@ -32,6 +32,7 @@ module.exports = {
   packetBodyWire: { ...require('./src/client/packetBodyWireDerivation'), ...require('./src/client/packetBodyWireInstall') },
   forgeHandshakeConfig: require('./src/client/forgeHandshakeConfig'),
   autoVersionForge: require('./src/client/autoVersionForge'),
+  loginAckDerivation: require('./src/client/loginAckDerivation'), // HF93: the embedder configures the per-jar digest store (configureJarDigestCache)
   decodeOptimized: require('./src/client/decodeOptimized'),
   installTolerantPlayParser: require('./src/client/tolerantPlayParser'),
   // HF45: the declare_commands boundary + the derived command argument-type table (per client)

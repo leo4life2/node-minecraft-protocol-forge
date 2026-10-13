@@ -290,6 +290,24 @@ function timeDerivation (client, messageId, name, fn) {
   }
 }
 
+/**
+ * HF93 THE REPLY-TIMING LAW: a reply DECIDED for a query (handed to the
+ * boundary's deferred write) is stamped on its entry the moment it is
+ * decided. A budget stop that fires after that stamp never ends the query
+ * - the decided reply is on its way through the boundary, and the boundary
+ * writes or drops it on what left the wire, never on the timer. The field
+ * (f27): the stop fired AFTER a 32 s synchronous hold, between the handler's
+ * decision and the deferred write, and the write was then refused as a
+ * duplicate of the stop.
+ */
+function noteDecided (client, messageId, context) {
+  const w = ledgerOf(client)
+  const e = openEntry(client, messageId, context)
+  if (!w || !e || e.decidedAt != null) return
+  e.decidedAt = w.now()
+  e.decidedKind = (context && context.kind) || null
+}
+
 /** An ASYNCHRONOUS derivation (announced-mod acquisition) now owns the reply. */
 function noteAsyncDerivation (client, messageId, name) {
   const w = ledgerOf(client)
@@ -328,6 +346,12 @@ function expire (client, e) {
   const now = w.now()
   const channel = e.innerChannel || e.channel
   const waitedMs = now - e.arrivedAt
+  if (e.decidedAt != null) {
+    // HF93: decided before this stop - the boundary owns it from here
+    e.stopWaived = { at: now, waitedMs, decidedAt: e.decidedAt, decidedKind: e.decidedKind }
+    debug(`login-window budget: the query on ${channel} (messageId ${e.messageId}) has waited ${waitedMs} ms, but its reply (${e.decidedKind || 'reply'}) was decided ${now - e.decidedAt} ms ago and is on its way - no stop`)
+    return
+  }
   const remainingMs = Math.max(0, w.startAt + w.windowMs - now)
   const derivation = describeDerivation(e, now)
   const fact = {
@@ -411,7 +435,9 @@ function loginWindowSummary (client) {
       outcome: e.outcome,
       kind: e.kind,
       why: e.why,
-      derivation: e.derivation ? { name: e.derivation.name, ms: e.derivation.done ? e.derivation.ms : now - e.derivation.startedAt, done: !!e.derivation.done } : null
+      derivation: e.derivation ? { name: e.derivation.name, ms: e.derivation.done ? e.derivation.ms : now - e.derivation.startedAt, done: !!e.derivation.done } : null,
+      decidedMs: e.decidedAt != null && e.arrivedAt != null ? e.decidedAt - e.arrivedAt : null, // HF93: when the reply was decided (the deferred hand-in), null = never
+      stopWaived: e.stopWaived ? { waitedMs: e.stopWaived.waitedMs } : null // HF93: a budget tick that found the reply already decided
     }
   })
   const pre = client.forgePreloginDerivation || null
@@ -458,5 +484,6 @@ module.exports = {
   closeWindow,
   DEFAULT_WINDOW_TICKS,
   DEFAULT_SAFETY_MS,
-  DEFAULT_QUERY_BUDGET_MS
+  DEFAULT_QUERY_BUDGET_MS,
+  noteDecided
 }

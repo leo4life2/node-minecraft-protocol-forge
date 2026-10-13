@@ -11,6 +11,10 @@ const { deriveNeoForgeComponents } = require('./neoForgePayloadDerivation')
 const { installNeoForgeConfigNegotiation } = require('./neoForgeConfig')
 const { warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, isLoginAssessmentCached } = require('./loginAckDerivation')
 
+// HF93: the label a verdict imported from the embedder's off-thread warm
+// carries (the receipt of a reply answered from it names it)
+const LOGIN_LANE_WORKER = 'login-lane worker'
+
 // HF38: THE PRE-LOGIN DERIVATION. The inputs of every jar-derived login
 // verdict — the ping's channel census + the local instance jars — are known
 // before login_start, so the verdicts are computed here, off the login path
@@ -26,7 +30,7 @@ function preloginDerivation (client, options, channelNames, modsPaths) {
   const store = options && options.loginAssessmentStore
   let imported = 0
   if (store && typeof store.load === 'function') {
-    try { imported = importLoginAssessments(store.load()) } catch (err) { debug(`login-assessment store load failed (${err.message})`) }
+    try { imported = importLoginAssessments(store.load(), 'persistent store') } catch (err) { debug(`login-assessment store load failed (${err.message})`) }
   }
   // Phase 1 — SYNCHRONOUS, on the ping hook's own turn: nmp emits
   // connect_allowed only after every hook returns, so everything assessed
@@ -41,7 +45,14 @@ function preloginDerivation (client, options, channelNames, modsPaths) {
   // mechanism). Entries import into the cache as they arrive; a query that lands
   // before its channel is warm still takes the inline path (unchanged).
   const warm = options && typeof options.loginAssessmentWarm === 'function' ? options.loginAssessmentWarm : null
-  if (warm) {
+  // HF93: the PER-CHANNEL request (options.loginAssessmentRequest(channel, modsPaths)
+  // -> Promise<entries>): each verdict imports the moment it lands, and the
+  // in-flight promise is filed per channel on the client so a login query
+  // that arrives before its verdict AWAITS it (forgeHandshake3) instead of
+  // walking the jars on the loop. The batch warm stays for an embedder
+  // without the per-channel seat.
+  const request = options && typeof options.loginAssessmentRequest === 'function' ? options.loginAssessmentRequest : null
+  if (warm || request) {
     const startedAt = Date.now()
     const queue = (channelNames || []).filter((ch) => typeof ch === 'string' && ch.includes(':') && !/^(fml|forge|minecraft):/.test(ch))
     const pathsKey = (modsPaths || []).filter(Boolean).join('|')
@@ -55,19 +66,41 @@ function preloginDerivation (client, options, channelNames, modsPaths) {
       }
     }
     if (pre.remaining === 0) { pre.finishedAt = startedAt; pre.finishedBeforeLoginStart = true; report(); return Promise.resolve(pre) }
-    return Promise.resolve()
-      .then(() => warm(queue.filter((ch) => !isLoginAssessmentCached(`${pathsKey}::${ch}`)), modsPaths))
-      .then((entries) => {
-        const n = importLoginAssessments(entries)
-        const startAt = client.forgeLoginWindow && client.forgeLoginWindow.startAt
-        pre.finishedAt = Date.now()
-        pre.ms = pre.finishedAt - startedAt
-        pre.assessed = cachedNow + n
-        pre.finishedBeforeLoginStart = startAt == null || pre.finishedAt <= startAt
+    const cold = queue.filter((ch) => !isLoginAssessmentCached(`${pathsKey}::${ch}`))
+    const finish = (n) => {
+      const startAt = client.forgeLoginWindow && client.forgeLoginWindow.startAt
+      pre.finishedAt = Date.now()
+      pre.ms = pre.finishedAt - startedAt
+      pre.assessed = cachedNow + n
+      pre.finishedBeforeLoginStart = startAt == null || pre.finishedAt <= startAt
+      pre.remaining = Math.max(0, queue.length - pre.assessed)
+      report()
+      return pre
+    }
+    if (request) {
+      const inFlight = client.forgeLoginAssessmentsInFlight || (client.forgeLoginAssessmentsInFlight = new Map())
+      pre.perChannel = true
+      let landed = 0
+      const settled = (ch) => (entries) => {
+        const n = importLoginAssessments(entries, LOGIN_LANE_WORKER)
+        landed += n
+        pre.assessed = cachedNow + landed
         pre.remaining = Math.max(0, queue.length - pre.assessed)
-        report()
-        return pre
+        return n
+      }
+      const all = cold.map((ch) => {
+        const p = Promise.resolve()
+          .then(() => request(ch, modsPaths))
+          .then(settled(ch), (err) => { debug(`off-thread login assessment for ${ch} failed (${err && err.message}); the inline path covers it`); return 0 })
+          .then((n) => { if (inFlight.get(ch) === p) inFlight.delete(ch); return n })
+        inFlight.set(ch, p)
+        return p
       })
+      return Promise.all(all).then(() => finish(landed))
+    }
+    return Promise.resolve()
+      .then(() => warm(cold, modsPaths))
+      .then((entries) => finish(importLoginAssessments(entries, LOGIN_LANE_WORKER)))
       .catch((err) => { debug(`off-thread login assessment warm failed (${err && err.message}); inline path covers every channel`); pre.error = String(err && err.message); return pre })
   }
   const syncBudget = Number.isFinite(options && options.preloginSyncBudgetMs) ? options.preloginSyncBudgetMs : DEFAULT_PRELOGIN_SYNC_BUDGET_MS
@@ -254,7 +287,13 @@ module.exports = function (client, options) {
       // HF23: announced-mod acquisition accessor (embedder-owned network +
       // cache policy; this lib only awaits it) + the MC version it keys on
       announcedModAcquisition: options.announcedModAcquisition,
-      mcVersion: options.mcVersion
+      mcVersion: options.mcVersion,
+      // HF93: the login-window ledger's own knobs ride through (the embedder's
+      // test seams; the defaults are the window law's)
+      loginWindowTicks: options.loginWindowTicks,
+      loginWindowSafetyMs: options.loginWindowSafetyMs,
+      loginQueryBudgetMs: options.loginQueryBudgetMs,
+      now: options.now
     })
     // HF12: precompute the jar verdicts for every pinged mod channel while
     // the connection is still being set up — the inline cold assessment used

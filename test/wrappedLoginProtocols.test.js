@@ -374,3 +374,226 @@ describe('HF23-R1 S2CModData as the announced-version source on hidden-ping wire
     assert.strictEqual(client.written.length, 1, 'exactly the ModListReply was written')
   })
 })
+
+// HF93: THE WRAPPED-LOGIN ASSESSMENT LEAVES THE MAIN LOOP. The field (f27,
+// a 428-mod Forge pack): the jar walk for one wrapped channel ran
+// synchronously inside the login_plugin_request handler for 32 s while the
+// login-lane worker was computing the same verdict; the 18 s budget timer
+// could only fire after the hold, and its stop then refused the derived
+// reply as a duplicate. Pins: m1 a cache miss with a live worker verdict in
+// flight walks NOTHING on the calling thread and answers when the verdict
+// lands; m5 the budget stop fires at its TRUE time while a verdict is
+// pending, and a reply decided before the stop is never refused by it.
+describe('HF93 wrapped-login assessment off the loop', function () {
+  const fs = require('fs')
+  const os = require('os')
+  const path = require('path')
+  const { Worker } = require('worker_threads')
+  const lad = require('../src/client/loginAckDerivation')
+  const loginWindow = require('../src/client/loginWindow')
+  const { OWNER_FIXTURE, OWNER_CHANNEL } = require('./helpers/hf93Pack')
+  const packDir = () => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'hf93-m1-')); fs.copyFileSync(OWNER_FIXTURE, path.join(d, 'origins-all.jar')); return d }
+  const query = (client, messageId = 116) => client.emit('login_plugin_request', { messageId, channel: 'fml:loginwrapper', data: wrap(OWNER_CHANNEL, Buffer.concat([writeVarInt(0), Buffer.from([0x01])])) })
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  // the product's login-lane worker shape: assess in ANOTHER thread, hand back the export entries of that one key
+  const workerVerdict = (channel, paths) => new Promise((resolve, reject) => {
+    const w = new Worker(`const { parentPort, workerData } = require('worker_threads'); const lad = require(${JSON.stringify(require.resolve('../src/client/loginAckDerivation'))});
+      const r = lad.assessLoginChannel(workerData.channel, workerData.paths); const key = lad.loginAssessmentKeyOf(workerData.channel, workerData.paths)
+      parentPort.postMessage({ verdict: r.verdict, entries: lad.exportLoginAssessments().filter((e) => e.key === key), digest: lad._internal.jarDigestStats() })`, { eval: true, workerData: { channel, paths } })
+    w.once('message', (m) => { resolve(m); w.terminate() })
+    w.once('error', reject)
+  })
+  const fml3Client = () => {
+    const client = makeClient()
+    client.state = 'login'
+    client.endedReasons = []
+    client.end = (reason) => { client.endedReasons.push(reason); client.emit('end', reason) }
+    client.forgeModList = { mods: ['minecraft', 'forge', 'origins', 'calio'], channels: [{ name: OWNER_CHANNEL, marker: '1.2' }], registries: [] }
+    client.forgePingMods = [{ id: 'origins', version: '1.20.1-1.10.0.9' }, { id: 'calio', version: '1.20.1-1.11.0.5' }]
+    return client
+  }
+  const quiet = (fn) => { const o = { log: console.log, warn: console.warn, error: console.error }; console.log = () => {}; console.warn = () => {}; console.error = () => {}; return Promise.resolve().then(fn).finally(() => Object.assign(console, o)) }
+
+  it('m1 a cache miss with the worker verdict in flight: nothing is indexed on the calling thread, the query waits on the worker, the reply is written the moment the verdict lands with the receipt naming the worker', async () => quiet(async () => {
+    const dir = packDir()
+    lad._internal.__clearJarDigests()
+    const client = fml3Client()
+    let land = null
+    const inFlight = new Promise((resolve) => { land = resolve })
+    client.forgeLoginAssessmentsInFlight = new Map([[OWNER_CHANNEL, inFlight]])
+    forgeHandshake3(client, { modsPaths: [dir] })
+    const before = lad._internal.jarDigestStats()
+    const key = lad.loginAssessmentKeyOf(OWNER_CHANNEL, [dir])
+    assert.strictEqual(lad.isLoginAssessmentCached(key), false, 'a cache miss (fresh key)')
+    query(client)
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 0, 'nothing written while the verdict is in flight')
+    const stats = lad._internal.jarDigestStats()
+    assert.strictEqual(stats.built, before.built, 'no jar was digested on the calling thread')
+    assert.strictEqual(stats.rawWalks, before.rawWalks, 'no raw walk on the calling thread')
+    const q = loginWindow.loginWindowSummary(client).queries[0]
+    assert.strictEqual(q.outcome, null, 'the query is open')
+    assert.strictEqual(q.derivation.done, false)
+    assert.strictEqual(q.derivation.name, `wrapped login verdict for ${OWNER_CHANNEL} from the login-lane worker`)
+    // the worker's verdict lands: imported, the in-flight promise resolves, the ladder re-enters on a cache hit
+    const m = await workerVerdict(OWNER_CHANNEL, [dir])
+    assert.strictEqual(m.verdict, 'ack')
+    assert.ok(m.digest.built >= 1, 'the WORKER digested the jar')
+    assert.strictEqual(lad.importLoginAssessments(m.entries, 'login-lane worker'), 1)
+    client.forgeLoginAssessmentsInFlight.delete(OWNER_CHANNEL)
+    land()
+    await sleep(5)
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 1, 'exactly one reply once the verdict landed')
+    assert.deepStrictEqual(client.written[0].params.data, wrap(OWNER_CHANNEL, Buffer.from([0x00])), 'the derived ack (index 0) in the channel\'s own index space')
+    assert.strictEqual(lad._internal.jarDigestStats().built, before.built, 'still nothing indexed on the calling thread')
+    assert.strictEqual(lad.loginAssessmentSource(key), 'login-lane worker')
+    const rec = client.forgeLoginCorroboration.find((r) => r.channel === OWNER_CHANNEL)
+    assert.strictEqual(rec.verdictSource, 'login-lane worker', 'the receipt says where the verdict came from')
+    const after = loginWindow.loginWindowSummary(client).queries[0]
+    assert.strictEqual(after.outcome, 'answered')
+    assert.strictEqual(after.derivation.done, true)
+    assert.strictEqual(client.endedReasons.length, 0)
+  }))
+
+  it('m1b the worker gone (its promise resolves with nothing cached): the ladder re-enters on the inline walk - the fallback of a client with no worker, said so by the stats', async () => quiet(async () => {
+    const dir = packDir()
+    lad._internal.__clearJarDigests()
+    const client = fml3Client()
+    const inFlight = Promise.resolve(0)
+    client.forgeLoginAssessmentsInFlight = new Map([[OWNER_CHANNEL, inFlight]])
+    forgeHandshake3(client, { modsPaths: [dir] })
+    const before = lad._internal.jarDigestStats().built
+    query(client)
+    await sleep(5)
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 1)
+    assert.deepStrictEqual(client.written[0].params.data, wrap(OWNER_CHANNEL, Buffer.from([0x00])))
+    assert.strictEqual(lad._internal.jarDigestStats().built, before + 1, 'the inline walk digested the jar on this thread (the fallback)')
+    assert.strictEqual(lad.loginAssessmentSource(lad.loginAssessmentKeyOf(OWNER_CHANNEL, [dir])), 'assessed')
+  }))
+
+  it('m1c a worker verdict that knows nothing of the channel takes the FML convention acknowledge (99) the synchronous ladder falls through to - never a decline', async () => quiet(async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hf93-m1c-'))
+    const client = fml3Client()
+    client.forgeModList = { mods: ['minecraft', 'forge'], channels: [], registries: [] }
+    client.forgePingMods = []
+    let land = null
+    const inFlight = new Promise((resolve) => { land = resolve })
+    const channel = 'stranger:login'
+    client.forgeLoginAssessmentsInFlight = new Map([[channel, inFlight]])
+    forgeHandshake3(client, { modsPaths: [dir] })
+    client.emit('login_plugin_request', { messageId: 7, channel: 'fml:loginwrapper', data: wrap(channel, Buffer.concat([writeVarInt(0), Buffer.from([0x01])])) })
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 0)
+    lad.importLoginAssessments([{ key: lad.loginAssessmentKeyOf(channel, [dir]), result: { verdict: 'unknown' } }], 'login-lane worker')
+    client.forgeLoginAssessmentsInFlight.delete(channel)
+    land()
+    await sleep(5)
+    await drainDeferredReplies()
+    assert.strictEqual(client.written.length, 1)
+    assert.deepStrictEqual(client.written[0].params.data, wrap(channel, Buffer.from([99])), 'the convention acknowledge on the originating channel')
+    assert.strictEqual(loginWindow.loginWindowSummary(client).queries[0].kind, 'convention ack (after the login-lane worker)')
+  }))
+
+  it('m5 the timing law: the budget stop fires at its TRUE time while the verdict is pending (the copy says what it waited for), and a reply decided before a stop is never refused by it', async () => quiet(async () => {
+    const dir = packDir()
+    // (a) pending past the budget: the stop at the budget's own time, the derivation named
+    const a = fml3Client()
+    let landLate = null
+    a.forgeLoginAssessmentsInFlight = new Map([[OWNER_CHANNEL, new Promise((resolve) => { landLate = resolve })]])
+    forgeHandshake3(a, { modsPaths: [dir], loginQueryBudgetMs: 300 })
+    const t0 = Date.now()
+    query(a)
+    await sleep(450)
+    const stop = a.forgeLoginWindowBudget
+    assert.ok(stop, 'the budget stop fired')
+    assert.ok(stop.waitedMs >= 290 && stop.waitedMs < 420, `true time: waited ${stop.waitedMs} of ${stop.budgetMs}`)
+    assert.strictEqual(stop.derivation.done, false)
+    assert.strictEqual(stop.derivation.name, `wrapped login verdict for ${OWNER_CHANNEL} from the login-lane worker`)
+    assert.ok(/wrapped login verdict for calio:channel from the login-lane worker still running after \d+ ms/.test(a.endedReasons[0]), a.endedReasons[0])
+    assert.ok(Date.now() - t0 < 1000)
+    assert.strictEqual(a.written.length, 0)
+    // the verdict lands AFTER our own stop: receipted LATE (what ended the query first), never a duplicate of an answer
+    a.forgeLoginAssessmentsInFlight.delete(OWNER_CHANNEL)
+    landLate()
+    await sleep(5)
+    await drainDeferredReplies()
+    assert.strictEqual(a.written.length, 0, 'nothing written after the stop')
+    const refusedLate = loginWindow.loginWindowSummary(a).refused
+    assert.strictEqual(refusedLate.length, 1)
+    assert.ok(/^late-reply: the budget stop closed the query first \(budget-ended/.test(refusedLate[0].why), refusedLate[0].why)
+    // (b) decided before the stop: the field order (decision, a loop hold past the budget, the timer, the deferred write)
+    const b = fml3Client()
+    forgeHandshake3(b, { modsPaths: [dir], loginQueryBudgetMs: 300 })
+    b.on('login_plugin_request', () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400)) // runs AFTER the handler decided, before its deferred write
+    query(b)
+    await sleep(50)
+    await drainDeferredReplies()
+    const q = loginWindow.loginWindowSummary(b)
+    assert.strictEqual(b.written.length, 1, 'the decided reply reached the wire')
+    assert.deepStrictEqual(b.written[0].params.data, wrap(OWNER_CHANNEL, Buffer.from([0x00])))
+    assert.strictEqual(q.queries[0].outcome, 'answered')
+    assert.deepStrictEqual(q.refused, [], 'never refused as a duplicate of a stop')
+    assert.strictEqual(q.budgetStops.length, 0, 'no stop was written')
+    assert.ok(q.queries[0].stopWaived && q.queries[0].stopWaived.waitedMs >= 300, `the late timer found the reply decided: ${JSON.stringify(q.queries[0].stopWaived)}`)
+    assert.ok(q.queries[0].decidedMs != null && q.queries[0].decidedMs < 300, `decided inside the budget (${q.queries[0].decidedMs} ms)`)
+    assert.strictEqual(b.endedReasons.length, 0)
+  }))
+})
+
+// HF93 m2: the pre-login derivation imports each channel's verdict the
+// moment it lands (never after the whole queue), and files the in-flight
+// promise per channel for the login path.
+describe('HF93 per-channel pre-login import', function () {
+  const fs = require('fs')
+  const os = require('os')
+  const path = require('path')
+  const lad = require('../src/client/loginAckDerivation')
+  const autoVersionForge = require('../src/client/autoVersionForge')
+  const { OWNER_FIXTURE, OWNER_CHANNEL } = require('./helpers/hf93Pack')
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+  it('m2 a verdict imported before the queue finishes; the in-flight map holds the rest; the batch warm untouched', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hf93-m2-')); fs.copyFileSync(OWNER_FIXTURE, path.join(dir, 'origins-all.jar'))
+    const client = makeClient()
+    const o = console.log; console.log = () => {}
+    try {
+      const resolvers = new Map()
+      const requested = []
+      autoVersionForge(client, {
+        modsPaths: [dir],
+        loginAssessmentRequest: (channel, paths) => {
+          requested.push(channel)
+          return new Promise((resolve) => {
+            resolvers.set(channel, () => {
+              const key = lad.loginAssessmentKeyOf(channel, paths)
+              resolve(lad.exportLoginAssessments().filter((e) => e.key === key).map((e) => ({ key: e.key.replace(dir, dir + '-m2'), result: e.result })))
+            })
+          })
+        }
+      })
+      const response = { version: { name: '1.20.1', protocol: 763 }, forgeData: { fmlNetworkVersion: 3, truncated: false, channels: [{ res: OWNER_CHANNEL, version: '1.2', required: true }, { res: 'other:thing', version: '1', required: true }], mods: [{ modId: 'origins', modmarker: '1' }] } }
+      for (const hook of client.autoVersionHooks) hook(response)
+      await sleep(5)
+      assert.deepStrictEqual(requested, [OWNER_CHANNEL, 'other:thing'], 'one request per channel')
+      assert.deepStrictEqual([...client.forgeLoginAssessmentsInFlight.keys()], [OWNER_CHANNEL, 'other:thing'])
+      // the "worker" computes the first verdict (here: this thread, keyed for a sibling path so the import is observable)
+      lad.assessLoginChannel(OWNER_CHANNEL, [dir])
+      resolvers.get(OWNER_CHANNEL)()
+      await sleep(5)
+      assert.strictEqual(lad.isLoginAssessmentCached(lad.loginAssessmentKeyOf(OWNER_CHANNEL, [dir + '-m2'])), true, 'imported before the queue finished')
+      assert.strictEqual(lad.loginAssessmentSource(lad.loginAssessmentKeyOf(OWNER_CHANNEL, [dir + '-m2'])), 'login-lane worker')
+      assert.deepStrictEqual([...client.forgeLoginAssessmentsInFlight.keys()], ['other:thing'], 'the landed channel left the in-flight map; the other is still held')
+      assert.strictEqual(client.forgePreloginDerivation.assessed, 1)
+      assert.strictEqual(client.forgePreloginDerivation.finishedAt, null, 'the queue is not finished')
+      lad.assessLoginChannel('other:thing', [dir])
+      resolvers.get('other:thing')()
+      await sleep(5)
+      assert.strictEqual(client.forgeLoginAssessmentsInFlight.size, 0)
+      assert.strictEqual(client.forgePreloginDerivation.assessed, 2)
+      assert.ok(client.forgePreloginDerivation.finishedAt != null)
+      assert.strictEqual(client.forgePreloginDerivation.perChannel, true)
+    } finally { console.log = o }
+  })
+})

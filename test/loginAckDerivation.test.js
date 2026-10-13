@@ -525,3 +525,88 @@ describe('loginAckDerivation - real calio jar (HF2 receipt ground truth)', funct
     assert.strictEqual(r.msgClass, 'io/github/edwinmindcraft/calio/common/network/packet/C2SAcknowledgePacket')
   })
 })
+
+// HF93 m3/m4: THE PER-JAR DIGEST. A jar is read into its channel-independent
+// digest once per content sha1 (nested jars inside their parent's), and every
+// channel asks the digest; the raw walk stays for a needle the digest's
+// alphabet cannot spell. The CONTROL: the digest path and the raw walk
+// derive byte-identical verdicts over every committed fixture jar, and the
+// whole set's sha is the one the base (c5fa1b7) derived.
+describe('HF93 per-jar digest', function () {
+  const fs = require('fs')
+  const os = require('os')
+  const path = require('path')
+  const crypto = require('crypto')
+  const lad = require('../src/client/loginAckDerivation')
+  const { buildClass, buildJar } = require('./helpers/synthJar')
+  const { OWNER_FIXTURE, OWNER_CHANNEL } = require('./helpers/hf93Pack')
+  const stats = () => lad._internal.jarDigestStats()
+  const ser = (r) => JSON.stringify(r, (k, v) => (v && v.type === 'Buffer' && Array.isArray(v.data)) ? { $buffer: Buffer.from(v.data).toString('base64') } : v)
+  const sha = (s) => crypto.createHash('sha256').update(s).digest('hex')
+  const CHANNELS = ['calio:channel', 'tacz:handshake', 'framework:handshake', 'zeta:main', 'owo:handshake', 'origins:origins', 'biggerstacks:main', 'stacc:main', 'sophisticatedcore:channel', 'waystones:network', 'balm:network', 'securitycraft:network', 'glitchcore:network', 'immersive_portals:main', 'bettercombat:network', 'combat_roll:network', 'nobody:nothing']
+  // the fixture set's verdicts, serialized as the embedder's store serializes them, at the base c5fa1b7 (the raw walk only)
+  const BASE_FIXTURE_SET_SHA = '95d3c1db659dc08d34da61b7115bd7fd65b2dda8fc02ce68fd77e19fd2a86fd4'
+  const quiet = (fn) => { const o = console.log; console.log = () => {}; try { return fn() } finally { console.log = o } }
+  const packOf = (tag) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hf93-m3-${tag}-`))
+    fs.copyFileSync(OWNER_FIXTURE, path.join(dir, 'a-origins-all.jar'))
+    fs.writeFileSync(path.join(dir, 'b-plain.jar'), buildJar([{ name: 'META-INF/mods.toml', data: Buffer.from('modLoader="javafml"\n[[mods]]\nmodId="plain"\n') }, { name: 'plain/Main.class', data: buildClass({ name: 'plain/Main', methods: [] }) }]))
+    fs.writeFileSync(path.join(dir, 'c-empty.jar'), buildJar([{ name: 'META-INF/mods.toml', data: Buffer.from('modLoader="javafml"\n[[mods]]\nmodId="empty"\n') }]))
+    return dir
+  }
+
+  it('m3 a pack is digested once per jar across two channels and two joins (a second folder of the same bytes hits by sha1; a changed jar re-digests alone)', () => quiet(() => {
+    lad._internal.__clearJarDigests()
+    const dir = packOf('one')
+    const r1 = lad.assessLoginChannel(OWNER_CHANNEL, [dir])
+    assert.strictEqual(r1.verdict, 'ack')
+    assert.deepStrictEqual({ built: stats().built, rawWalks: stats().rawWalks }, { built: 3, rawWalks: 0 }, 'three jars, one digest each, no raw walk')
+    const r2 = lad.assessLoginChannel('plain:login', [dir]) // a second channel: the wide pass re-asks the digests
+    assert.strictEqual(r2.verdict, 'unknown')
+    assert.strictEqual(stats().built, 3, 'no jar digested twice for the second channel')
+    // a second join: the same bytes under another path (the sha1 is the key, never the path)
+    const again = packOf('two')
+    lad.assessLoginChannel('other:thing', [again])
+    assert.strictEqual(stats().built, 3, 'the second join digested nothing')
+    assert.ok(stats().hits >= 3)
+    // one jar changes: only it re-digests
+    fs.writeFileSync(path.join(again, 'c-empty.jar'), buildJar([{ name: 'META-INF/mods.toml', data: Buffer.from('modLoader="javafml"\n[[mods]]\nmodId="empty"\nversion="2"\n') }]))
+    lad.assessLoginChannel('fourth:channel', [again])
+    assert.strictEqual(stats().built, 4)
+    assert.strictEqual(stats().held, 4)
+    // the LRU law: the embedder's slot count bounds the store, the oldest out first
+    assert.deepStrictEqual(lad.configureJarDigestCache({ slots: 2 }), { slots: 2, held: 2 })
+    lad.configureJarDigestCache({ slots: 1024 })
+  }))
+
+  it('m4 CONTROL: the digest path and the raw walk derive byte-identical verdicts over every fixture jar; the set\'s sha is the base\'s; a needle outside the digest alphabet takes the raw walk', () => quiet(() => {
+    const fixtures = fs.readdirSync(path.join(__dirname, 'fixtures')).filter((f) => f.endsWith('.jar')).map((f) => path.join(__dirname, 'fixtures', f))
+    const run = (raw, tag) => {
+      lad._internal.__clearJarDigests()
+      lad._internal.digestStore.rawWalk = raw
+      const out = {}
+      try {
+        for (const jar of fixtures) {
+          const copy = fs.mkdtempSync(path.join(os.tmpdir(), `hf93-m4-${tag}-`)) // a fresh key per run (the verdict cache is keyed on the path)
+          fs.copyFileSync(jar, path.join(copy, path.basename(jar)))
+          for (const ch of CHANNELS) { const r = lad.assessLoginChannel(ch, [path.join(copy, path.basename(jar))]); out[`${path.basename(jar)}::${ch}`] = { sha: sha(ser(r)), verdict: r.verdict, index: r.index } }
+        }
+      } finally { lad._internal.digestStore.rawWalk = false }
+      return out
+    }
+    const viaDigest = run(false, 'd')
+    assert.strictEqual(stats().rawWalks, 0, 'the digest answered every fixture')
+    assert.ok(stats().built >= fixtures.length)
+    const viaRaw = run(true, 'r')
+    assert.strictEqual(stats().built, 0, 'the raw walk digested nothing')
+    assert.ok(stats().rawWalks >= fixtures.length)
+    assert.deepStrictEqual(viaDigest, viaRaw, 'byte-identical verdicts, pair by pair')
+    assert.strictEqual(sha(JSON.stringify(viaDigest)), BASE_FIXTURE_SET_SHA, 'the whole fixture set derives what the base derived')
+    assert.ok(Object.values(viaDigest).some((v) => v.verdict === 'ack'), 'the set holds a derived ack (calio)')
+    // a needle the alphabet cannot spell: the raw walk, as before
+    lad._internal.__clearJarDigests()
+    const dir = packOf('alpha')
+    assert.strictEqual(lad.assessLoginChannel('weird~ns:path', [dir]).verdict, 'unknown')
+    assert.deepStrictEqual({ built: stats().built, rawWalks: stats().rawWalks }, { built: 0, rawWalks: 3 })
+  }))
+})
