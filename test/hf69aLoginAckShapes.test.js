@@ -386,4 +386,100 @@ describe('HF69a - split constants, RL subclasses, direction-less login packets w
       assert.deepStrictEqual(_internal.namespaceProofOf(facts, { className: NET }), { owner: { by: 'class-bytes', className: NET }, helper: null, chain: null })
     })
   })
+  // HF95 — THE TOLERATED DECLINE. The F29 field (a 288-mod Forge 1.20.1
+  // pack): two channels whose every login message is server-to-client
+  // .markAsLoginPacket().noResponse() through a helper taking the Class as a
+  // parameter (S1) read 'no-derivable-ack' and were named as the kick's
+  // causes; by Forge's own law (SimpleChannel.MessageBuilder#noResponse clears
+  // needsResponse; IndexedMessageCodec.consume handles a null payload when
+  // !needsResponse) the decline there is the accepted answer. The shapes are
+  // synthetic jars (test/helpers/hf95LoginShapes.js); the single-shape rows
+  // of HF53 / HF69a and the S2 / S3 shapes stay byte-identical (m3, m4).
+  describe('HF95 no-reply-needed: a channel whose every login message is S2C + noResponse is a tolerated decline', () => {
+    const shapes = require('./helpers/hf95LoginShapes')
+    const crypto = require('crypto')
+    const pinOf = (r) => crypto.createHash('sha256').update(JSON.stringify({ verdict: r.verdict, reason: r.reason, why: r.why, msgClass: r.msgClass, evidence: r.evidence, index: r.index })).digest('hex').slice(0, 16)
+    const tmp = (tag) => fs.mkdtempSync(path.join(os.tmpdir(), `hf95-${tag}-`))
+    // recorded from the BASE tree (43ba03d3) by the lane's baseline script over the same fixtures
+    const BASE = { s2: '0375fcf6582e4660', ctrl: '18abda47f2a3385b', s3: 'c56332dfa219eecd', calio: '18ab347fd41532cc' }
+
+    it('m1 S1: every login-marked site is S2C with noResponse and no C2S login site exists -> no-reply-needed, the sites named in why, no msgClass, the decline is tolerated', () => {
+      const { dir, channels } = shapes.f29Pack(tmp('m1'))
+      for (const ch of channels.slice(0, 2)) {
+        const r = assessLoginChannel(ch, [dir])
+        assert.strictEqual(r.verdict, 'underivable', ch)
+        assert.strictEqual(r.reason, 'no-reply-needed', ch)
+        assert.match(r.why, /^every login-marked site is server-to-client with noResponse: synth\/[a-z_]+\/Network#registerLoginS2C/)
+        assert.strictEqual(r.msgClass, undefined)
+        assert.match(r.evidence, /every login message it registers is marked noResponse — no reply is needed/)
+        assert.strictEqual(r.corroboration, 'corroborated-by-local-jar')
+        assert.strictEqual(deriveLoginAck(ch, [dir]), null)
+      }
+    })
+
+    it('m2 CONTROL: one S2C noResponse site AND one C2S login site on the same channel -> NOT no-reply-needed (the reply-needed row, byte-identical to the base)', () => {
+      const dir = tmp('m2'); shapes.s1Jar(dir, { ns: 'ctrlmod', pathPart: 'handshake', withC2S: true })
+      const r = assessLoginChannel('ctrlmod:handshake', [dir])
+      assert.strictEqual(r.verdict, 'underivable')
+      assert.strictEqual(r.reason, 'no-derivable-ack')
+      assert.strictEqual(pinOf(r), BASE.ctrl)
+    })
+
+    it('m3 S2: the generic-helper shape (Class as a parameter, LOGIN_TO_SERVER reply, S2C markAsLoginPacket without noResponse) keeps the decisive reason no-derivable-ack, byte-identical to the base', () => {
+      const { dir, channels } = shapes.f29Pack(tmp('m3'))
+      const r = assessLoginChannel(channels[2], [dir])
+      assert.strictEqual(r.verdict, 'underivable')
+      assert.strictEqual(r.reason, 'no-derivable-ack')
+      assert.strictEqual(r.msgClass, undefined, 'the Class is a helper parameter: no msgClass at the site ((c) not landed)')
+      assert.strictEqual(pinOf(r), BASE.s2)
+    })
+
+    it('m4 S3 (library-mediated handshake) and the hf53 nested fixture read exactly as on the base (sha pins)', () => {
+      const dir = tmp('m4'); shapes.s3Jars(dir)
+      const s3 = assessLoginChannel('backpacked:play', [dir])
+      assert.strictEqual(s3.reason, 'no-derivable-ack')
+      assert.strictEqual(pinOf(s3), BASE.s3)
+      const calio = assessLoginChannel('calio:channel', [path.join(__dirname, 'fixtures', 'hf53-origins-forge-1.20.1-1.10.0.9.trimmed.jar')])
+      assert.strictEqual(calio.verdict, 'ack')
+      assert.strictEqual(pinOf(calio), BASE.calio)
+    })
+
+    it('m5 THE WIRE: the F29 pack asked in field order (S1a, S1b, S2) - every answer is the same not-understood decline; S1 is recorded tolerated without the known-fatal mark and logged tolerated, S2 keeps the known-fatal record and copy', async () => {
+      const forgeHandshake3 = require('../src/client/forgeHandshake3')
+      const { EventEmitter } = require('events')
+      const { writeVarInt, writeString } = forgeHandshake3
+      const { dir, channels } = shapes.f29Pack(tmp('m5'))
+      const client = new EventEmitter()
+      client.state = 'login'; client.written = []
+      client.write = (name, params) => client.written.push({ name, params })
+      client.end = () => {}
+      client.on('login_plugin_request', function () {})
+      client.forgeModList = { mods: ['minecraft', 'forge', 'tacztweaks', 'kubejs_tfc', 'additionalplacements'], channels: channels.map((name) => ({ name, marker: '1' })), registries: [] }
+      client.forgePingMods = [{ id: 'tacztweaks', version: '2.14.2' }, { id: 'kubejs_tfc', version: '1.20.1-1.6.2' }, { id: 'additionalplacements', version: '1.20.1-5.0.1' }]
+      forgeHandshake3(client, { modsPaths: [dir] })
+      const lines = []; const warn = console.warn; const log = console.log
+      console.warn = (m) => lines.push(String(m)); console.log = (m) => lines.push(String(m))
+      try {
+        for (const [i, ch] of channels.entries()) {
+          client.emit('login_plugin_request', { messageId: [1, 76, 77][i], channel: 'fml:loginwrapper', data: Buffer.concat([writeString(ch), writeVarInt(2), writeVarInt(0), Buffer.from([0x01])]) })
+          await new Promise((resolve) => setImmediate(() => setImmediate(() => setImmediate(resolve))))
+        }
+      } finally { console.warn = warn; console.log = log }
+      const replies = client.written.filter((w) => w.name === 'login_plugin_response')
+      assert.deepStrictEqual(replies.map((w) => [w.params.messageId, w.params.data]), [[1, undefined], [76, undefined], [77, undefined]], 'the same decline bytes on all three')
+      const d = client.forgeDeclinedLoginChannels
+      assert.deepStrictEqual(d.map((x) => [x.channel, x.reason, x.tolerated === true, 'knownFatalDecline' in x]), [
+        [channels[0], 'no-reply-needed', true, false],
+        [channels[1], 'no-reply-needed', true, false],
+        [channels[2], 'no-derivable-ack', false, true]
+      ])
+      assert.deepStrictEqual(d[2].knownFatalDecline, { basis: 'fml3-login-message-needs-response', why: 'no-derivable-ack' })
+      const tolerated = lines.filter((l) => l.includes('not-understood decline (tolerated)'))
+      assert.strictEqual(tolerated.length, 2, lines.join('\n'))
+      for (const l of tolerated) { assert.match(l, /every login message the local mod jars register on it is marked noResponse/); assert.doesNotMatch(l, /ENDS THE LOGIN|no provable/) }
+      const fatal = lines.find((l) => l.includes(`channel "${channels[2]}" with the protocol's not-understood decline:`))
+      assert.match(fatal, /ENDS THE LOGIN whenever the message needs a reply/)
+      assert.ok(lines.some((l) => /needs no reply \(no-reply-needed;/.test(l)), 'the assessment log says no reply is needed, never "no correct reply"')
+    })
+  })
 })

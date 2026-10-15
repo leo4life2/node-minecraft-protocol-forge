@@ -291,6 +291,12 @@ function parseServerRegistry (client, buffer, offset) {
 //                         an answer no decline can satisfy, so the join
 //                         fails HERE, naming the channel, instead of dying
 //                         with the server's generic kick.
+//          reason 'no-reply-needed' -> TOLERATED DECLINE (HF95): the jars
+//                         prove every login message on the channel is
+//                         server-to-client with noResponse(), so the server
+//                         handles the empty answer (IndexedMessageCodec
+//                         .consume, !needsResponse) — the same decline bytes,
+//                         logged as tolerated, no known-fatal mark.
 //          reason 'no-derivable-ack' -> PROTOCOL-CORRECT DECLINE (HF8, the
 //                         tacztweaks:handshake receipt). The reference
 //                         client's own behavior for a login query it cannot
@@ -731,13 +737,28 @@ function failWrappedLoginHonestly (client, channel, assessed) {
 // so a following kick is classified with this channel attached.
 function declineWrappedLoginHonestly (client, channel, assessed) {
   const nested = assessed.nestedChain && assessed.nestedChain.length ? ` (the channel is created by ${assessed.nestedArtifact}, nested inside ${assessed.jarName})` : ''
+  if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
+  // HF95: a TOLERATED decline. The jars prove every login message on the
+  // channel is server-to-client with noResponse() (SimpleChannel.MessageBuilder
+  // #noResponse clears needsResponse; IndexedMessageCodec.consume handles a
+  // null payload when !needsResponse), so the same decline bytes ARE the
+  // accepted answer: logged as tolerated, recorded without the known-fatal
+  // mark, never the cause of a kick that follows.
+  if (assessed.reason === 'no-reply-needed') {
+    const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline (tolerated): ` +
+      `every login message the local mod jars register on it is marked noResponse${nested}, so the server handles the empty answer without waiting for a reply — ` +
+      `this decline is not what ends a login that fails later (${assessed.why || assessed.evidence}).`
+    console.log(`[forge] ${message}`)
+    client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null, tolerated: true, ...nestingFacts(assessed) })
+    client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null, tolerated: true })
+    return
+  }
   const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline: ` +
     `no provable acknowledgement reply exists in the local mod jars${nested}, and a decline (unlike a guessed acknowledgement) is not a claim. ` +
     `${KNOWN_FATAL_ON_FML3} ` +
     'The server now decides — mods that tolerate a vanilla-shaped answer continue the login; mods that require the reply will kick with their own message.'
   console.warn(`[forge] ${message}`)
   const knownFatalDecline = { basis: KNOWN_FATAL_BASIS, why: assessed.reason }
-  if (!Array.isArray(client.forgeDeclinedLoginChannels)) client.forgeDeclinedLoginChannels = []
   client.forgeDeclinedLoginChannels.push({ channel, verdict: assessed.verdict, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null, knownFatalDecline, ...nestingFacts(assessed) })
   client.emit('forgeLoginDeclined', { channel, reason: assessed.reason, evidence: assessed.evidence, acquisition: assessed.acquisition || null, knownFatalDecline })
 }

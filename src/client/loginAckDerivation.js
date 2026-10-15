@@ -63,7 +63,10 @@ const { NESTED_JAR_RE, forEachNestedJar } = require('./nestedJars')
 //   3 — HF69a namespace-owner prefilter (mods.toml / String constants), RL
 //       subclasses + constructor-chain helper namespaces, lambda encoders
 //       proven from their bytecode, markAsLoginPacket = a server payload
-const LOGIN_ACK_DERIVATION_VERSION = 3
+//   4 — HF95 the tolerated decline: reason 'no-reply-needed' when every
+//       login-marked site is server-to-client with noResponse (a persisted
+//       'no-derivable-ack' verdict of such a channel is re-derived)
+const LOGIN_ACK_DERIVATION_VERSION = 4
 
 const RL_CLASSES = new Set([
   'net/minecraft/resources/ResourceLocation', // mojmap/srg (Forge 1.17+ mods)
@@ -1399,7 +1402,12 @@ const assessSources = new Map()
  *       The channel IS created by a local jar, but no correct reply can be
  *       constructed: reason 'substantive-reply' when a login-marked C2S
  *       message provably writes data we cannot reconstruct, else
- *       'no-derivable-ack'. Callers must fail the join honestly — the FML
+ *       'no-derivable-ack'; HF95: 'no-reply-needed' (with `why` naming the
+ *       sites) when every login-marked site is server-to-client with
+ *       noResponse and no client-to-server login site exists — the server
+ *       handles the null payload of the not-understood decline there
+ *       (IndexedMessageCodec.consume, !needsResponse), a TOLERATED decline.
+ *       Callers must fail the join honestly — the FML
  *       convention byte (99) is then a KNOWN-wrong guess, and Forge's login
  *       protocol defines no accepted "not understood" answer for wrapped
  *       channels (any undispatched response kicks with
@@ -1430,6 +1438,9 @@ function assessLoginChannel (channelId, modsPaths) {
   }
   if (result.verdict === 'ack') {
     console.log(`[forge] derived ${channelId} login ack: index ${result.index} (${result.msgClass}; ${result.evidence}; ${Date.now() - started}ms)`)
+  } else if (result.verdict === 'underivable' && result.reason === 'no-reply-needed') {
+    // HF95: a tolerated decline is the right answer, never a missing one
+    console.log(`[forge] ${channelId} login channel found in local jars and needs no reply (${result.reason}; ${result.evidence}; ${Date.now() - started}ms)`)
   } else if (result.verdict === 'underivable') {
     console.log(`[forge] ${channelId} login channel found in local jars but no correct reply is derivable (${result.reason}; ${result.evidence}; ${Date.now() - started}ms)`)
   } else {
@@ -1675,6 +1686,16 @@ function assessUncached (channelId, paths) {
   // failure instead of guessing.
   const fields = new Set(channelCreations.filter((c) => c.direct && c.channelField).map((c) => c.channelField))
   let substantive = null
+  // HF95: the login-marked sites of the channel, split by whether the server
+  // waits for a reply to them. SimpleChannel.MessageBuilder#markAsLoginPacket
+  // sets needsResponse=true and only an explicit noResponse() clears it
+  // (Forge 1.20.1 SimpleChannel.MessageBuilder#noResponse ->
+  // HandshakeHandler.packetNeedsResponse); a server-generated login payload
+  // registered with noResponse() is consumed with a NULL payload handled
+  // (IndexedMessageCodec.consume: `if (payload == null && !needsResponse)`),
+  // so the protocol's not-understood decline is the accepted answer there.
+  const noReplySites = []
+  let replySiteSeen = false
   for (const parsed of hot) {
     for (const m of parsed.codes) {
       for (const site of extractRegSites(eventsFor(facts, parsed, m), parsed.className, m.method, indySitesOf(facts, parsed, m))) {
@@ -1682,7 +1703,12 @@ function assessUncached (channelId, paths) {
         // HF69a (C): a markAsLoginPacket site without a LOGIN_TO_SERVER
         // direction is a payload the SERVER sends (cited in extractRegSites)
         // — never the client's reply, so it cannot make the reply substantive
-        if (site.loginPacketMarked && site.direction !== 'LOGIN_TO_SERVER') continue
+        if (site.loginPacketMarked && site.direction !== 'LOGIN_TO_SERVER') {
+          if (site.noResponse) noReplySites.push(site)
+          else replySiteSeen = true
+          continue
+        }
+        if (site.loginMarked) replySiteSeen = true
         if (site.loginMarked && site.msgClass && (!site.direction || site.direction === 'LOGIN_TO_SERVER') &&
             !encoderProofOf(facts, site).empty) {
           substantive = site.msgClass
@@ -1691,6 +1717,22 @@ function assessUncached (channelId, paths) {
     }
   }
   const where = corroborationOf(facts, channelCreations[0].className)
+  const creator = `${channelCreations[0].className}${where.nestedChain.length ? `, nested in ${where.jarName} -> ${where.nestedArtifact}` : ''}`
+  // HF95: every login-marked site is server-to-client with noResponse and no
+  // client-to-server login site exists — nothing on this channel waits for a
+  // reply, the decline is tolerated by the server (reason 'no-reply-needed').
+  if (!substantive && !replySiteSeen && noReplySites.length > 0) {
+    const sites = noReplySites.map((s) => `${s.className}#${s.method}${s.msgClass ? ` (${s.msgClass})` : ''}`).join(', ')
+    const why = `every login-marked site is server-to-client with noResponse: ${sites}`
+    return {
+      verdict: 'underivable',
+      reason: 'no-reply-needed',
+      why: facts.abstains.length ? `${why}; ${facts.abstains.join('; ')}` : why,
+      ...where,
+      namespaceProof: namespaceProofOf(facts, channelCreations[0]),
+      evidence: `channel is created by a local jar (${creator}) and every login message it registers is marked noResponse — no reply is needed`
+    }
+  }
   return {
     verdict: 'underivable',
     reason: substantive ? 'substantive-reply' : 'no-derivable-ack',
@@ -1698,7 +1740,7 @@ function assessUncached (channelId, paths) {
     msgClass: substantive || undefined,
     ...where,
     namespaceProof: namespaceProofOf(facts, channelCreations[0]),
-    evidence: `channel is created by a local jar (${channelCreations[0].className}${where.nestedChain.length ? `, nested in ${where.jarName} -> ${where.nestedArtifact}` : ''}) but no provable login-ack reply exists`
+    evidence: `channel is created by a local jar (${creator}) but no provable login-ack reply exists`
   }
 }
 
