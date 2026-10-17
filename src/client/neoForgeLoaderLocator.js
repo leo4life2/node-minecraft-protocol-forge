@@ -76,19 +76,35 @@ function dropTrailingZeros (comps) {
 }
 
 /**
+ * HF100 r3: the NeoForge lines numbered BEFORE the game-version scheme - data,
+ * keyed by a build's leading number, valued as the game-version axis that line
+ * names (the same shape neoForgeBuildGameAxis returns). From the NeoForge
+ * release history: the project forked from Forge at Minecraft 1.20.1 and kept
+ * Forge's 47.1.x numbering for that one line (47.1.3 was the first NeoForge
+ * release, August 2023; every later 1.20.1 build is 47.1.x); from 1.20.2 on
+ * each build is named after its game version (20.2.x and up). No other line
+ * exists before the scheme, so the table has one row.
+ */
+const NEOFORGE_LEGACY_LINE_GAME_AXIS = Object.freeze({ 47: Object.freeze([20, 1]) })
+
+/**
  * HF100: the game-version axis of a NeoForge build number - the numeric
  * leading segments minus the LAST one (the build counter), trailing zeros
  * dropped. NeoForge names every build after the game version it is built
  * for; the 1.x line drops Minecraft's leading major (the scheme, not a
  * version): 20.2.88 -> [20, 2] (1.20.2), 21.1.0-beta -> [21, 1] (1.21.1),
- * 26.1.2.121 -> [26, 1, 2] (26.1.2), 26.3.0.83 -> [26, 3] (26.3).
- * null when the name carries fewer than two numeric segments.
+ * 26.1.2.121 -> [26, 1, 2] (26.1.2), 26.3.0.83 -> [26, 3] (26.3). A line
+ * numbered before that scheme reads its axis from NEOFORGE_LEGACY_LINE_GAME_AXIS
+ * (47.1.106 -> [20, 1], the 1.20.1 line). null when the name carries fewer
+ * than two numeric segments.
  * @param {string} build
  * @returns {number[]|null}
  */
 function neoForgeBuildGameAxis (build) {
   const nums = numericLead(build)
   if (nums.length < 2) return null
+  const legacy = NEOFORGE_LEGACY_LINE_GAME_AXIS[nums[0]]
+  if (legacy) return legacy.slice()
   return dropTrailingZeros(nums.slice(0, -1))
 }
 
@@ -254,6 +270,7 @@ module.exports = {
   compareNeoForgeVersions,
   // HF100: the game-version axis + the one claim record
   LOADER_ABSTAIN_FOREIGN_GAME_VERSION,
+  NEOFORGE_LEGACY_LINE_GAME_AXIS,
   neoForgeBuildGameAxis,
   neoForgeBuildMatchesGameVersion,
   neoForgeLoaderClaimOf,

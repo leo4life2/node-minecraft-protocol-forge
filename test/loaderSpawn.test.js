@@ -298,7 +298,7 @@ describe('Forge loader jar locator', () => {
 })
 
 describe('NeoForge loader jar locator (HF100: the game-version axis of each build against the world game version)', () => {
-  const { pickNeoForgeLoaderJars, neoForgeBuildGameAxis, neoForgeBuildMatchesGameVersion, neoForgeLoaderClaimOf, LOADER_ABSTAIN_FOREIGN_GAME_VERSION } = require('../src/client/neoForgeLoaderLocator')
+  const { pickNeoForgeLoaderJars, neoForgeBuildGameAxis, neoForgeBuildMatchesGameVersion, neoForgeLoaderClaimOf, LOADER_ABSTAIN_FOREIGN_GAME_VERSION, NEOFORGE_LEGACY_LINE_GAME_AXIS } = require('../src/client/neoForgeLoaderLocator')
   const tree = (name, builds) => {
     const inst = path.join(tmp, name)
     const mods = path.join(inst, 'mods')
@@ -321,6 +321,31 @@ describe('NeoForge loader jar locator (HF100: the game-version axis of each buil
     assert.ok(neoForgeBuildMatchesGameVersion('20.2.88', '1.20.2') && neoForgeBuildMatchesGameVersion('21.1.216', '1.21.1') && neoForgeBuildMatchesGameVersion('21.0.5', '1.21'))
     assert.ok(!neoForgeBuildMatchesGameVersion('26.3.0.83', '26.1.2') && !neoForgeBuildMatchesGameVersion('21.1.216', '1.20.4') && !neoForgeBuildMatchesGameVersion('26.1.2.121', '26.3'))
     assert.ok(!neoForgeBuildMatchesGameVersion('26.3.0.83', null) && !neoForgeBuildMatchesGameVersion(null, '26.3'))
+    // HF100 r3: the legacy line reads its axis from the table (data), the 1.x drop rule then matches it
+    assert.deepStrictEqual(neoForgeBuildGameAxis('47.1.106'), [20, 1])
+    assert.deepStrictEqual(neoForgeBuildGameAxis('47.1.3'), [20, 1])
+    assert.ok(neoForgeBuildMatchesGameVersion('47.1.106', '1.20.1') && neoForgeBuildMatchesGameVersion('47.1.3', '1.20.1'))
+    assert.ok(!neoForgeBuildMatchesGameVersion('47.1.106', '1.20.2') && !neoForgeBuildMatchesGameVersion('47.1.106', '1.20.4') && !neoForgeBuildMatchesGameVersion('20.2.88', '1.20.1'))
+    assert.strictEqual(neoForgeBuildGameAxis('47'), null, 'one segment is no build number, table or not')
+    assert.deepStrictEqual(Object.keys(NEOFORGE_LEGACY_LINE_GAME_AXIS), ['47'], 'the table names the one line numbered before the scheme')
+    for (const [major, axis] of Object.entries(NEOFORGE_LEGACY_LINE_GAME_AXIS)) {
+      assert.deepStrictEqual(neoForgeBuildGameAxis(`${major}.1.3`), axis)
+      assert.notStrictEqual(neoForgeBuildGameAxis(`${major}.1.3`), axis, 'a copy, never the table row')
+      assert.ok(neoForgeBuildMatchesGameVersion(`${major}.1.3`, `1.${axis.join('.')}`))
+    }
+  })
+  it('HF100 r3: the legacy 1.20.1 line (47.1.x) is claimed as the running loader of a 1.20.1 world (kind local, abstain null), newest numerically; a 1.21.1 world in the same tree claims its own line', () => {
+    const mods = tree('neo-legacy47', ['47.1.3', '47.1.106', '47.1.99', '21.1.216'])
+    const pick = pickNeoForgeLoaderJars([mods], { mcVersion: '1.20.1' })
+    assert.strictEqual(pick.version, '47.1.106', 'numeric, the newest of the legacy line')
+    assert.strictEqual(pick.foreignBuilds, undefined)
+    assert.strictEqual(pick.guess, undefined)
+    assert.deepStrictEqual(neoForgeLoaderClaimOf(pick), { jars: pick.jars, version: '47.1.106', kind: 'local', abstain: null, foreignBuilds: [] })
+    assert.strictEqual(pickNeoForgeLoaderJars([mods], { mcVersion: '1.21.1' }).version, '21.1.216')
+    const foreign = pickNeoForgeLoaderJars([tree('neo-legacy47-only', ['47.1.106'])], { mcVersion: '1.20.2' })
+    assert.deepStrictEqual(foreign.jars, [])
+    assert.strictEqual(foreign.abstain, LOADER_ABSTAIN_FOREIGN_GAME_VERSION)
+    assert.deepStrictEqual(foreign.guess.gameAxis, [20, 1])
   })
   it('a foreign lone build is NAMED, never claimed: foreignBuilds + the abstain enum; the newest foreign build rides back as a stamped GUESS (today\'s jar, byte for byte)', () => {
     const mods = tree('neo-foreign', ['26.3.0.83'])
