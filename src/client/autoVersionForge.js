@@ -153,16 +153,19 @@ function listModJars (modsPaths) {
 // server-announced build first, else numerically newest local build).
 // Missing is tolerated (mod channels alone still negotiate; registry sync is
 // then skipped by the server).
-const { pickNeoForgeLoaderJars } = require('./neoForgeLoaderLocator')
+const { pickNeoForgeLoaderJars, neoForgeLoaderClaimOf } = require('./neoForgeLoaderLocator')
 
-function findNeoForgeLoaderJars (modsPaths, preferredVersion) {
-  const picked = pickNeoForgeLoaderJars(modsPaths, { preferredVersion })
-  if (picked.jars.length > 0) {
-    debug(`neoforge universal jar located: ${picked.jars[0]}${picked.matchedPreferred ? ' (matches the server-announced build)' : ''}`)
+function findNeoForgeLoaderJars (modsPaths, preferredVersion, mcVersion = null) {
+  // HF100: keyed on the world game version when known; a foreign-game-version
+  // build is read as a stamped guess (today's jar), never the running loader
+  const picked = pickNeoForgeLoaderJars(modsPaths, { preferredVersion, mcVersion })
+  const claim = neoForgeLoaderClaimOf(picked)
+  if (claim.jars.length > 0) {
+    debug(`neoforge universal jar located: ${claim.jars[0]}${picked.matchedPreferred ? ' (matches the server-announced build)' : claim.kind === 'guess' ? ` (a ${claim.abstain} guess: build ${claim.version} is of another game version)` : ''}`)
   } else {
     debug('no neoforge universal jar found near the mods folder(s) — built-in channels unclaimed')
   }
-  return picked.jars
+  return claim.jars
 }
 
 // 1.20.2 moved the Forge handshake from the login state into the vanilla
@@ -331,7 +334,7 @@ module.exports = function (client, options) {
     }
     const modsPaths = options.modsPaths || options.owoModsPaths || []
     const jarPaths = listModJars(modsPaths)
-    const loaderJars = options.neoForgeLoaderJars || findNeoForgeLoaderJars(modsPaths, options.neoForgePreferredVersion)
+    const loaderJars = options.neoForgeLoaderJars || findNeoForgeLoaderJars(modsPaths, options.neoForgePreferredVersion, client.version || null)
     if (jarPaths.length === 0) {
       debug('NeoForge 1.20.5+ server detected but no local mod jars resolved — attempting vanilla join')
       return

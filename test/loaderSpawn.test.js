@@ -297,6 +297,72 @@ describe('Forge loader jar locator', () => {
   })
 })
 
+describe('NeoForge loader jar locator (HF100: the game-version axis of each build against the world game version)', () => {
+  const { pickNeoForgeLoaderJars, neoForgeBuildGameAxis, neoForgeBuildMatchesGameVersion, neoForgeLoaderClaimOf, LOADER_ABSTAIN_FOREIGN_GAME_VERSION } = require('../src/client/neoForgeLoaderLocator')
+  const tree = (name, builds) => {
+    const inst = path.join(tmp, name)
+    const mods = path.join(inst, 'mods')
+    fs.mkdirSync(mods, { recursive: true })
+    for (const v of builds) {
+      const d = path.join(inst, 'libraries', 'net', 'neoforged', 'neoforge', v)
+      fs.mkdirSync(d, { recursive: true })
+      fs.writeFileSync(path.join(d, `neoforge-${v}-universal.jar`), 'x')
+    }
+    return mods
+  }
+  it('parses the game-version axis from the build number (the worked cases) and matches it against the world game version', () => {
+    assert.deepStrictEqual(neoForgeBuildGameAxis('26.1.2.121'), [26, 1, 2])
+    assert.deepStrictEqual(neoForgeBuildGameAxis('26.3.0.83'), [26, 3])
+    assert.deepStrictEqual(neoForgeBuildGameAxis('20.2.88'), [20, 2])
+    assert.deepStrictEqual(neoForgeBuildGameAxis('21.1.0-beta'), [21, 1])
+    assert.strictEqual(neoForgeBuildGameAxis('universal'), null)
+    assert.ok(neoForgeBuildMatchesGameVersion('26.1.2.121', '26.1.2'))
+    assert.ok(neoForgeBuildMatchesGameVersion('26.3.0.83', '26.3') && neoForgeBuildMatchesGameVersion('26.3.0.83', '26.3.0'))
+    assert.ok(neoForgeBuildMatchesGameVersion('20.2.88', '1.20.2') && neoForgeBuildMatchesGameVersion('21.1.216', '1.21.1') && neoForgeBuildMatchesGameVersion('21.0.5', '1.21'))
+    assert.ok(!neoForgeBuildMatchesGameVersion('26.3.0.83', '26.1.2') && !neoForgeBuildMatchesGameVersion('21.1.216', '1.20.4') && !neoForgeBuildMatchesGameVersion('26.1.2.121', '26.3'))
+    assert.ok(!neoForgeBuildMatchesGameVersion('26.3.0.83', null) && !neoForgeBuildMatchesGameVersion(null, '26.3'))
+  })
+  it('a foreign lone build is NAMED, never claimed: foreignBuilds + the abstain enum; the newest foreign build rides back as a stamped GUESS (today\'s jar, byte for byte)', () => {
+    const mods = tree('neo-foreign', ['26.3.0.83'])
+    const pick = pickNeoForgeLoaderJars([mods], { mcVersion: '26.1.2' })
+    assert.deepStrictEqual(pick.jars, [])
+    assert.strictEqual(pick.version, null)
+    assert.strictEqual(pick.matchedPreferred, false)
+    assert.deepStrictEqual(pick.foreignBuilds, ['26.3.0.83'])
+    assert.strictEqual(pick.abstain, LOADER_ABSTAIN_FOREIGN_GAME_VERSION)
+    assert.strictEqual(pick.abstain, 'foreign-game-version')
+    assert.strictEqual(pick.guess.version, '26.3.0.83')
+    assert.strictEqual(path.basename(pick.guess.jars[0]), 'neoforge-26.3.0.83-universal.jar')
+    assert.deepStrictEqual(pick.guess.gameAxis, [26, 3])
+    const claim = neoForgeLoaderClaimOf(pick)
+    assert.deepStrictEqual(claim, { jars: pick.guess.jars, version: '26.3.0.83', kind: 'guess', abstain: 'foreign-game-version', foreignBuilds: ['26.3.0.83'] })
+    // without the world version the pick is today's rule 2, byte for byte - the guess reads the same jar
+    const today = pickNeoForgeLoaderJars([mods], {})
+    assert.deepStrictEqual(today, { jars: pick.guess.jars, version: '26.3.0.83', matchedPreferred: false })
+    assert.strictEqual(neoForgeLoaderClaimOf(today).kind, 'local')
+  })
+  it('the matching build is claimed over a newer foreign one; the announced build present locally wins over both (rule 1 unchanged); the 1.x line matches by the dropped major', () => {
+    const mods = tree('neo-both', ['26.3.0.83', '26.1.2.121', '26.1.2.100'])
+    const local = pickNeoForgeLoaderJars([mods], { mcVersion: '26.1.2' })
+    assert.strictEqual(local.version, '26.1.2.121', 'the newest of the SAME game version, not the newest overall')
+    assert.strictEqual(local.matchedPreferred, false)
+    assert.strictEqual(local.foreignBuilds, undefined)
+    assert.strictEqual(neoForgeLoaderClaimOf(local).kind, 'local')
+    const announced = pickNeoForgeLoaderJars([mods], { mcVersion: '26.1.2', preferredVersion: '26.3.0.83' })
+    assert.strictEqual(announced.version, '26.3.0.83')
+    assert.strictEqual(announced.matchedPreferred, true)
+    assert.strictEqual(neoForgeLoaderClaimOf(announced).kind, 'announced')
+    const legacy = tree('neo-legacy', ['21.1.216', '20.4.80'])
+    assert.strictEqual(pickNeoForgeLoaderJars([legacy], { mcVersion: '1.20.4' }).version, '20.4.80')
+    assert.strictEqual(pickNeoForgeLoaderJars([legacy], { mcVersion: '1.21.1' }).version, '21.1.216')
+    const none = pickNeoForgeLoaderJars([legacy], { mcVersion: '1.20.1' })
+    assert.deepStrictEqual(none.jars, [])
+    assert.deepStrictEqual(none.foreignBuilds, ['20.4.80', '21.1.216'])
+    assert.strictEqual(none.guess.version, '21.1.216')
+    assert.deepStrictEqual(neoForgeLoaderClaimOf({ jars: [], version: null, matchedPreferred: false }), { jars: [], version: null, kind: null, abstain: null, foreignBuilds: [] })
+  })
+})
+
 // --- ground truth over the real loader jars (env-gated) ------------------------------
 
 // PIN-COUNT NOTE: this block's rows exist only when MINEPAL_D3_JARS=<dir of loader universal jars>

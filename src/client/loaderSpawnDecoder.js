@@ -59,7 +59,7 @@
 const path = require('path')
 const debug = require('../../debug')
 const { deriveLoaderSpawnCodec } = require('./loaderSpawnDerivation')
-const { pickForgeLoaderJars, pickNeoForgeLoaderJars, collectForgeUniversalJars, collectNeoForgeUniversalJars } = require('./neoForgeLoaderLocator')
+const { pickForgeLoaderJars, pickNeoForgeLoaderJars, neoForgeLoaderClaimOf, collectForgeUniversalJars, collectNeoForgeUniversalJars } = require('./neoForgeLoaderLocator')
 const { installWorldBounds, worldBoundsOf, LEGAL_MIN_Y, LEGAL_MAX_Y, VOID_MARGIN } = require('./worldBounds')
 
 // Horizontal: the world border's hard limit (WorldBorder MAX_SIZE 5.9999968E7
@@ -277,9 +277,12 @@ function selectLoaderJar (client, options, family) {
   const announced = announcedLoaderVersion(client, options, family)
   if (family === 'neoforge') {
     const preferred = (options && options.neoForgeServerBuild) || announced || null
-    const pick = pickNeoForgeLoaderJars(paths, { preferredVersion: preferred })
-    const foreign = pick.jars.length ? [] : [...collectForgeUniversalJars(paths).keys()].filter((v) => !mc || v.startsWith(`${mc}-`)).map((v) => `forge ${v}`)
-    return { jar: pick.jars[0] || null, version: pick.version, matchedPreferred: pick.matchedPreferred, announced, paths, foreign }
+    // HF100: the pick is keyed on the world game version; a foreign-game-version
+    // build is read as a stamped guess (today's jar), never claimed as the running loader
+    const pick = pickNeoForgeLoaderJars(paths, { preferredVersion: preferred, mcVersion: mc })
+    const claim = neoForgeLoaderClaimOf(pick)
+    const foreign = claim.jars.length ? [] : [...collectForgeUniversalJars(paths).keys()].filter((v) => !mc || v.startsWith(`${mc}-`)).map((v) => `forge ${v}`)
+    return { jar: claim.jars[0] || null, version: claim.version, matchedPreferred: pick.matchedPreferred, announced, paths, foreign, loaderClaim: claim.kind, loaderAbstain: claim.abstain }
   }
   const pick = pickForgeLoaderJars(paths, { mcVersion: mc, preferredVersion: mc && announced ? `${mc}-${announced}` : null })
   const foreign = pick.jars.length ? [] : [...collectNeoForgeUniversalJars(paths).keys()].map((v) => `neoforge ${v}`)
