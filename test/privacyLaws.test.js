@@ -328,6 +328,8 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // HF53: the one nested-jar rule (zip entry reads only)
         './nestedJars',
         './loginReplyBoundary', './annotationRegistryDerivation', './listenOnlyDerivation', './data/blockShapeTables.json',
+        // HF105: the direction table (cited data, local JSON)
+        './data/payloadDirectionRules.json',
         // D3: loader-spawn codec derivation (jar bytes → codec spec) + its decoder + the loader-jar locator (local fs walk)
         './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator',
         // D3 rider: the gate's dimension-bounds tracker (packet fields only, no requires)

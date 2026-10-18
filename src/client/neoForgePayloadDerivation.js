@@ -78,6 +78,10 @@ const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cp
 const { nestedJarEntriesOf } = require('./nestedJars') // HF53 rider: the one nested-jar rule
 const { deriveAnnotationRegistries } = require('./annotationRegistryDerivation')
 const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveContainerCarriedListenChannels, assembleListenOnly } = require('./listenOnlyDerivation')
+// HF105 item A: the DIRECTION TABLE - the ordered rule shapes an enum packet
+// registry's direction is read by (data; every row cites the fixture jar + the
+// class it was read from). Consulted beside the marker read, in order.
+const DIRECTION_RULES = require('./data/payloadDirectionRules.json')
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
@@ -1395,7 +1399,7 @@ function analyzeWrapperMethod (index, wrapperCls, methodName, desc, state) {
 
 // ---------- ENUM-REGISTRY shape (catnip) ----------
 
-function deriveEnumRegistries (index, state, markers) {
+function deriveEnumRegistries (index, state, markers, read = null) {
   const out = []
   for (const name of seedNamesOf(index, state)) {
     const bytes = index.rawBytes(name)
@@ -1486,24 +1490,84 @@ function deriveEnumRegistries (index, state, markers) {
     }
     for (const c of constants) {
       const payloadClass = c.classes[0] || null
-      const flow = payloadClass ? flowFromHierarchy(index, payloadClass, markers) : null
+      // HF105 item A: the direction is decided by the DIRECTION TABLE in rule
+      // order (rule 0 = the unit's own marker read, byte for byte as before);
+      // no rule deciding = the abstain as before, naming the rules tried
+      const decided = payloadClass ? decideFlowByRules(index, payloadClass, markers, read) : null
       const id = `${helperNs}:${c.name.toLowerCase()}`
-      if (!flow) {
-        state.diagnostics.abstains.push(`${id}: no flow marker on ${payloadClass}`)
+      if (!decided) {
+        state.diagnostics.abstains.push(`${id}: no flow marker on ${payloadClass}${directionRulesTriedNote()}`)
         continue
       }
       out.push({
         id,
         version: registry.version,
-        flow,
+        flow: decided.flow,
         optional: false,
         protocols: ['play'],
-        source: `enum-registry ${name} (${registry.modId})`,
+        source: `enum-registry ${name} (${registry.modId})${decided.note}`,
         jar: info.jar
       })
     }
   }
   return out
+}
+
+// HF105 item A — THE DIRECTION TABLE (src/client/data/payloadDirectionRules.json).
+// An enum packet registry (Create/catnip's shape above) carries no direction
+// of its own: the loader helper decides it at registration time by the
+// MARKER INTERFACES in the payload class's hierarchy. The marker read used
+// to be the UNIT's alone (discoverFlowMarkers over this jar's entry methods),
+// so an addon whose payloads implement a marker ANOTHER jar's helper names
+// (TFMG / createdieselgenerators: catnip's markers live in Create's nested
+// ponder jar, the payload supers in Create's own classes) dropped every row
+// "no flow marker" and the server named them all (F39, 12 of 12). The table
+// lists the rule shapes in order; the only shape the cited fixtures exhibit
+// is marker-hierarchy, read at unit scope (rule 0, unchanged) and then at
+// PACK scope: the marker census of every unit's helper lambdas (the same
+// isAssignableFrom / playToX pairing), discovered once per read, with the
+// hierarchy walked through the shared index. The pack read is a pack-wide
+// scan: the unit's deps record the pack census (the absence law) and every
+// cross-jar class read lands on the unit's trail, so a slot never outlives
+// the pack it was decided in. A rule word the code does not model is skipped
+// (never guessed), and no rule deciding keeps the abstain.
+function packFlowMarkersOf (index, read) {
+  if (!read) return null
+  if (!read.packFlowMarkers) {
+    const entries = []
+    for (const name of index.allNames()) {
+      const bytes = index.rawBytes(name)
+      if (!bytes || !bytes.includes('isAssignableFrom') || !(bytes.includes('playToClient') || bytes.includes('playToServer'))) continue
+      const info = index.get(name)
+      if (!info) continue
+      for (const m of info.codes) if (m.code) entries.push({ info, method: m })
+    }
+    read.packFlowMarkers = discoverFlowMarkers(index, entries)
+  } else if (index.focus) {
+    // a later unit reading the cached census depends on the pack it was read from
+    index.packScanned = true
+  }
+  return read.packFlowMarkers
+}
+
+function directionRuleWords () {
+  return (DIRECTION_RULES.rules || []).map((r) => `${r.rule}/${r.scope}`)
+}
+
+function directionRulesTriedNote () {
+  const words = directionRuleWords()
+  return words.length > 1 ? ` (direction rules tried: ${words.join(', ')})` : ''
+}
+
+function decideFlowByRules (index, cls, unitMarkers, read) {
+  for (const rule of DIRECTION_RULES.rules || []) {
+    if (rule.rule !== 'marker-hierarchy') continue
+    const markers = rule.scope === 'pack' ? packFlowMarkersOf(index, read) : rule.scope === 'unit' ? unitMarkers : null
+    if (!markers) continue
+    const flow = flowFromHierarchy(index, cls, markers)
+    if (flow) return { flow, rule: `${rule.rule}/${rule.scope}`, note: rule.scope === 'unit' ? '' : ` [direction: ${rule.rule}/${rule.scope}]` }
+  }
+  return null
 }
 
 function flowFromHierarchy (index, cls, markers, depth = 0) {
@@ -4227,7 +4291,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
   }
 
   const markers = discoverFlowMarkers(index, entryMethods)
-  const enumComponents = deriveEnumRegistries(index, state, markers)
+  const enumComponents = deriveEnumRegistries(index, state, markers, read)
 
   // the unit's CLAIMS: the tuples the pack assembly feeds its conflict guard,
   // tagged with the assembly phase they belonged to (0 registrations, 1 enum

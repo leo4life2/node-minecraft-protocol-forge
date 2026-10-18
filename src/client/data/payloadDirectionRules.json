@@ -1,0 +1,46 @@
+{
+  "_about": "HF105 item A - THE DIRECTION TABLE for enum packet registries (Create/catnip shape: an enum whose constants carry a payload class + codec and whose registry construction carries (modId, version); no direction of its own). The walk consults these rules IN ORDER when it needs a payload class's direction; the first rule that decides wins; no rule deciding keeps the 'no flow marker' abstain naming the rules tried. Every row cites the fixture jar (the REAL file name + its sha1, and the trimmed test fixture + its sha1) and the class the shape was read from (javap over the real bytes, 2026-10-18). Rule shapes not exhibited by a cited fixture (a direction-valued constant on the payload type or the enum constant, a boolean construction argument of the registry entry, the registrar call shape) are NOT listed: a row without a cited fixture is a guess.",
+  "rules": [
+    {
+      "rule": "marker-hierarchy",
+      "scope": "unit",
+      "reads": "the marker interfaces discovered in THIS unit's own registrar-event entry methods (a loader-helper lambda pairing Class.isAssignableFrom with playToClient / playToServer: discoverFlowMarkers), looked for in the payload class's super / interface hierarchy (flowFromHierarchy, depth 8). The read that stood before HF105, byte for byte.",
+      "cited": [
+        {
+          "jar": "create-1.21.1-6.0.10.jar",
+          "sha1": "0e97e49837bed766e6f28a4c95b04885d6acc353",
+          "fixture": "hf105-create-1.21.1-6.0.10.trimmed.jar",
+          "fixture_sha1": "4c7d9ad19672df843bbc9928d31b52c420336efa",
+          "class": "META-INF/jarjar/ponder-neoforge-1.0.82+mc1.21.1.jar!net/createmod/catnip/platform/NeoForgeNetworkHelper.lambda$registerPackets$4(CatnipPacketRegistry, RegisterPayloadHandlersEvent)",
+          "bytes": "ldc class net/createmod/catnip/net/base/ClientboundPacketPayload; invokevirtual Class.isAssignableFrom; ldc class net/createmod/catnip/net/base/ServerboundPacketPayload; invokevirtual Class.isAssignableFrom; ... PayloadRegistrar.playToClient / PayloadRegistrar.playToServer",
+          "decides": "com/simibubi/create/AllPackets constants (their payload classes implement the markers inside the same jar) - the control row of the HF105 pin (claim set byte-identical)"
+        }
+      ]
+    },
+    {
+      "rule": "marker-hierarchy",
+      "scope": "pack",
+      "reads": "the marker census of EVERY unit of the read (every class whose bytes name isAssignableFrom and playToClient / playToServer, each method handed to discoverFlowMarkers; discovered once per read, cached on it), looked for in the payload class's hierarchy walked through the shared index (a cross-jar super lands on the unit's trail; the census read sets the unit's pack-census dependency).",
+      "cited": [
+        {
+          "jar": "tfmg-1.2.0.jar",
+          "sha1": "b520f3687f60a69eb265ff5b9a16759b9e124103",
+          "fixture": "hf105-tfmg-1.2.0.trimmed.jar",
+          "fixture_sha1": "fceea3b9eaaffba51496fe641fa73b383fcba957",
+          "class": "com/drmangotea/tfmg/registry/TFMGPackets (new CatnipPacketRegistry(\"create\", 1); constants (Class, StreamCodec) - no direction constant, no boolean)",
+          "payloads": "com/drmangotea/tfmg/content/electricity/configuration_wrench/ElectriciansWrenchPacket implements net/createmod/catnip/net/base/ServerboundPacketPayload (the marker is named in TFMG's own bytes but discovered only in Create's nested ponder jar); com/drmangotea/tfmg/content/engines/engine_controller/packets/EngineControllerPacketBase implements ServerboundPacketPayload; com/drmangotea/tfmg/content/electricity/connection/cables/CablePlacePacket extends com/simibubi/create/foundation/networking/BlockEntityDataPacket (Create's own class, another unit); com/drmangotea/tfmg/content/machinery/vat/base/VatEvaluationPacket extends com/simibubi/create/foundation/networking/BlockEntityConfigurationPacket",
+          "decides": "the 11 create:* ids the F39 Case A server named (a-missing.txt) + the 6 TFMG rows it did not name"
+        },
+        {
+          "jar": "createdieselgenerators-1.21.1-1.3.15.jar",
+          "sha1": "7f751dabfa83c141c1d13025cd16f06553ba459b",
+          "fixture": "hf105-createdieselgenerators-1.21.1-1.3.15.trimmed.jar",
+          "fixture_sha1": "0dcfc12c529fbcf703d670d4bf050540039589d7",
+          "class": "com/jesz/createdieselgenerators/packets/CDGPackets (new CatnipPacketRegistry(\"createdieselgenerators\", 1))",
+          "payloads": "com/jesz/createdieselgenerators/packets/EntityFilterScreenPacket extends java/lang/Record implements net/createmod/catnip/net/base/ServerboundPacketPayload",
+          "decides": "createdieselgenerators:entity_filter_screen (the 12th id of a-missing.txt)"
+        }
+      ]
+    }
+  ]
+}

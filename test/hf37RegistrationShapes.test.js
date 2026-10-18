@@ -141,3 +141,79 @@ describe('HF37 registration shapes', function () {
     assert.ok(!r.diagnostics.abstains.some((a) => a.includes('ldtteam') || a.includes('never reaches')), r.diagnostics.abstains.join(' | '))
   })
 })
+
+// HF105 item A - THE DIRECTION TABLE (src/client/data/payloadDirectionRules.json):
+// an enum packet registry (Create/catnip) whose payload classes implement a
+// marker ANOTHER jar's helper names (TFMG + createdieselgenerators: catnip's
+// markers live in Create's nested ponder jar, the payload supers in Create's
+// own classes) derives every row WITH a direction through the pack-scope
+// marker rule; a jar whose own unit discovers the markers (Create, the hf51
+// securitycraft fixture) keeps its claim set byte for byte (rule 0 unchanged).
+// Fixtures: the REAL jars of the F39 Case A receipt, trimmed (tools/trim-packet-wire-fixture.js).
+describe('HF105 item A: enum-registry direction decided by the pack-scope marker rule', function () {
+  this.timeout(60000)
+  const crypto = require('crypto')
+  const FX = path.join(__dirname, 'fixtures')
+  const TFMG = path.join(FX, 'hf105-tfmg-1.2.0.trimmed.jar')
+  const DIESEL = path.join(FX, 'hf105-createdieselgenerators-1.21.1-1.3.15.trimmed.jar')
+  const CREATE = path.join(FX, 'hf105-create-1.21.1-6.0.10.trimmed.jar')
+  const SC = path.join(FX, 'hf51-securitycraft-1.10.2.1.trimmed.jar')
+  // a-missing.txt of the F39 receipt: the 12 ids the 21.1.255 server named missing.server.client
+  const A_MISSING = ['create:cable_place_packet', 'create:coke_oven_packet', 'create:distillation_packet', 'create:electricians_wrench_packet', 'create:engine_controller_input', 'create:engine_controller_stop_control', 'create:engine_start', 'create:engine_transmission_packet', 'create:transmission_remove', 'create:update_in_front_packet', 'create:vat_evaluation', 'createdieselgenerators:entity_filter_screen']
+  // the claim-set line format of the lane's baseline driver (bV-claim.sha): "<protocol> <id> v=<version> flow=<flow> opt=<optional> src=<source word>", sorted
+  const claimSha = (r) => crypto.createHash('sha256').update(
+    [...r.components.play.map((c) => ['play', c]), ...r.components.configuration.map((c) => ['configuration', c])]
+      .map(([p, c]) => `${p} ${c.id} v=${c.version} flow=${c.flow} opt=${c.optional} src=${String(c.source).split(' ')[0]}`).sort().join('\n')).digest('hex')
+
+  it('claims the 12 server-named ids with a direction and version 1 (the registry construction), 0 "no flow marker" abstains', () => {
+    const r = deriveNeoForgeComponents([TFMG, DIESEL, CREATE])
+    const play = new Map(r.components.play.map((c) => [c.id, c]))
+    for (const id of A_MISSING) {
+      const c = play.get(id)
+      assert.ok(c, `${id} claimed`)
+      assert.strictEqual(c.version, '1', `${id} version`)
+      assert.ok(c.flow === 'serverbound' || c.flow === 'clientbound', `${id} flow ${c.flow}`)
+      assert.strictEqual(c.optional, false)
+      assert.ok(/^enum-registry /.test(c.source) && /direction: marker-hierarchy\/pack/.test(c.source), c.source)
+    }
+    assert.strictEqual(play.get('create:engine_start').flow, 'serverbound') // EngineControllerPacketBase implements ServerboundPacketPayload
+    assert.strictEqual(play.get('create:cable_place_packet').flow, 'clientbound') // extends Create's BlockEntityDataPacket (clientbound)
+    assert.strictEqual(play.get('createdieselgenerators:entity_filter_screen').flow, 'serverbound')
+    assert.deepStrictEqual(r.diagnostics.abstains.filter((a) => /no flow marker/.test(a)), [])
+    // the pack-scope read is a pack-wide scan: the addon unit records the pack census + Create's jar on its trail
+    const { readNeoForgeJarUnits, deriveNeoForgeJarUnit } = require('../src/client/neoForgePayloadDerivation')
+    const read = readNeoForgeJarUnits([TFMG, DIESEL, CREATE])
+    const tfmgUnit = deriveNeoForgeJarUnit(read, read.units.find((u) => u.path === TFMG))
+    assert.ok(tfmgUnit.deps.packCensus, 'pack census dependency recorded')
+    assert.ok(tfmgUnit.trail.includes(CREATE), `trail ${JSON.stringify(tfmgUnit.trail)}`)
+  })
+
+  it('control: a jar whose own unit discovers the markers keeps its claim set byte for byte (bV sha of the baseline)', () => {
+    const r = deriveNeoForgeComponents([SC, CREATE])
+    assert.strictEqual(claimSha(r), 'a32114e162102b1c83cf96684e99a52f3e668ac751f79a00ef5e2c449b09305a')
+    assert.ok(r.components.play.every((c) => !/direction: marker-hierarchy\/pack/.test(c.source)), 'no row needed the pack rule')
+  })
+
+  it('the table is the mechanism (M1): the pack-scope row removed from the data file -> the 12 named ids abstain "no flow marker" again', () => {
+    const dataPath = path.join(__dirname, '..', 'src', 'client', 'data', 'payloadDirectionRules.json')
+    const rules = JSON.parse(fs.readFileSync(dataPath, 'utf8'))
+    assert.deepStrictEqual(rules.rules.map((x) => `${x.rule}/${x.scope}`), ['marker-hierarchy/unit', 'marker-hierarchy/pack'])
+    for (const rule of rules.rules) for (const c of rule.cited) assert.ok(/^[0-9a-f]{40}$/.test(c.sha1) && /^[0-9a-f]{40}$/.test(c.fixture_sha1) && c.jar && c.fixture && c.class, JSON.stringify(c))
+    const dataKey = require.resolve(dataPath)
+    const mainPath = require.resolve('../src/client/neoForgePayloadDerivation')
+    const phPath = require.resolve('../src/client/platformHelperDerivation')
+    const saved = { data: require.cache[dataKey], main: require.cache[mainPath], ph: require.cache[phPath] }
+    try {
+      delete require.cache[mainPath]; delete require.cache[phPath]
+      require.cache[dataKey] = { id: dataKey, filename: dataKey, loaded: true, exports: { ...rules, rules: rules.rules.filter((x) => x.scope !== 'pack') } }
+      const red = require('../src/client/neoForgePayloadDerivation').deriveNeoForgeComponents([TFMG, DIESEL, CREATE])
+      const play = new Map(red.components.play.map((c) => [c.id, c]))
+      for (const id of A_MISSING) {
+        assert.strictEqual(play.get(id), undefined, `${id} must not be claimed without the pack row`)
+        assert.ok(red.diagnostics.abstains.some((a) => a.startsWith(`${id}: no flow marker on `)), `${id} abstains`)
+      }
+    } finally {
+      require.cache[dataKey] = saved.data; require.cache[mainPath] = saved.main; require.cache[phPath] = saved.ph
+    }
+  })
+})
