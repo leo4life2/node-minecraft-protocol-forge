@@ -1,0 +1,41 @@
+{
+  "_about": "HF105 item B - THE PLATFORM-HELPER PATTERN TABLE (platformHelperDerivation.js). A library registers payloads at runtime from the list each mod hands it: the mod calls a static helper entry (consumer lambda, int version); the helper's listener lambda constructs a registrar object and hands it to the consumer; each registrar method takes the mod's TypeAndCodec and performs the PayloadRegistrar registration. One row per shape; the walk VERIFIES every rule of the row against the helper's bytes (the entry descriptor, the registrar method table, the id rule, the version rule) before a row is claimed - a mismatch abstains by name. Every row cites the fixture jar (real file name + sha1, trimmed test fixture + sha1) and the classes the rules were read from (javap over the real bytes, 2026-10-18). A helper, a mod or a version literal appears ONLY here, never in a code path.",
+  "patterns": [
+    {
+      "shape": "consumer-registrar",
+      "entryDesc": "(Ljava/util/function/Consumer;I)V",
+      "entry": "a static method of that descriptor (reached through same-shaped static forwarders, depth 3) whose body captures the int and the consumer into a listener lambda (desc (I, Consumer, <event>)V) that constructs the registrar class and calls Consumer.accept on it",
+      "registrarMethodTable": "READ from the registrar class bytes: every method taking (TypeAndCodec) -> the PayloadRegistrar.play* / configuration* / common* method it invokes (flow + protocols from REGISTRATION_METHODS), optional when PayloadRegistrar.optional() is invoked in that method",
+      "idRule": "argument-type-and-codec",
+      "idRuleReads": "the registered CustomPacketPayload$Type is the argument's own TypeAndCodec.type() (aload_1; invokevirtual TypeAndCodec.type()); the id is read off the mod's message class static initializer: ldc <path>; invokestatic <mod>.res(String)ResourceLocation (resolveNamespaceHelper) or ResourceLocation.fromNamespaceAndPath(ns, path) / parse(ns:path); ... putstatic <TypeAndCodec field>",
+      "versionRule": "int-argument-concat",
+      "versionRuleReads": "the call site's int constant folded through the listener lambda's makeConcatWithConstants recipe (or String.valueOf(int) / Integer.toString(int)) = the String handed to PayloadRegistrar.versioned(String)",
+      "sourceWord": "platform-helper",
+      "cited": [
+        {
+          "jar": "moonlight-1.21.1-3.7.2-neoforge.jar",
+          "sha1": "0da45e6bc941f4b9b18dda24f8d047431ddc7226",
+          "fixture": "hf105-moonlight-1.21.1-3.7.2-neoforge.trimmed.jar",
+          "fixture_sha1": "bacab58dab8c75be2858bb9ae1b7ea5c17909fd9",
+          "libraryVersion": "3.7.2",
+          "entryBytes": "net/mehvahdjukaar/moonlight/api/platform/network/NetworkHelper.addNetworkRegistration(Consumer,int): aload_0 iload_1 invokestatic net/mehvahdjukaar/moonlight/api/platform/network/platform/NetworkHelperImpl.addNetworkRegistration(Consumer,int) (the forwarder); NetworkHelperImpl.addNetworkRegistration: invokedynamic accept(int, Consumer) -> lambda$addNetworkRegistration$0(int, Consumer, RegisterPayloadHandlersEvent); MoonlightForge.getCurrentBus().addListener(consumer)",
+          "listenerBytes": "lambda$addNetworkRegistration$0: invokedynamic makeConcatWithConstants(I)String (the version string); new NetworkHelperImpl$1; invokespecial NetworkHelperImpl$1.<init>(RegisterPayloadHandlersEvent, String); invokeinterface Consumer.accept",
+          "registrarBytes": "NetworkHelperImpl$1.registerServerBound(TypeAndCodec): getfield val$event; aload_1 invokevirtual TypeAndCodec.type() invokevirtual Type.id() invokevirtual ResourceLocation.getPath() invokevirtual RegisterPayloadHandlersEvent.registrar(String); getfield val$versionStr invokevirtual PayloadRegistrar.versioned(String); PayloadRegistrar.executesOn(MAIN); aload_1 TypeAndCodec.type(); aload_1 TypeAndCodec.codec(); PayloadRegistrar.playToServer(Type, StreamCodec, IPayloadHandler). registerClientBound -> playToClient; registerClientBoundOptional -> NetworkHelper.markOptional + PayloadRegistrar.optional() + playToClient; registerBidirectional -> playBidirectional",
+          "consumerBytes": "net/mehvahdjukaar/moonlight/core/network/ModNetworking: invokedynamic accept(); bipush 10; invokestatic NetworkHelper.addNetworkRegistration; the lambda: getstatic ClientBoundFinalizeFluidsMessage.TYPE:TypeAndCodec; invokeinterface RegisterMessagesEvent.registerClientBound ... (7 clientbound, 2 serverbound, 1 bidirectional)",
+          "messageBytes": "net/mehvahdjukaar/moonlight/core/network/ClientBoundSendLoginMessage.<clinit>: ldc \"s2c_send_login\"; invokestatic net/mehvahdjukaar/moonlight/core/Moonlight.res(String)ResourceLocation; invokestatic Message.makeType(ResourceLocation, StreamDecoder); putstatic TYPE:TypeAndCodec",
+          "decides": "the 10 moonlight:* ids of the F39 Case B refusal (b-missing.txt), version 10"
+        },
+        {
+          "jar": "supplementaries-1.21.1-4.0.1-neoforge.jar",
+          "sha1": "104225e17001c68a1c1aaac6d928fc5377c93427",
+          "fixture": "hf105-supplementaries-1.21.1-4.0.1-neoforge.trimmed.jar",
+          "fixture_sha1": "703a6fb1c0528c59473f3b759507797b29aa9332",
+          "consumerBytes": "net/mehvahdjukaar/supplementaries/common/network/ModNetwork: invokedynamic accept(); iconst_5; invokestatic NetworkHelper.addNetworkRegistration; the lambda: getstatic ClientBoundPlaySpeakerMessagePacket.CODEC:TypeAndCodec; invokeinterface RegisterMessagesEvent.registerClientBound ... (37 registrations)",
+          "messageBytes": "net/mehvahdjukaar/supplementaries/common/network/ClientBoundSendLoginPacket.<clinit>: ldc \"s2c_send_login\"; invokestatic net/mehvahdjukaar/supplementaries/Supplementaries.res(String)ResourceLocation (ldc \"supplementaries\"; aload_0; ResourceLocation.fromNamespaceAndPath); Message.makeType; putstatic CODEC:TypeAndCodec",
+          "decides": "the 37 supplementaries:* ids of the F39 Case B refusal (b-missing.txt), version 5"
+        }
+      ],
+      "notCited": "the currency mod of Case B (6 ids, MEconomy-1.0.5-NeoForge-1.21.1-1.21.7.jar sha1 069aead5d010dfde1c85a144482771d07257eb18) registers through the same helper but its jar is not on the mod-distribution host the lane may reach; its ids are learned by the belt as before"
+    }
+  ]
+}

@@ -82,6 +82,8 @@ const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveCo
 // registry's direction is read by (data; every row cites the fixture jar + the
 // class it was read from). Consulted beside the marker read, in order.
 const DIRECTION_RULES = require('./data/payloadDirectionRules.json')
+// HF105 item B: the platform-helper shape (a library registering from the list each mod hands it) - its own module, joined below as phase-1 claims
+const { derivePlatformHelperRegistrations } = require('./platformHelperDerivation')
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
@@ -4356,6 +4358,31 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
   for (const c of enumComponents) {
     add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, 'enum-registry')
   }
+  // HF105 item B: the PLATFORM-HELPER rows (platformHelperDerivation.js, the
+  // pattern table in data/platformHelperPatterns.json): the mod's call sites
+  // of a runtime-list helper, their consumer lambdas followed to the message
+  // classes handed over, the id from the message class's own type, the
+  // version from the call site's int. Fail-open: a walk failure lands in
+  // diagnostics.errors and the unit's other claims are untouched.
+  let platformHelper = { rows: [], abstains: [], resolvedClasses: new Set() }
+  try {
+    platformHelper = derivePlatformHelperRegistrations(index, state, {
+      seedNames: () => seedNamesOf(index, state),
+      walkLinear,
+      registrationMethods: REGISTRATION_METHODS,
+      resolveNamespaceHelper,
+      resolveReslocValue: (v) => resolveReslocValue(index, v, state),
+      concatWithConstants,
+      isStrToReslocDesc,
+      isStrStrToReslocDesc,
+      isReslocDesc,
+      isReslocOwner
+    })
+  } catch (err) {
+    diagnostics.errors.push(`platform-helper derivation failed (${err.message})`)
+  }
+  for (const r of platformHelper.rows) add(r.id, r.version, r.flow, r.optional, r.protocols, r.source, 'platform-helper')
+  diagnostics.abstains.push(...platformHelper.abstains)
 
   // HF11 AGGREGATOR pass: resolve id-less registrations from their jar-wide
   // population contexts (see the shape header above); leftovers abstain with
@@ -4477,6 +4504,10 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     claims,
     listenOnlyNamed,
     listen,
+    // HF105 item B: the helper classes whose registrar sites this unit's
+    // platform-helper rows resolved (the pack assembly drops the walks'
+    // unresolved abstains on them - the pack pseudo-unit emits them first)
+    platformHelperResolved: [...platformHelper.resolvedClasses].sort(),
     ackContracts,
     ackUnprovable: ackCollect.unprovable,
     syncContracts: annotationRun.syncContracts,
@@ -4501,7 +4532,7 @@ function assembleNeoForgeComponents (read, perJar) {
   // proofs drop the channel loudly (mirror of the aggregator conflict law —
   // a wrong tuple claim fails the negotiation with a worse diagnostic than
   // an honest miss).
-  const CONSTANT_VERSION_SOURCES = new Set(['constant', 'enum-registry', 'annotation-registry'])
+  const CONSTANT_VERSION_SOURCES = new Set(['constant', 'enum-registry', 'annotation-registry', 'platform-helper']) // HF105: platform-helper = the call site's int constant
   const droppedConflicts = new Set()
   const add = (id, version, flow, optional, protocols, source, versionSource, versionFrom = null) => {
     for (const proto of protocols) {
@@ -4556,6 +4587,18 @@ function assembleNeoForgeComponents (read, perJar) {
     if (u.listen) { listen.factory.push(...(u.listen.factory || [])); listen.fabric.push(...(u.listen.fabric || [])); listen.container.push(...(u.listen.container || [])) }
   }
   syncContracts.unfinishableTasks = [...new Set(syncContracts.unfinishableTasks)]
+  // HF105 item B: a helper's registrar sites RESOLVED through a unit's
+  // platform-helper rows no longer abstain anywhere in the pack: the walks'
+  // 'unresolved payload type id' / 'never reaches a registration' lines on
+  // those classes (the mod-root pass emits them before the unit resolves
+  // them) are dropped; the text stays in the code, the sites resolve
+  const helperResolved = new Set(perJar.flatMap((u) => u.platformHelperResolved || []))
+  if (helperResolved.size > 0) {
+    const resolvedSite = (a) => [...helperResolved].some((c) => a.startsWith(`${c}.`) || a.startsWith(`${c}:`) || a.startsWith(`${c} `))
+    // (a site line cut at the abstain length cap keeps its '(via <entry>' head and loses its kind words: the site prefix alone names it)
+    const unresolvedKind = (a) => /unresolved payload type id/.test(a) || /never reaches a registration/.test(a) || /\(via /.test(a)
+    diagnostics.abstains = diagnostics.abstains.filter((a) => !(resolvedSite(a) && unresolvedKind(a)))
+  }
   const components = {
     configuration: [...byProtocol.configuration.values()],
     play: [...byProtocol.play.values()]

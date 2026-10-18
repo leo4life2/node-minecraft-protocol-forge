@@ -544,8 +544,10 @@ describe('HF93 per-jar digest', function () {
   const ser = (r) => JSON.stringify(r, (k, v) => (v && v.type === 'Buffer' && Array.isArray(v.data)) ? { $buffer: Buffer.from(v.data).toString('base64') } : v)
   const sha = (s) => crypto.createHash('sha256').update(s).digest('hex')
   const CHANNELS = ['calio:channel', 'tacz:handshake', 'framework:handshake', 'zeta:main', 'owo:handshake', 'origins:origins', 'biggerstacks:main', 'stacc:main', 'sophisticatedcore:channel', 'waystones:network', 'balm:network', 'securitycraft:network', 'glitchcore:network', 'immersive_portals:main', 'bettercombat:network', 'combat_roll:network', 'nobody:nothing']
-  // the fixture set's verdicts, serialized as the embedder's store serializes them, at the base c5fa1b7 (the raw walk only)
-  const BASE_FIXTURE_SET_SHA = '95d3c1db659dc08d34da61b7115bd7fd65b2dda8fc02ce68fd77e19fd2a86fd4'
+  // the fixture set's verdicts, serialized as the embedder's store serializes them, at the base c5fa1b7 (the raw walk only);
+  // HF105: the five hf105-*.trimmed.jar fixtures (tfmg, createdieselgenerators, create, moonlight, supplementaries) joined the set - the
+  // digest-vs-raw byte identity below is the control, this sha is the set's listing (re-pinned over the grown set; 95d3c1db... before)
+  const BASE_FIXTURE_SET_SHA = '57fcd6a9d2825d89e0691e20b6e68d7d6a6e8b0896c0fa48a028114a55b72f34'
   const quiet = (fn) => { const o = console.log; console.log = () => {}; try { return fn() } finally { console.log = o } }
   const packOf = (tag) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hf93-m3-${tag}-`))

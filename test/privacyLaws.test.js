@@ -28,6 +28,8 @@ const { buildClass, buildJar } = require('./helpers/synthJar')
 const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js', 'nestedJars.js',
   'neoForgePayloadDerivation.js', 'neoForgeConfig.js', 'blockShapeDerivation.js',
   'loginReplyBoundary.js', 'annotationRegistryDerivation.js', 'listenOnlyDerivation.js',
+  // HF105: the platform-helper walk (a pure local bytecode parser: jarAnalysis + its own data table)
+  'platformHelperDerivation.js',
   // HF38: the login-window ledger/budget (requires only debug + the reply boundary, lazily)
   'loginWindow.js',
   // D3: the loader custom-spawn codec derivation + decoder (local loader jar only)
@@ -328,8 +330,8 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // HF53: the one nested-jar rule (zip entry reads only)
         './nestedJars',
         './loginReplyBoundary', './annotationRegistryDerivation', './listenOnlyDerivation', './data/blockShapeTables.json',
-        // HF105: the direction table (cited data, local JSON)
-        './data/payloadDirectionRules.json',
+        // HF105: the direction table + the platform-helper pattern table (cited data, local JSON) and the platform-helper walk
+        './data/payloadDirectionRules.json', './platformHelperDerivation', './data/platformHelperPatterns.json',
         // D3: loader-spawn codec derivation (jar bytes → codec spec) + its decoder + the loader-jar locator (local fs walk)
         './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator',
         // D3 rider: the gate's dimension-bounds tracker (packet fields only, no requires)
