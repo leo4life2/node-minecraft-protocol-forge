@@ -2099,12 +2099,26 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         return
       }
       if (flag && flag.k === 'jvmflag') {
-        // HF106: a branch a JVM flag decides - the TRUE arm is walked under a
-        // jvm_property gate scope (ifeq: the fallthrough up to the jump target;
-        // ifne: from the jump target to the frame's end), never skipped silently
+        // HF106: a branch a JVM flag decides - the flag's TRUE arm is walked
+        // under a jvm_property gate scope, the FALSE arm (a player's game: the
+        // flag is never set there) is walked plain, and the join point both arms
+        // reach is plain again. The arm that LEAVES AT ONCE (a `return`, a goto,
+        // a throw) registers nothing, so the other arm owns the continuation:
+        //   ifeq (true arm = the fallthrough up to the jump target): walked gated
+        //     over [next, target); `if (flag) return;` jumps to the player's path
+        //     with no scope.
+        //   ifne (true arm = the jump target onward): the fallthrough is the
+        //     player's arm, walked plain up to the join point at the target;
+        //     `if (!flag) return;` makes the target's continuation exclusively
+        //     the flag's - jumped to under a scope to the frame's end.
+        // (r2: the round-1 ifne arm jumped to the target under that scope every
+        // time, so a listener subscribed after an `if (!flag) {..}` block was
+        // gated and the block itself never walked.)
         const sc = state.jvmGateScopes || (state.jvmGateScopes = [])
         const gate = { kind: 'jvm_property', key: flag.key, probe: flag.probe, site: `${classInfo.className}.${method.method}` }
-        if (flag.trueArm === 'jump') { sc.push({ gate, frame, lo: target, hi: Infinity }); jump(target) } else sc.push({ gate, frame, lo: next, hi: target })
+        const fallthroughLeaves = armLeavesAtOnce(code, next) || armThrowsImmediately(code, next, cp)
+        if (flag.trueArm === 'jump') { if (fallthroughLeaves) { sc.push({ gate, frame, lo: target, hi: Infinity }); jump(target) } } else if (fallthroughLeaves) jump(target)
+        else sc.push({ gate, frame, lo: next, hi: target })
         if (opts.walk) opts.walk.undecided = true
         return
       }
