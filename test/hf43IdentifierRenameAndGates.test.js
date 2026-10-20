@@ -10,6 +10,7 @@
 // Pinned on the real jars (GlitchCore 26.1.2.0.2 whole, sophisticatedcore
 // 1.5.0 trimmed to its network + compat classes) and on jarMutate bends.
 const assert = require('assert')
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
@@ -83,5 +84,47 @@ describe('HF43 — 26.1 Identifier rename + string-helper chains + mod-presence 
     assert.strictEqual(r.components.configuration.length, 1)
     assert.ok(r.components.play.length >= 19)
     assert.deepStrictEqual(r.diagnostics.errors, [])
+  })
+
+  // ---------- HF106: the JVM-flag presence gate (F41: a rendering mod's game-test registry) ----------
+  // The real jar (embeddium-1.0.15+mc1.21.1.jar, sha1 56063839172a000d079272794bad366f2ad4cbbd) trimmed to the
+  // mod root + the game-test package; the mod root subscribes the test registry ONLY under
+  // "true".equals(System.getProperty(<flag>)) -> bus.register(Class.forName(<registry>)), and the registry's
+  // static registerPayloads(RegisterPayloadHandlersEvent) registers one required clientbound play channel.
+  const EMB = path.join(FX, 'hf106-embeddium-1.0.15+mc1.21.1.trimmed.jar')
+  const EMB_TWIN = path.join(FX, 'hf106-embeddium-1.0.15+mc1.21.1.twin-noguard.jar') // the same bytes, the guard's `ifeq` -> `pop nop nop`
+  const PROBES = require('../src/client/data/jvmFlagProbes.json')
+  const claimSha = (r) => crypto.createHash('sha256').update([...r.components.configuration.map((c) => ['configuration', c]), ...r.components.play.map((c) => ['play', c])].map(([p, c]) => `${p}|${c.id}|${c.version}|${c.flow}|${c.optional}`).sort().join('\n')).digest('hex').slice(0, 16)
+  it('HF106 JVM-FLAG GATE: the test registry subscribed only under a System.getProperty flag is NOT claimed — the named abstain (jvm_property + the probe, never the key) and the presenceGates receipt', () => {
+    const r = deriveNeoForgeComponents([EMB])
+    assert.deepStrictEqual(ids(r), [], JSON.stringify(ids(r)))
+    assert.deepStrictEqual(r.diagnostics.errors, [])
+    const g = r.diagnostics.presenceGates
+    assert.strictEqual(g.length, 1, JSON.stringify(g))
+    assert.strictEqual(g[0].kind, 'jvm_property')
+    assert.strictEqual(g[0].present, false)
+    assert.strictEqual(g[0].probe, 'System.getProperty/String.equals')
+    assert.ok(g[0].site.endsWith('TestRegistry.registerPayloads') && g[0].gateSite.endsWith('Embeddium.<init>'), JSON.stringify(g))
+    assert.ok(!('key' in g[0]) && !('modId' in g[0]), 'no key value, no mod id on a jvm gate row')
+    const named = r.diagnostics.abstains.filter((a) => /gated on a JVM flag/.test(a))
+    assert.strictEqual(named.length, 1, r.diagnostics.abstains.join(' | '))
+    assert.ok(/TestRegistry\.registerPayloads/.test(named[0]) && /jvm_property/.test(named[0]) && /System\.getProperty\/String\.equals/.test(named[0]), named[0])
+    assert.ok(!/enableGameTest/.test(named[0]) && !/enableGameTest/.test(JSON.stringify(g)), 'the key value never leaves the evaluator')
+  })
+  it('HF106 twin: the same bytes with the guard neutralised subscribe the registry unconditionally and claim the channel (play, version 1, clientbound, required)', () => {
+    const r = deriveNeoForgeComponents([EMB_TWIN])
+    assert.deepStrictEqual(r.components.play.map((c) => [c.id, c.version, c.flow, c.optional]), [['embeddium:test_barrier', '1', 'clientbound', false]])
+    assert.deepStrictEqual(r.diagnostics.presenceGates, [])
+    assert.ok(!r.diagnostics.abstains.some((a) => /JVM flag/.test(a)), r.diagnostics.abstains.join(' | '))
+  })
+  it('HF106 RED control: the property_string row dropped from the probe table -> the guard is unread and the channel is claimed again (the table is the mechanism)', () => {
+    const r = deriveNeoForgeComponents([EMB], { jvmFlagProbes: PROBES.rows.filter((row) => row.shape !== 'property_string') })
+    assert.deepStrictEqual(r.components.play.map((c) => c.id), ['embeddium:test_barrier'])
+    assert.deepStrictEqual(r.diagnostics.presenceGates, [])
+  })
+  it('HF106 bar: the wired static entries of the existing fixtures keep their claim set byte for byte (the base tree\'s shas)', () => {
+    assert.strictEqual(claimSha(deriveNeoForgeComponents([path.join(FX, 'hf105-tfmg-1.2.0.trimmed.jar'), path.join(FX, 'hf105-createdieselgenerators-1.21.1-1.3.15.trimmed.jar'), path.join(FX, 'hf105-create-1.21.1-6.0.10.trimmed.jar')])), '24f4d6515451db0e')
+    assert.strictEqual(claimSha(deriveNeoForgeComponents([path.join(FX, 'hf105-moonlight-1.21.1-3.7.2-neoforge.trimmed.jar'), path.join(FX, 'hf105-supplementaries-1.21.1-4.0.1-neoforge.trimmed.jar')])), '8708040ef0f8db9d')
+    assert.strictEqual(claimSha(deriveNeoForgeComponents([path.join(FX, 'hf51-securitycraft-1.10.2.1.trimmed.jar')])), 'c83b535ded0e0b66')
   })
 })

@@ -801,8 +801,26 @@ function jdkModelInvoke (index, state, opts, ref, recv, argVals, push, kind) {
     if (ref.name === 'getPath') { push(vStr(rest.join(':'))); return true }
     if (ref.name === 'toString') { push(vStr(recv.v)); return true }
   }
+  // HF106: Class.forName(<constant>) is the class VALUE a mod root subscribes
+  // (bus.register(Class.forName("..."))) - modelled exactly as a class constant.
+  if (!recv && ref.owner === CLASS_TYPE && ref.name === 'forName' && ref.desc === '(Ljava/lang/String;)Ljava/lang/Class;') {
+    push(argVals[0] && argVals[0].k === 'str' ? vCls(String(argVals[0].v).replace(/\./g, '/')) : UNKNOWN)
+    return true
+  }
+  // HF106: a JVM-flag probe read with a constant key -> a tagged value
+  const probeRow = (!recv && argVals.length >= 1 && argVals[0] && argVals[0].k === 'str') ? jvmFlagProbeRowOf(state, ref) : null
+  if (probeRow) {
+    const probe = `${ref.owner.split('/').pop()}.${ref.name}`
+    push(probeRow.shape === 'property_boolean' ? { k: 'jvmflag', key: argVals[0].v, probe } : { k: 'jvmprop', key: argVals[0].v, probe })
+    return true
+  }
   if (ref.name === 'equals' && ref.desc === '(Ljava/lang/Object;)Z' && recv && argVals[0]) {
     const a = recv; const b = argVals[0]
+    if ((a.k === 'str' && b.k === 'jvmprop') || (a.k === 'jvmprop' && b.k === 'str')) { // HF106: "<const>".equals(System.getProperty(key)) is the flag
+      const prop = a.k === 'jvmprop' ? a : b
+      push({ k: 'jvmflag', key: prop.key, probe: `${prop.probe}/String.equals` })
+      return true
+    }
     if (a.k === 'enumconst' && b.k === 'enumconst') { push(vInt(a.cls === b.cls && a.name === b.name ? 1 : 0)); return true }
     if ((a.k === 'str' && b.k === 'str') || (a.k === 'resloc' && b.k === 'resloc') || (a.k === 'int' && b.k === 'int')) { push(vInt(a.v === b.v ? 1 : 0)); return true }
     if (a.k === 'obj' && b.k === 'obj') { push(vInt(a === b ? 1 : 0)); return true }
@@ -1665,6 +1683,24 @@ function discoverFlowMarkers (index, entryMethods) {
 // abstains.
 
 const CLASS_TYPE = 'java/lang/Class'
+// ---------- HF106: JVM-FLAG PROBES (data/jvmFlagProbes.json) ----------
+// A registration reachable only under a JVM system-property read (a
+// developer launch flag: a test harness, an automated-test run) is never
+// registered on a player's game - client AND integrated server alike - so the
+// server cannot hold it, and a claim of it fails the negotiation
+// ("missing.client.server": F41, a rendering mod's game-test registry behind
+// "true".equals(System.getProperty(<flag>)) -> bus.register(Class.forName(..))).
+// The rows (owner + method + descriptor + the value shape, each cited from a
+// real jar) are the probes; the evaluator tags their results (jvmprop /
+// jvmflag) so a branch one decides walks its TRUE arm under a jvm_property
+// gate scope, and a listener subscribed inside that scope is gated for the
+// entry pass instead of fired. No key value ever leaves the evaluator.
+const JVM_FLAG_PROBES = require('./data/jvmFlagProbes.json')
+function jvmFlagProbeRowOf (state, ref) {
+  const rows = (state && Array.isArray(state.jvmFlagProbes)) ? state.jvmFlagProbes : JVM_FLAG_PROBES.rows
+  for (const r of rows) if (r.owner === ref.owner && r.method === ref.name && r.desc === ref.desc) return r
+  return null
+}
 const AGG_MAX_DEPTH = 3
 const AGG_MAX_CONTEXTS = 512 // HF37: bounded by the step budgets below; 24 truncated a 160-holder pack (minecolonies) to nothing
 const AGG_MAX_STEPS_PER_EVAL = 30000
@@ -1892,9 +1928,11 @@ function evaluateMethod (index, classInfo, method, state, opts = {}, hooks = {})
     stack.push(k)
     if (state.rootVisited) state.rootVisited.add(k)
   }
+  const scopeDepth = state.jvmGateScopes ? state.jvmGateScopes.length : 0 // HF106: a frame closes the gate scopes it opened
   try {
     return evaluateMethodInner(index, classInfo, method, state, opts, hooks)
   } finally {
+    if (state.jvmGateScopes && state.jvmGateScopes.length > scopeDepth) state.jvmGateScopes.length = scopeDepth
     state.evalClassInfo = prevClassInfo
     if (stack) stack.pop()
   }
@@ -2037,6 +2075,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
     return len
   }
 
+  const frame = {} // HF106: the token the jvm gate scopes of this frame carry
   while (pc >= 0 && pc < code.length) {
     if (++steps > AGG_MAX_STEPS_PER_EVAL || ++state.aggSteps > (state.aggStepLimit ?? AGG_TOTAL_STEP_BUDGET)) {
       state.aggBudgetBlown = true
@@ -2048,11 +2087,25 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
     if (seen > AGG_MAX_LOOP_VISITS + Math.min(opts.walk.iterAdvances, AGG_MAX_ITEMS)) return
     const op = code[pc]
     const next = pc + instrLen(pc)
+    if (state.jvmGateScopes && state.jvmGateScopes.length > 0) { // HF106: a gate scope closes where its arm ends
+      const sc = state.jvmGateScopes
+      while (sc.length > 0 && sc[sc.length - 1].frame === frame && pc >= sc[sc.length - 1].hi) sc.pop()
+    }
     let jumped = false
     const jump = (target) => { pc = target; jumped = true }
-    const condBranch = (target, known, takeJump) => {
+    const condBranch = (target, known, takeJump, flag = null) => {
       if (known) {
         if (takeJump) jump(target)
+        return
+      }
+      if (flag && flag.k === 'jvmflag') {
+        // HF106: a branch a JVM flag decides - the TRUE arm is walked under a
+        // jvm_property gate scope (ifeq: the fallthrough up to the jump target;
+        // ifne: from the jump target to the frame's end), never skipped silently
+        const sc = state.jvmGateScopes || (state.jvmGateScopes = [])
+        const gate = { kind: 'jvm_property', key: flag.key, probe: flag.probe, site: `${classInfo.className}.${method.method}` }
+        if (flag.trueArm === 'jump') { sc.push({ gate, frame, lo: target, hi: Infinity }); jump(target) } else sc.push({ gate, frame, lo: next, hi: target })
+        if (opts.walk) opts.walk.undecided = true
         return
       }
       // unknown condition: avoid an immediately-throwing arm; HF51-rider: and
@@ -2318,12 +2371,12 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       case 0xc8: jump(pc + code.readInt32BE(pc + 1)); break // goto_w
       case 0x99: { // ifeq
         const v = stack.pop()
-        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v === 0)
+        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v === 0, v && v.k === 'jvmflag' ? { ...v, trueArm: 'fallthrough' } : null)
         break
       }
       case 0x9a: { // ifne
         const v = stack.pop()
-        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v !== 0)
+        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v !== 0, v && v.k === 'jvmflag' ? { ...v, trueArm: 'jump' } : null)
         break
       }
       case 0x9b: case 0x9c: case 0x9d: case 0x9e: { // iflt/ge/gt/le
@@ -3828,6 +3881,27 @@ function deriveModRootRegistrations (index, state, record) {
     onCall: (ref, kind, recv, argVals) => {
       if (trace) trace(ref, kind, recv, argVals)
       if (!LISTENER_REGISTRATION_METHODS.has(ref.name) || index.get(ref.owner)) return // the loader's bus API lives outside the jars
+      // HF106: a listener registered inside a JVM-flag branch (bus.register(
+      // Class.forName(..)) behind System.getProperty / Boolean.getBoolean) is
+      // never subscribed on a player's game: nothing is fired here; the
+      // subscribed class (or the lambda's own method) is gated for the entry pass.
+      const jvmScopes = state.jvmGateScopes
+      const jvmGate = (jvmScopes && jvmScopes.length > 0) ? jvmScopes[jvmScopes.length - 1].gate : null
+      if (jvmGate) {
+        const gated = state.jvmGates || (state.jvmGates = new Map())
+        if (ref.name === 'register' && argVals.length === 1 && argVals[0] && (argVals[0].k === 'obj' || argVals[0].k === 'cls')) {
+          const cls = argVals[0].k === 'obj' ? argVals[0].cls : argVals[0].v
+          if (index.get(cls) && !gated.has(cls)) gated.set(cls, jvmGate)
+        } else {
+          for (const a of argVals) {
+            if (!a || a.k !== 'lambda' || !a.impl || !index.get(a.impl.owner)) continue
+            const k = `${a.impl.owner}#${a.impl.name}${a.impl.desc}`
+            if (!gated.has(k)) gated.set(k, jvmGate)
+          }
+        }
+        summary.jvmGated = (summary.jvmGated || 0) + 1
+        return
+      }
       // HF51: `bus.register(object)` / `bus.register(Class)` subscribe every
       // @SubscribeEvent method of that object (instance) or class (static)
       // whose one parameter is a lifecycle event — a registration OBJECT
@@ -3995,7 +4069,7 @@ function deriveModRootRegistrations (index, state, record) {
 
 function seedNamesOf (index, state) { return index.seedNames ? index.seedNames() : state.allClassNames }
 
-function gateKeyOf (gate) { return gate ? `${gate.modId}|${gate.holder}|${gate.probe}|${gate.site}` : null }
+function gateKeyOf (gate) { return gate ? (gate.kind === 'jvm_property' ? `jvm_property|${gate.probe}|${gate.site}` : `${gate.modId}|${gate.holder}|${gate.probe}|${gate.site}`) : null }
 
 function freshDerivationState (read, diagnostics, deps = null) {
   const versionByModId = deps
@@ -4029,7 +4103,7 @@ function packCensusOf (read) {
  * the mods.toml version census and the presence gates (holders and keyed
  * user sites anywhere in the pack).
  */
-function readNeoForgeJarUnits (jarPaths) {
+function readNeoForgeJarUnits (jarPaths, opts = {}) {
   const started = Date.now()
   const index = makeClassIndex()
   const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0, presenceGates: [] }
@@ -4038,6 +4112,7 @@ function readNeoForgeJarUnits (jarPaths) {
   for (const j of diagnostics.jars) for (const id of j.modIds || []) if (j.modVersion && !versionByModId[id]) versionByModId[id] = j.modVersion
   const read = { index, units: index.units, diagnostics, versionByModId, allClassNames: [...index.raw.keys()], gates: new Map(), readMs: 0 }
   const gateState = freshDerivationState(read, diagnostics)
+  gateState.jvmFlagProbes = (opts && Array.isArray(opts.jvmFlagProbes)) ? opts.jvmFlagProbes : null // HF106: the table (a test hands a copy with a row dropped)
   try {
     read.gates = deriveModPresenceGates(index, gateState)
   } catch (err) {
@@ -4063,6 +4138,8 @@ function readNeoForgeJarUnits (jarPaths) {
     diagnostics.errors.push(`mod-root walk failed (${err.message})`)
   }
   read.modRootResolved = gateState.modRootResolved || new Set()
+  // HF106: the classes / listener methods a mod root subscribes only under a JVM flag join the gate map
+  for (const [k, g] of (gateState.jvmGates || new Map())) if (!read.gates.has(k)) read.gates.set(k, g)
   read.readMs = Date.now() - started
   return read
 }
@@ -4188,8 +4265,19 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // what the aggregation pass binds candidates to. The event/registrar
     // values are still produced by the interpreter when registrar() is
     // invoked on the event argument.
-    const gate = (method.flags & 0x0008) === 0 ? presenceGates.get(info.className) : null
-    if ((method.flags & 0x0008) === 0) deps.gates[info.className] = gateKeyOf(gate)
+    // HF106: a STATIC entry consults the gate map too, for the jvm_property
+    // kind alone (a static registration subscribed only under a JVM flag is
+    // never registered on a player's game); the mod-presence kind stays an
+    // instance-hosted fact as before. A listener method gated by name wins.
+    const isStaticEntry = (method.flags & 0x0008) !== 0
+    const gateRow = presenceGates.get(`${info.className}#${method.method}${method.desc}`) || presenceGates.get(info.className) || null
+    const gate = isStaticEntry ? ((gateRow && gateRow.kind === 'jvm_property') ? gateRow : null) : gateRow
+    if (!isStaticEntry || gate) deps.gates[info.className] = gateKeyOf(gate)
+    if (gate && gate.kind === 'jvm_property') {
+      diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, kind: 'jvm_property', present: false, probe: gate.probe, gateSite: gate.site })
+      diagnostics.abstains.push(`${info.className}.${method.method}: registrations gated on a JVM flag — ${gate.site} subscribes it only under a jvm_property read by ${gate.probe}; a launch flag is absent on a player's game (client and integrated server alike), so its channels are left unclaimed`)
+      continue
+    }
     if (gate) {
       const present = censusHas(gate.modId)
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, modId: gate.modId, present, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
@@ -4613,9 +4701,9 @@ function assembleNeoForgeComponents (read, perJar) {
  * pseudo-unit first) and the assembled answer; `perJar` carries each unit's
  * path, sha1, trail, deps and claims for a caller that caches per jar.
  */
-function deriveNeoForgeComponentsPerJar (jarPaths) {
+function deriveNeoForgeComponentsPerJar (jarPaths, opts = {}) {
   const started = Date.now()
-  const read = readNeoForgeJarUnits(jarPaths)
+  const read = readNeoForgeJarUnits(jarPaths, opts)
   const perJar = [derivePackUnit(read), ...read.units.map((u) => deriveNeoForgeJarUnit(read, u))]
   const out = assembleNeoForgeComponents(read, perJar)
   const { components, diagnostics, ackContracts, listenOnly } = out
@@ -4623,8 +4711,8 @@ function deriveNeoForgeComponentsPerJar (jarPaths) {
   return { ...out, perJar, read }
 }
 
-function deriveNeoForgeComponents (jarPaths) {
-  const { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly } = deriveNeoForgeComponentsPerJar(jarPaths)
+function deriveNeoForgeComponents (jarPaths, opts = {}) {
+  const { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly } = deriveNeoForgeComponentsPerJar(jarPaths, opts)
   return { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly }
 }
 

@@ -332,6 +332,8 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         './loginReplyBoundary', './annotationRegistryDerivation', './listenOnlyDerivation', './data/blockShapeTables.json',
         // HF105: the direction table + the platform-helper pattern table (cited data, local JSON) and the platform-helper walk
         './data/payloadDirectionRules.json', './platformHelperDerivation', './data/platformHelperPatterns.json',
+        // HF106: the JVM-flag probe table (cited data, local JSON: the launch-flag reads a registration can hide behind)
+        './data/jvmFlagProbes.json',
         // D3: loader-spawn codec derivation (jar bytes → codec spec) + its decoder + the loader-jar locator (local fs walk)
         './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator',
         // D3 rider: the gate's dimension-bounds tracker (packet fields only, no requires)

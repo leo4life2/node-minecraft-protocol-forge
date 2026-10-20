@@ -1,0 +1,19 @@
+{
+  "_doc": "HF106: JVM-FLAG PROBES. A mod registration reachable only under a JVM system-property read (a developer launch flag: a test harness, an automated-test run) is never registered on a player's game, client and integrated server alike, so the server cannot hold the channel and a claim of it fails the negotiation (missing.client.server). Each row is one probe the evaluator tags: owner + method + descriptor (the JDK call as the bytes name it) and the value shape its result takes. shapes: property_string = the read returns the property's String (a branch on it is read through String.equals against a constant); property_boolean = the read returns the flag's boolean. Every row cites the real jar it was read from (file name, sha1, the class and the javap lines of the F41 forensics). Add a row only with such a citation.",
+  "rows": [
+    {
+      "owner": "java/lang/System",
+      "method": "getProperty",
+      "desc": "(Ljava/lang/String;)Ljava/lang/String;",
+      "shape": "property_string",
+      "source": { "jar": "embeddium-1.0.15+mc1.21.1.jar", "sha1": "56063839172a000d079272794bad366f2ad4cbbd", "class": "org/embeddedt/embeddium/impl/Embeddium", "read": "the @Mod constructor: ldc \"true\"; ldc <key>; invokestatic System.getProperty; invokevirtual String.equals; ifeq -> bus.register(Class.forName(<test registry>)) (Embeddium.javap:47-66, receipts/f41/jars)" }
+    },
+    {
+      "owner": "java/lang/Boolean",
+      "method": "getBoolean",
+      "desc": "(Ljava/lang/String;)Z",
+      "shape": "property_boolean",
+      "source": { "jar": "embeddium-1.0.15+mc1.21.1.jar", "sha1": "56063839172a000d079272794bad366f2ad4cbbd", "class": "org/embeddedt/embeddium/impl/gametest/content/TestRegistry", "read": "<clinit>: ldc_w <key>; invokestatic Boolean.getBoolean; putstatic IS_AUTOMATED_TEST_RUN (TestRegistry.javap:321, receipts/f41/jars)" }
+    }
+  ]
+}
