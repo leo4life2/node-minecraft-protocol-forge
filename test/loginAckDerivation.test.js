@@ -547,7 +547,8 @@ describe('HF93 per-jar digest', function () {
   // the fixture set's verdicts, serialized as the embedder's store serializes them, at the base c5fa1b7 (the raw walk only);
   // HF105: the five hf105-*.trimmed.jar fixtures (tfmg, createdieselgenerators, create, moonlight, supplementaries) joined the set - the
   // digest-vs-raw byte identity below is the control, this sha is the set's listing (re-pinned over the grown set; 95d3c1db... before)
-  const BASE_FIXTURE_SET_SHA = '57fcd6a9d2825d89e0691e20b6e68d7d6a6e8b0896c0fa48a028114a55b72f34'
+  // HF106: the two hf106-embeddium-*.jar fixtures (the trimmed real jar + its no-guard twin) joined the set (57fcd6a9... before)
+  const BASE_FIXTURE_SET_SHA = '8984fc451059793f58037f844b63fcd505f18e47173c62b7c23f7e362a0b3301'
   const quiet = (fn) => { const o = console.log; console.log = () => {}; try { return fn() } finally { console.log = o } }
   const packOf = (tag) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hf93-m3-${tag}-`))
