@@ -548,7 +548,7 @@ describe('HF93 per-jar digest', function () {
   // HF105: the five hf105-*.trimmed.jar fixtures (tfmg, createdieselgenerators, create, moonlight, supplementaries) joined the set - the
   // digest-vs-raw byte identity below is the control, this sha is the set's listing (re-pinned over the grown set; 95d3c1db... before)
   // HF106: the two hf106-embeddium-*.jar fixtures (the trimmed real jar + its no-guard twin) joined the set (57fcd6a9... before)
-  const BASE_FIXTURE_SET_SHA = '8984fc451059793f58037f844b63fcd505f18e47173c62b7c23f7e362a0b3301'
+  const BASE_FIXTURE_SET_SHA = 'e188a2ebbc8892fb023219f7e08972ac65888e58e3a51bd2cd4ecc5c62d1cdc3' // HF110: the set grew by the hf110-* fixtures (the trimmed owner + library pair and the no-call-site twin); every earlier pair derives what it derived (the lane's bV control, pair by pair)
   const quiet = (fn) => { const o = console.log; console.log = () => {}; try { return fn() } finally { console.log = o } }
   const packOf = (tag) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hf93-m3-${tag}-`))
@@ -611,5 +611,106 @@ describe('HF93 per-jar digest', function () {
     const dir = packOf('alpha')
     assert.strictEqual(lad.assessLoginChannel('weird~ns:path', [dir]).verdict, 'unknown')
     assert.deepStrictEqual({ built: stats().built, rawWalks: stats().rawWalks }, { built: 0, rawWalks: 3 })
+  }))
+})
+
+// ---------------------------------------------------------------------------
+// HF110: THE CROSS-JAR BUILDER BINDING + THE MIRROR REPLY. The field (F44, a
+// Forge 1.19.2 world of 302 mods): the login ended at one wrapped message on
+// quark:main. The owner jar's QuarkNetwork never spells "main" - the channel
+// is built by the LIBRARY (AutoRegLib's NetworkHandler("quark", 2) adds the
+// ldc "main", builds the ResourceLocation and the SimpleChannel); the login
+// check is a mirror (S2CLoginFlag at 98 = longArray + int + int, the client
+// handler answers `new C2SLoginFlag()` at 99 = the same three members from
+// its own configuration). Fixtures: the two REAL jars trimmed to the
+// structural classes + mods.toml (test/fixtures/hf110-*.trimmed.jar); the
+// twin = the owner jar with QuarkNetwork's constant-pool reference to the
+// library class rewritten to a same-length name no jar holds (the call site
+// no longer binds). The base tree derives 'unknown' on every one of these.
+describe('HF110 cross-jar builder binding + mirror reply (real Quark 3.4-418 + AutoRegLib 1.8.2-55, trimmed)', function () {
+  const FX = path.join(__dirname, 'fixtures')
+  const OWNER = path.join(FX, 'hf110-Quark-3.4-418.trimmed.jar')
+  const LIB = path.join(FX, 'hf110-AutoRegLib-1.8.2-55.trimmed.jar')
+  const TWIN = path.join(FX, 'hf110-Quark-3.4-418.twin-nocallsite.jar')
+  const lad = require('../src/client/loginAckDerivation')
+  const quietly = (fn) => { const log = console.log; console.log = () => {}; try { return fn() } finally { console.log = log } }
+  // the S2C body a real server sends behind index 98: writeLongArray (varint length 1 + one long) + int + int
+  const S2C_BODY = Buffer.from('010000000000000005' + '0000000c' + '2a3b4c5d', 'hex')
+
+  it('R1 + R2: the owner + library pair derives the echo verdict at the reply index 99, builtBy naming the library jar file and its mod id, no reply buffer at assess time', () => quietly(() => {
+    lad._internal.__clearJarDigests()
+    const r = lad.assessLoginChannel('quark:main', [OWNER, LIB])
+    assert.strictEqual(r.verdict, 'echo')
+    assert.strictEqual(r.index, 99)
+    assert.strictEqual(r.msgClass, 'vazkii/quark/base/network/message/structural/C2SLoginFlag')
+    assert.strictEqual(r.inboundClass, 'vazkii/quark/base/network/message/structural/S2CLoginFlag')
+    assert.strictEqual(r.constructedAt, 'vazkii/quark/base/network/message/structural/S2CLoginFlag#consume')
+    assert.deepStrictEqual(r.layout, ['m_178381_()[J', 'readInt()I', 'readInt()I'])
+    assert.deepStrictEqual(r.builtBy, { jarName: 'hf110-AutoRegLib-1.8.2-55.trimmed.jar', modId: 'autoreglib', className: 'vazkii/arl/network/NetworkHandler', nestedChain: [] })
+    assert.strictEqual(r.jarName, 'hf110-Quark-3.4-418.trimmed.jar')
+    assert.strictEqual(r.corroboration, 'corroborated-by-local-jar')
+    assert.deepStrictEqual(r.namespaceProof.chain, { kind: 'cross-jar-builder', className: 'vazkii/arl/network/NetworkHandler', method: '<init>', desc: '(Ljava/lang/String;I)V', ns: 'quark', path: 'main' })
+    assert.strictEqual(r.namespaceProof.owner.by, 'mods-toml')
+    assert.strictEqual(r.reply, undefined, 'no reply bytes at assess time: the body is the query\'s')
+    assert.match(r.evidence, /explicit constant 99 at vazkii\/quark\/base\/network\/QuarkNetwork#setup \(through vazkii\/quark\/base\/network\/QuarkNetwork#loginIndexedBuilder\)/)
+    // JSON-safe round trip: the verdict the embedder persists revives byte for byte
+    const entry = lad.exportLoginAssessments().find((e) => e.key === lad.loginAssessmentKeyOf('quark:main', [OWNER, LIB]))
+    assert.ok(entry && entry.result.verdict === 'echo')
+    assert.strictEqual(JSON.stringify(JSON.parse(JSON.stringify(entry.result))), JSON.stringify(entry.result))
+    // the order of the paths does not change the verdict (the library may sit before the owner in a census)
+    assert.strictEqual(lad.assessLoginChannel('quark:main', [LIB, OWNER]).verdict, 'echo')
+  }))
+
+  it('the handshake reply for a synthesized S2C body = the reply index byte + the inbound body byte for byte; the corroboration row says jar-derived-echo and names the library', () => quietly(() => {
+    const client = new EventEmitter()
+    client.forgePingMods = [{ id: 'quark', version: '3.4-418' }]
+    client.forgeModList = { mods: ['minecraft', 'forge', 'quark'], channels: [{ name: 'quark:main', marker: '2' }], registries: [] }
+    const resolved = forgeHandshake3.resolveWrappedModLogin(client, 'quark:main', 98, S2C_BODY, { modsPaths: [OWNER, LIB] }, 3, false)
+    assert.ok(resolved && Buffer.isBuffer(resolved.reply), 'a reply rides')
+    assert.strictEqual(resolved.reply.toString('hex'), '63' + '010000000000000005' + '0000000c' + '2a3b4c5d')
+    assert.deepStrictEqual(resolved.reply, Buffer.concat([Buffer.from([99]), S2C_BODY]))
+    assert.strictEqual(resolved.via, 'jar-derived echo index 99 from hf110-Quark-3.4-418.trimmed.jar (built by hf110-AutoRegLib-1.8.2-55.trimmed.jar)')
+    const row = client.forgeLoginCorroboration[0]
+    assert.strictEqual(row.via, 'jar-derived-echo'); assert.strictEqual(row.index, 99); assert.strictEqual(row.ownerMod, 'quark'); assert.strictEqual(row.ownerVersion, '3.4-418')
+    assert.deepStrictEqual(row.builtBy, { jarName: 'hf110-AutoRegLib-1.8.2-55.trimmed.jar', modId: 'autoreglib' })
+    assert.strictEqual(client.forgeDeclinedLoginChannels, undefined, 'no decline')
+    // a different body on a later query echoes THAT body: the bytes are the query's, never cached
+    const other = Buffer.from('00' + 'ffffffff' + '00000000', 'hex')
+    assert.strictEqual(forgeHandshake3.resolveWrappedModLogin(client, 'quark:main', 98, other, { modsPaths: [OWNER, LIB] }, 3, false).reply.toString('hex'), '63' + other.toString('hex'))
+    // an empty body echoes the bare index (never a guessed byte)
+    assert.strictEqual(forgeHandshake3.resolveWrappedModLogin(client, 'quark:main', 98, Buffer.alloc(0), { modsPaths: [OWNER, LIB] }, 3, false).reply.toString('hex'), '63')
+  }))
+
+  it('the owner jar alone = unknown (no builder callee in the paths), the library alone = unknown, the no-call-site twin + library = unknown: never a library name in the serialized verdict', () => quietly(() => {
+    lad._internal.__clearJarDigests()
+    for (const paths of [[OWNER], [LIB], [TWIN, LIB], [TWIN]]) {
+      const r = lad.assessLoginChannel('quark:main', paths)
+      assert.strictEqual(r.verdict, 'unknown', paths.map((p) => path.basename(p)).join('+'))
+      assert.strictEqual(r.builtBy, undefined)
+      assert.ok(!JSON.stringify(r).includes('AutoRegLib') && !JSON.stringify(r).includes('autoreglib'), 'no library name on an unknown verdict')
+    }
+    // the base's bare unknown, byte for byte (the bV control: an owner jar with no creation serializes exactly as before)
+    assert.strictEqual(JSON.stringify(lad.assessLoginChannel('quark:main', [OWNER])), JSON.stringify({ verdict: 'unknown' }))
+  }))
+
+  it('the mechanism, not the mod: the forwarded registration reads the caller\'s constant through the helper\'s parameter slot, the mirror reads the two layouts and the no-arg construction', () => quietly(() => {
+    lad._internal.__clearJarDigests()
+    lad.assessLoginChannel('quark:main', [OWNER, LIB])
+    const { regSitesOn, mirrorEchoOf, bufferLayoutOf, newFacts, indexJar } = lad._internal
+    const facts = newFacts(); const hot = []
+    for (const jar of [OWNER, LIB]) indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [], artifacts: [] }, facts, 0, Buffer.from('quark'), Buffer.from('main'), hot, false)
+    for (const jar of [OWNER, LIB]) indexJar(fs.readFileSync(jar), { jarPath: jar, chain: [], artifacts: [] }, facts, 0, Buffer.from('quark'), Buffer.from('main'), hot, true)
+    assert.deepStrictEqual(hot.map((h) => h.className), ['vazkii/quark/base/network/QuarkNetwork'], 'the owner class is admitted through its call into the library (the twin admits nothing)')
+    assert.ok(facts.builderCallees.has('vazkii/arl/network/NetworkHandler'), 'the library class is a builder-callee candidate')
+    const sites = regSitesOn(facts, hot)
+    const forwarded = sites.filter((s) => s.forwardedFrom)
+    assert.deepStrictEqual(forwarded.map((s) => [s.msgClass.split('/').pop(), s.index.const, s.direction, s.loginMarked, s.noResponse]), [['S2CLoginFlag', 98, 'LOGIN_TO_CLIENT', true, false], ['C2SLoginFlag', 99, 'LOGIN_TO_SERVER', true, true]])
+    assert.ok(forwarded.every((s) => s.channelField === 'vazkii/arl/network/NetworkHandler.channel' && s.forwardedFrom === 'vazkii/quark/base/network/QuarkNetwork#loginIndexedBuilder'))
+    const echo = mirrorEchoOf(facts, sites.filter((s) => s.channelField === 'vazkii/arl/network/NetworkHandler.channel'), hot)
+    assert.strictEqual(echo.index, 99)
+    const a = bufferLayoutOf(facts, 'vazkii/quark/base/network/message/structural/S2CLoginFlag')
+    const b = bufferLayoutOf(facts, 'vazkii/quark/base/network/message/structural/C2SLoginFlag')
+    assert.deepStrictEqual(a.reads, b.reads); assert.deepStrictEqual(a.writes, b.writes)
+    assert.deepStrictEqual(a.writes, ['m_130091_([J)Lnet/minecraft/network/FriendlyByteBuf;', 'writeInt(I)Lio/netty/buffer/ByteBuf;', 'writeInt(I)Lio/netty/buffer/ByteBuf;'])
   }))
 })
