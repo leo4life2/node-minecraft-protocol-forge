@@ -681,6 +681,25 @@ describe('HF110 cross-jar builder binding + mirror reply (real Quark 3.4-418 + A
     assert.strictEqual(forgeHandshake3.resolveWrappedModLogin(client, 'quark:main', 98, Buffer.alloc(0), { modsPaths: [OWNER, LIB] }, 3, false).reply.toString('hex'), '63')
   }))
 
+  // Rider: HF110 - the replay body pin. The bytes a real Forge 1.19.2 server
+  // (the verify rig, 302-mod mods folder) sent on quark:main behind its index
+  // byte 98, and the reply the real child put on the wire (recorded through a
+  // byte proxy); the handshake reply seat over the trimmed pair must equal that
+  // reply byte for byte - the server's own body behind the reply index 99.
+  it('the recorded S2C body from the Forge 1.19.2 rig replay echoes to the recorded reply byte for byte', () => quietly(() => {
+    const recordedBody = Buffer.from('04fffffffffffffeffffdffff3ffffffffffffffffffffffff0000ffffffffffff00000109e99ea7ac', 'hex')
+    const recordedReply = '6304fffffffffffffeffffdffff3ffffffffffffffffffffffff0000ffffffffffff00000109e99ea7ac'
+    const client = new EventEmitter()
+    client.forgePingMods = [{ id: 'quark', version: '3.4-418' }]
+    client.forgeModList = { mods: ['minecraft', 'forge', 'quark'], channels: [{ name: 'quark:main', marker: '2' }], registries: [] }
+    const resolved = forgeHandshake3.resolveWrappedModLogin(client, 'quark:main', 98, recordedBody, { modsPaths: [OWNER, LIB] }, 3, false)
+    assert.ok(resolved && Buffer.isBuffer(resolved.reply), 'a reply rides')
+    assert.strictEqual(resolved.reply.toString('hex'), recordedReply)
+    assert.strictEqual(resolved.reply.length, 1 + recordedBody.length)
+    assert.strictEqual(client.forgeLoginCorroboration[0].via, 'jar-derived-echo')
+    assert.strictEqual(client.forgeDeclinedLoginChannels, undefined, 'no decline')
+  }))
+
   it('the owner jar alone = unknown (no builder callee in the paths), the library alone = unknown, the no-call-site twin + library = unknown: never a library name in the serialized verdict', () => quietly(() => {
     lad._internal.__clearJarDigests()
     for (const paths of [[OWNER], [LIB], [TWIN, LIB], [TWIN]]) {
