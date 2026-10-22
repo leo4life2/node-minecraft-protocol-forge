@@ -66,7 +66,12 @@ const { NESTED_JAR_RE, forEachNestedJar } = require('./nestedJars')
 //   4 — HF95 the tolerated decline: reason 'no-reply-needed' when every
 //       login-marked site is server-to-client with noResponse (a persisted
 //       'no-derivable-ack' verdict of such a channel is re-derived)
-const LOGIN_ACK_DERIVATION_VERSION = 4
+//   5 — HF110 the cross-jar builder binding (a channel a library builds on
+//       the owner's behalf, builtBy) + the forwarded registration (the index
+//       from a helper's parameter) + the 'echo' verdict (a mirror reply: the
+//       inbound body behind the reply's own index) — a persisted 'unknown'
+//       verdict of such a channel is re-derived
+const LOGIN_ACK_DERIVATION_VERSION = 5
 
 const RL_CLASSES = new Set([
   'net/minecraft/resources/ResourceLocation', // mojmap/srg (Forge 1.17+ mods)
@@ -243,7 +248,8 @@ function newFacts () {
     nsOwners: [], // HF69a: {jarPath, chain, by, className?} jars that own the namespace
     jarHints: new Set(), // HF69a: top-level jars the strict pass saw the namespace in (mods.toml or class bytes)
     abstains: [], // HF69a: named reasons a derivation stopped, for the receipt
-    bufs: new Map() // HF93: jar bytes read for THIS assessment (jarPath + nested chain -> { buf, entries }), so a nested jar inflates once per assessment
+    bufs: new Map(), // HF93: jar bytes read for THIS assessment (jarPath + nested chain -> { buf, entries }), so a nested jar inflates once per assessment
+    builderCallees: new Map() // HF110: className -> {jarPath, chain, entryName} classes of ANY jar that carry the path needle, a loader channel-builder class and an RL class (the cross-jar builder candidates, noted in the strict pass)
   }
 }
 
@@ -463,14 +469,30 @@ function indexDigest (d, source, facts, depth, ns, pathPart, hot, wide) {
   }
   let rlIds = null
   if (owner) { rlIds = new Set(); for (const rl of RL_CLASSES) for (const id of runIdsMatching(d, rl)) rlIds.add(id) }
+  // HF110: the strict pass notes the builder-callee candidates of EVERY jar
+  // (path needle + a loader channel builder + an RL class in one pool); the
+  // wide pass admits, in an owner jar, a namespace-carrying class that names
+  // a candidate of ANOTHER jar (the cross-jar call site)
+  let calleeBuilderIds = null
+  let calleeRlIds = null
+  if (!wide && pathIds.size) {
+    calleeBuilderIds = new Set(); for (const b of LOADER_BUILDERS) for (const id of runIdsMatching(d, b)) calleeBuilderIds.add(id)
+    if (calleeBuilderIds.size) { calleeRlIds = new Set(); for (const rl of RL_CLASSES) for (const id of runIdsMatching(d, rl)) calleeRlIds.add(id) }
+  }
+  let calleeRefIds = null
+  if (wide && owner && facts.builderCallees.size) {
+    calleeRefIds = new Set()
+    for (const [cn, loc] of facts.builderCallees) { if (sameSource(loc, source)) continue; for (const id of runIdsMatching(d, cn)) calleeRefIds.add(id) }
+  }
   for (const row of d.classes) {
     const className = row.entryName.slice(0, -6)
     if (!facts.classIndex.has(className)) facts.classIndex.set(className, { ...source, entryName: row.entryName })
     if (row.unreadable) continue
     const hasNs = classCarries(row, nsIds)
     if (!wide && hasNs) facts.jarHints.add(source.jarPath)
+    if (calleeBuilderIds && calleeBuilderIds.size && classCarries(row, pathIds) && classCarries(row, calleeBuilderIds) && classCarries(row, calleeRlIds)) facts.builderCallees.set(className, { ...source, entryName: row.entryName })
     const strict = hasNs && classCarries(row, pathIds)
-    const widened = !strict && owner && classCarries(row, pathIds) && classCarries(row, rlIds)
+    const widened = !strict && owner && ((classCarries(row, pathIds) && classCarries(row, rlIds)) || (hasNs && classCarries(row, calleeRefIds)))
     if (strict || widened) {
       if (hot.some((h) => h.className === className)) continue
       let parsed = facts.parsed.get(className)
@@ -556,6 +578,10 @@ function indexJar (buf, source, facts, depth, nsNeedle, pathNeedle, hot, wide) {
   forEachNestedJar(buf, entries, depth, ({ entry, data, artifact }) => {
     indexJar(data, { jarPath: source.jarPath, chain: [...source.chain, entry.name], artifacts: [...(source.artifacts || []), artifact] }, facts, depth + 1, nsNeedle, pathNeedle, hot, wide)
   })
+  // HF110: the raw walk's twin of the digest's builder-callee note / cross-jar admission (indexDigest)
+  const calleeNeedles = wide && owner && facts.builderCallees.size
+    ? [...facts.builderCallees].filter(([, loc]) => !sameSource(loc, source)).map(([cn]) => Buffer.from(cn, 'utf8'))
+    : null
   for (const entry of entries) {
     if (NESTED_JAR_RE.test(entry.name)) continue
     if (!entry.name.endsWith('.class') || entry.name.startsWith('META-INF/')) continue
@@ -567,8 +593,9 @@ function indexJar (buf, source, facts, depth, nsNeedle, pathNeedle, hot, wide) {
     try { data = zipEntryData(buf, entry) } catch { continue }
     const hasNs = data.includes(nsNeedle)
     if (!wide && hasNs) facts.jarHints.add(source.jarPath)
+    if (!wide && data.includes(pathNeedle) && LOADER_BUILDER_NEEDLES.some((n) => data.includes(n)) && RL_NEEDLES.some((n) => data.includes(n))) facts.builderCallees.set(className, { ...source, entryName: entry.name })
     const strict = hasNs && data.includes(pathNeedle)
-    const widened = !strict && owner && data.includes(pathNeedle) && RL_NEEDLES.some((n) => data.includes(n))
+    const widened = !strict && owner && ((data.includes(pathNeedle) && RL_NEEDLES.some((n) => data.includes(n))) || (hasNs && calleeNeedles && calleeNeedles.some((n) => data.includes(n))))
     if (strict || widened) {
       if (hot.some((h) => h.className === className)) continue // already hot from the strict pass
       const parsed = facts.parsed.get(className) || parseClassFile(data)
@@ -1051,16 +1078,8 @@ function counterUsePositions (ev, counterField) {
 // getstatic. Proves the ack site is the counter's first use by linearizing
 // the unique root method that calls every counter-using method.
 function deriveDirect (facts, channelField, hotClasses, channelId) {
-  // all registration sites on this channel across hot classes
-  const sites = []
-  for (const parsed of hotClasses) {
-    for (const m of parsed.codes) {
-      const ev = eventsFor(facts, parsed, m)
-      for (const s of extractRegSites(ev, parsed.className, m.method, indySitesOf(facts, parsed, m))) {
-        if (s.channelField === channelField) sites.push(s)
-      }
-    }
-  }
+  // all registration sites on this channel across hot classes (HF110: the forwarded ones too)
+  const sites = regSitesOn(facts, hotClasses).filter((s) => s.channelField === channelField)
   if (sites.length === 0) return null
 
   const proofs = new Map()
@@ -1376,7 +1395,438 @@ function findCreations (facts, hotClasses, ns, pathPart) {
       }
     }
   }
+  // HF110 (R1): the creations made through a builder callee of another jar
+  for (const c of crossJarCreations(facts, hotClasses, ns, pathPart)) creations.push(c)
   return creations
+}
+
+// ---------------------------------------------------------------------------
+// HF110 (R1): THE CROSS-JAR BUILDER BINDING. The field (F44: a Forge 1.19.2
+// world, 302 mods, the login ended at ONE wrapped message on a channel whose
+// owner jar never spells the channel's path): the channel is built by a
+// LIBRARY on the owner's behalf - the owner's class passes its namespace
+// constant as a String argument into a class of ANOTHER jar, and that callee
+// builds the ResourceLocation from the parameter plus its own ldc path and
+// calls the loader's channel builder. Neither class is hot under the strict
+// rule (both halves in one class) or the wide rule (an owner-jar class that
+// carries the path): the owner's class carries only the namespace, the
+// library's class carries the path but its jar owns another namespace.
+//
+// The rule is a bytecode shape, never a name: (a) the strict pass notes, in
+// EVERY jar of the paths set, the classes that carry the path needle, a
+// loader channel-builder class and an RL class in one constant pool (the
+// builder-callee candidates); (b) the wide pass admits, in a jar that OWNS
+// the namespace, a class carrying the namespace needle whose constant pool
+// names a candidate of ANOTHER jar; (c) findCreations follows each call from
+// such a class into the candidate with the call's constant arguments bound
+// to the callee's parameter slots, through `this(...)` delegation, and reads
+// the RL the callee builds and the SimpleChannel field it stores - a channel
+// bound to ns:path with `builtBy` naming the library jar and its mod id.
+// The straight-line walk abstains at the first branch or unmodeled op:
+// wrong answers are worse than no answer.
+const LOADER_BUILDERS = new Set([
+  'net/minecraftforge/network/NetworkRegistry$ChannelBuilder', // FML3-era mods (the LOADER_TRANSPORTS row of packetBodyWireDerivation)
+  'net/minecraftforge/fml/network/NetworkRegistry$ChannelBuilder' // FML2-era mods (the same API under fml/)
+])
+const LOADER_BUILDER_NEEDLES = [...LOADER_BUILDERS].map((n) => Buffer.from(n, 'utf8'))
+const JAVA_CLASS = 'Ljava/lang/Class;'
+
+/** The parameter type descriptors of a method descriptor, in order. */
+function paramTypes (desc) {
+  const out = []
+  if (typeof desc !== 'string' || desc[0] !== '(') return out
+  let i = 1
+  while (i < desc.length && desc[i] !== ')') {
+    let j = i
+    while (desc[j] === '[') j++
+    if (desc[j] === 'L') { const end = desc.indexOf(';', j); out.push(desc.slice(i, end + 1)); i = end + 1 } else { out.push(desc.slice(i, j + 1)); i = j + 1 }
+  }
+  return out
+}
+function returnType (desc) { const i = typeof desc === 'string' ? desc.lastIndexOf(')') : -1; return i < 0 ? null : desc.slice(i + 1) }
+const sameSource = (a, b) => !!a && !!b && a.jarPath === b.jarPath && JSON.stringify(a.chain || []) === JSON.stringify(b.chain || [])
+
+/** The `[[mods]]` modId a jar's own mods.toml declares first (null when it declares none). */
+function jarModIdOf (facts, loc) {
+  if (!loc) return null
+  const held = jarBytesOf(facts, loc.jarPath, loc.chain)
+  if (!held) return null
+  for (const entry of held.entries) {
+    if (!MODS_TOML_ENTRIES.has(entry.name)) continue
+    let text = ''
+    try { text = zipEntryData(held.buf, entry).toString('utf8') } catch { continue }
+    let table = null
+    for (const line of text.split(/\r?\n/)) {
+      const t = line.match(/^\s*\[\[\s*([^\]\s]+)\s*\]\]/)
+      if (t) { table = t[1]; continue }
+      const m = line.match(/^\s*modId\s*=\s*"([^"]+)"/)
+      if (m && table === 'mods') return m[1]
+    }
+  }
+  return null
+}
+
+// The constant arguments a call site pushes, read backwards from the call
+// over the modeled events: a String parameter takes the nearest preceding
+// `str`, an int parameter the nearest `int`; any other parameter is unknown.
+// Bounded by the `new` of the receiver or the previous call.
+function callArgsOf (ev, i, desc) {
+  const params = paramTypes(desc)
+  const args = new Array(params.length).fill(null).map(() => ({ k: 'unknown' }))
+  let j = i - 1
+  for (let p = params.length - 1; p >= 0 && j >= 0; p--, j--) {
+    const e = ev[j]
+    if (!e || e.k === 'new' || e.k === 'call' || e.k === 'put') break
+    if (params[p] === JAVA_STRING && e.k === 'str') args[p] = { k: 'str', v: e.v }
+    else if (params[p] === 'I' && e.k === 'int') args[p] = { k: 'int', v: e.v }
+    else if (params[p] === JAVA_CLASS && e.k === 'cls') args[p] = { k: 'cls', v: e.v }
+  }
+  return args
+}
+
+/**
+ * Runs one callee method straight-line with its parameters bound to the
+ * caller's constants and reads the channel it builds: { ns, path, channelField }
+ * when a SimpleChannel built from an RL(ns, path) through a loader builder is
+ * stored into a field (an instance field through `this`, or a static one), or
+ * { ns, path, returned: true } when it is returned. Null = unproven.
+ */
+function bindBuilderCallee (facts, className, name, desc, args, depth = 0) {
+  if (depth > 3) return null
+  const parsed = lazyClass(facts, className)
+  if (!parsed) return null
+  const m = parsed.codes.find((mm) => mm.method === name && mm.desc === desc)
+  if (!m) return null
+  const isStatic = !!(m.flags & ACC_STATIC)
+  const params = paramTypes(desc)
+  const locals = new Map()
+  let slot = 0
+  if (!isStatic) { locals.set(0, { k: 'this' }); slot = 1 }
+  params.forEach((t, i) => { locals.set(slot, (args && args[i]) || { k: 'unknown' }); slot += (t === 'J' || t === 'D') ? 2 : 1 })
+  const stack = []
+  const { cp } = parsed
+  const code = m.code
+  let result = null
+  let stop = false
+  const pop = () => stack.length ? stack.pop() : { k: 'unknown' }
+  const push = (v) => stack.push(v)
+  const rlOf = (a, b) => ({ k: 'rl', ns: a && a.k === 'str' ? a.v : null, path: b && b.k === 'str' ? b.v : null })
+  walkBytecode(code, (op, pc) => {
+    if (stop) return
+    if (op === 0x00) return // nop
+    if (op === 0x01) return push({ k: 'null' })
+    if (op >= 0x02 && op <= 0x08) return push({ k: 'int', v: op - 0x03 })
+    if (op === 0x09 || op === 0x0a || op === 0x0b || op === 0x0c || op === 0x0d || op === 0x0e || op === 0x0f) return push({ k: 'unknown' }) // lconst/fconst/dconst
+    if (op === 0x10) return push({ k: 'int', v: code.readInt8(pc + 1) })
+    if (op === 0x11) return push({ k: 'int', v: code.readInt16BE(pc + 1) })
+    if (op === 0x12 || op === 0x13) {
+      const c = cp[op === 0x12 ? code[pc + 1] : code.readUInt16BE(pc + 1)]
+      if (c && c.tag === 8) return push({ k: 'str', v: cpUtf8(cp, c.strIndex) })
+      if (c && c.tag === 7) return push({ k: 'cls', v: cpUtf8(cp, c.nameIndex) })
+      if (c && c.tag === 3) return push({ k: 'int', v: c.int })
+      return push({ k: 'unknown' })
+    }
+    if (op === 0x14) return push({ k: 'unknown' }) // ldc2_w
+    if (op >= 0x15 && op <= 0x19) return push(locals.get(code[pc + 1]) || { k: 'unknown' }) // iload..aload <n>
+    if (op >= 0x1a && op <= 0x2d) return push(locals.get((op - 0x1a) % 4) || { k: 'unknown' }) // xload_0..3
+    if (op >= 0x36 && op <= 0x3a) { locals.set(code[pc + 1], pop()); return }
+    if (op >= 0x3b && op <= 0x4e) { locals.set((op - 0x3b) % 4, pop()); return }
+    if (op === 0x57) { pop(); return }
+    if (op === 0x59) { const t = pop(); push(t); push(t); return } // dup: the same value twice (an RL built later through the copy is seen through both)
+    if (op === 0xc0) return // checkcast keeps the value
+    if (op === 0xbb) { const c = cp[code.readUInt16BE(pc + 1)]; return push({ k: 'obj', cls: c && c.tag === 7 ? cpUtf8(cp, c.nameIndex) : null }) }
+    if (op === 0xb2) { const r = cpRef(cp, code.readUInt16BE(pc + 1)); return push({ k: 'get', r }) }
+    if (op === 0xb4) { pop(); const r = cpRef(cp, code.readUInt16BE(pc + 1)); return push({ k: 'get', r }) }
+    if (op === 0xb3 || op === 0xb5) {
+      const r = cpRef(cp, code.readUInt16BE(pc + 1))
+      const v = pop()
+      if (op === 0xb5) pop()
+      if (v && v.k === 'channel' && r && isSimpleChannelDesc(r.desc) && !result) result = { ns: v.rl.ns, path: v.rl.path, channelField: `${r.owner}.${r.name}`, className, method: name, desc }
+      return
+    }
+    if (op === 0xba) { // invokedynamic: the arguments by its descriptor, an opaque value back
+      const c = cp[code.readUInt16BE(pc + 1)]
+      const nat = c && cp[c.natIndex]
+      const d = nat ? cpUtf8(cp, nat.descIndex) : '()V'
+      for (let k = 0; k < paramTypes(d).length; k++) pop()
+      if (returnType(d) !== 'V') push({ k: 'unknown' })
+      return
+    }
+    if (op === 0xb6 || op === 0xb7 || op === 0xb8 || op === 0xb9) {
+      const r = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (!r) { stop = true; return }
+      const n = paramTypes(r.desc).length
+      const a = []
+      for (let k = 0; k < n; k++) a.unshift(pop())
+      const recv = op === 0xb8 ? null : pop()
+      const ret = returnType(r.desc)
+      if (r.name === '<init>') {
+        if (recv && recv.k === 'obj' && isRlClass(facts, r.owner)) {
+          if (r.desc === '(Ljava/lang/String;Ljava/lang/String;)V') Object.assign(recv, rlOf(a[0], a[1]))
+          else if (r.desc === '(Ljava/lang/String;)V' && a[0] && a[0].k === 'str' && RL_CLASSES.has(r.owner)) { const ix = a[0].v.indexOf(':'); Object.assign(recv, { k: 'rl', ns: ix >= 0 ? a[0].v.slice(0, ix) : 'minecraft', path: ix >= 0 ? a[0].v.slice(ix + 1) : a[0].v }) } else Object.assign(recv, { k: 'unknown' })
+        } else if (recv && recv.k === 'this' && r.owner === className) {
+          // this(...) delegation: the same walk over the delegated constructor with these arguments bound
+          const sub = bindBuilderCallee(facts, r.owner, '<init>', r.desc, a, depth + 1)
+          if (sub && !result) result = sub
+        }
+        return
+      }
+      if (LOADER_BUILDERS.has(r.owner)) {
+        if (ret && ret.slice(1, -1) === r.owner) return push({ k: 'builder', rl: (recv && recv.rl) || (a[0] && a[0].k === 'rl' ? a[0] : null) })
+        if (isSimpleChannelDesc(ret)) return push({ k: 'channel', rl: (recv && recv.rl) || null })
+      }
+      if (ret !== 'V') push({ k: 'unknown' })
+      return
+    }
+    if (op === 0xb0) { const v = pop(); if (v && v.k === 'channel' && v.rl && !result) result = { ns: v.rl.ns, path: v.rl.path, returned: true, className, method: name, desc }; stop = true; return }
+    if (op === 0xb1) { stop = true; return }
+    // a branch, arithmetic, an array op, a wide stack op: no longer provable straight-line
+    stop = true
+  })
+  return result && result.ns != null && result.path != null && (result.channelField || result.returned) ? result : null
+}
+
+/**
+ * HF110 (R1): the creations a hot class makes THROUGH a builder callee of
+ * another jar: a call whose String argument is the namespace, into a class
+ * that builds RL(ns, path) and a SimpleChannel from it. The creation reads as
+ * a direct one (the field the library stores the channel in is the field the
+ * owner's registrations read through) with `builtBy` naming the library.
+ */
+function crossJarCreations (facts, hotClasses, ns, pathPart) {
+  const out = []
+  if (!facts.builderCallees || facts.builderCallees.size === 0) return out
+  for (const parsed of hotClasses) {
+    const loc = facts.classIndex.get(parsed.className)
+    for (const m of parsed.codes) {
+      const ev = eventsFor(facts, parsed, m)
+      for (let i = 0; i < ev.length; i++) {
+        const e = ev[i]
+        if (e.k !== 'call' || !e.r.desc) continue
+        const callee = facts.builderCallees.get(e.r.owner)
+        if (!callee || sameSource(callee, loc)) continue
+        if (!paramTypes(e.r.desc).includes(JAVA_STRING)) continue
+        const args = callArgsOf(ev, i, e.r.desc)
+        if (!args.some((a) => a.k === 'str' && a.v === ns)) continue
+        const bound = bindBuilderCallee(facts, e.r.owner, e.r.name, e.r.desc, args)
+        if (!bound || bound.ns !== ns || bound.path !== pathPart) continue
+        let channelField = bound.channelField || null
+        if (!channelField && bound.returned) {
+          for (let j = i + 1; j < ev.length; j++) {
+            if (ev[j].k === 'put' && isSimpleChannelDesc(ev[j].r.desc)) { channelField = `${ev[j].r.owner}.${ev[j].r.name}`; break }
+            if (ev[j].k === 'put' || ev[j].k === 'call') break
+          }
+        }
+        if (!channelField) continue
+        const builtBy = { jarName: path.basename(callee.jarPath), modId: jarModIdOf(facts, callee), className: e.r.owner, nestedChain: callee.chain || [] }
+        out.push({
+          className: parsed.className,
+          method: m.method,
+          direct: true,
+          channelField,
+          chain: [],
+          idProof: { helper: null, chain: { kind: 'cross-jar-builder', className: e.r.owner, method: e.r.name, desc: e.r.desc, ns, path: pathPart } },
+          builtBy
+        })
+      }
+    }
+  }
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// HF110: THE FORWARDED REGISTRATION. A mod's own helper
+// `static <M> MessageBuilder<M> login(Class<M> cls, int index, NetworkDirection dir)`
+// calls `channel.messageBuilder(cls, index, dir)` with its index from a
+// PARAMETER slot (never stored in the method: resolveLocalIndex has no store
+// to read), marks the builder (loginIndex / encoder) and returns it; the
+// callers pass the class, the constant index and the direction and finish
+// the chain (decoder / consumer / noResponse / add). The site is the CALLER'S:
+// the helper's channel field and markers, the caller's class, constant and
+// direction, and the union of both chains' markers. The forwarding is keyed
+// on the helper's parameter TYPES (one int, at most one Class, at most one
+// NetworkDirection): two parameters of one kind are ambiguous, so no site.
+function forwardedRegSites (facts, hotClasses) {
+  const out = []
+  for (const parsed of hotClasses) {
+    for (const h of parsed.codes) {
+      const ret = returnType(h.desc)
+      if (!ret || !MESSAGE_BUILDERS.has(ret.slice(1, -1))) continue
+      const ev = eventsFor(facts, parsed, h)
+      const own = extractRegSites(ev, parsed.className, h.method, indySitesOf(facts, parsed, h))
+      if (own.length !== 1) continue
+      const s = own[0]
+      if (!s.index || s.index.local == null || !s.channelField) continue
+      const params = paramTypes(h.desc)
+      const isStatic = !!(h.flags & ACC_STATIC)
+      const slots = []
+      let slot = isStatic ? 0 : 1
+      for (const t of params) { slots.push(slot); slot += (t === 'J' || t === 'D') ? 2 : 1 }
+      const ints = params.map((t, i) => (t === 'I' ? i : -1)).filter((i) => i >= 0)
+      const classes = params.filter((t) => t === JAVA_CLASS).length
+      const dirs = params.filter((t) => NETWORK_DIRECTIONS.has(t.slice(1, -1))).length
+      if (ints.length !== 1 || slots[ints[0]] !== s.index.local || classes > 1 || dirs > 1) continue
+      if (!s.msgClass && classes !== 1) continue
+      if (ev.some((e) => e.k === 'istore' && e.slot === s.index.local)) continue // the parameter is rewritten: not the caller's constant
+      for (const caller of hotClasses) {
+        for (const m of caller.codes) {
+          if (caller === parsed && m === h) continue
+          const cev = eventsFor(facts, caller, m)
+          const indys = indySitesOf(facts, caller, m)
+          for (let i = 0; i < cev.length; i++) {
+            const c = cev[i]
+            if (c.k !== 'call' || c.r.owner !== parsed.className || c.r.name !== h.method || c.r.desc !== h.desc) continue
+            let cls = null
+            let idx = null
+            let dir = null
+            for (let j = i - 1; j >= 0 && j >= i - (params.length + 3); j--) {
+              const p = cev[j]
+              if (p.k === 'call' || p.k === 'put') break
+              if (p.k === 'cls' && !cls) cls = p.v
+              if (p.k === 'int' && idx == null) idx = p.v
+              if (p.k === 'get' && NETWORK_DIRECTIONS.has(p.r.owner) && !dir) dir = p.r.name
+            }
+            if (idx == null) continue
+            const msgClass = s.msgClass || cls
+            if (!msgClass) continue
+            let loginIndexMarked = s.loginIndexMarked
+            let loginPacketMarked = s.loginPacketMarked
+            let noResponse = s.noResponse
+            let encoderIndy = s.encoderIndy
+            for (let j = i + 1; j < cev.length; j++) {
+              const n = cev[j]
+              if (n.k === 'call' && MESSAGE_BUILDERS.has(n.r.owner)) {
+                if (n.r.name === 'loginIndex') loginIndexMarked = true
+                if (n.r.name === 'markAsLoginPacket') loginPacketMarked = true
+                if (n.r.name === 'noResponse') noResponse = true
+                if (n.r.name === 'encoder' && !encoderIndy) encoderIndy = indys.find((d) => d.insn === n.insn - 1) || null
+              }
+              if (n.k === 'call' && (SIMPLE_CHANNELS.has(n.r.owner) || (n.r.owner === parsed.className && n.r.name === h.method))) break
+              if (n.k === 'put') break
+            }
+            out.push({
+              className: caller.className,
+              method: m.method,
+              evIdx: i,
+              msgClass,
+              index: { const: idx },
+              channelField: s.channelField,
+              direction: s.direction || dir,
+              loginMarked: loginIndexMarked || loginPacketMarked,
+              loginIndexMarked,
+              loginPacketMarked,
+              noResponse,
+              encoderIndy,
+              ev: cev,
+              forwardedFrom: `${parsed.className}#${h.method}`
+            })
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+
+/** Every registration site across the hot classes: the direct ones and the forwarded ones (HF110). */
+function regSitesOn (facts, hotClasses) {
+  const sites = []
+  for (const parsed of hotClasses) {
+    for (const m of parsed.codes) {
+      const ev = eventsFor(facts, parsed, m)
+      for (const s of extractRegSites(ev, parsed.className, m.method, indySitesOf(facts, parsed, m))) sites.push(s)
+    }
+  }
+  return sites.concat(forwardedRegSites(facts, hotClasses))
+}
+
+// ---------------------------------------------------------------------------
+// HF110 (R2): THE MIRROR REPLY. A login check whose server-to-client message
+// carries data and whose client-to-server reply class is the SAME layout: the
+// client handler constructs the reply through its no-argument constructor
+// (the reply's values come from the client's own configuration, which a
+// same-config client holds equal to the server's) and the reply class reads
+// and writes exactly the buffer members the inbound class reads and writes,
+// in the same order. Then the reply IS the inbound body behind the reply's
+// own index: the bytes the server produced are the bytes its decoder reads.
+// The proof is the two classes' buffer-member sequences (name + descriptor)
+// and the construction site; the reply bytes are built at the handshake
+// seat from the inbound body - never here, never from a guess.
+function bufferLayoutOf (facts, className) {
+  const parsed = lazyClass(facts, className)
+  if (!parsed) return null
+  const takesBuf = (desc) => paramTypes(desc).some((t) => t[0] === 'L' && BYTEBUF_TYPES.includes(t.slice(1, -1)))
+  const members = (m, want) => {
+    const out = []
+    for (const e of eventsFor(facts, parsed, m)) {
+      if (e.k !== 'call') continue
+      if (BUFFER_OWNERS.has(e.r.owner)) {
+        const ps = paramTypes(e.r.desc)
+        const rt = returnType(e.r.desc)
+        if (want === 'read' && ps.length === 0 && rt !== 'V') out.push({ member: `${e.r.name}${e.r.desc}`, type: rt })
+        else if (want === 'write' && ps.length === 1) out.push({ member: `${e.r.name}${e.r.desc}`, type: ps[0] })
+        else if (want === 'write' && ps.length === 0 && rt === 'V') continue // e.g. a no-op member
+        else return null // a buffer member of another shape: the layout is not a plain member sequence
+      } else if (takesBuf(e.r.desc)) {
+        return null // the buffer handed to another method: its reads/writes are not in this body
+      }
+    }
+    return out
+  }
+  const readers = parsed.codes.filter((m) => !(m.flags & ACC_BRIDGE) && takesBuf(m.desc) && (m.method === '<init>' || ((m.flags & ACC_STATIC) && returnType(m.desc) === `L${className};`)))
+  const writers = parsed.codes.filter((m) => !(m.flags & ACC_BRIDGE) && m.method !== '<init>' && takesBuf(m.desc) && returnType(m.desc) === 'V')
+  if (readers.length !== 1 || writers.length !== 1) return null
+  const reads = members(readers[0], 'read')
+  const writes = members(writers[0], 'write')
+  if (!reads || !writes || reads.length === 0 || reads.length !== writes.length) return null
+  for (let i = 0; i < reads.length; i++) if (reads[i].type !== writes[i].type) return null
+  return { reads: reads.map((r) => r.member), writes: writes.map((w) => w.member), reader: `${className}#${readers[0].method}`, writer: `${className}#${writers[0].method}` }
+}
+
+/** The method of `inClass` (or of a hot class) that constructs `cls` through `<init>()V`, as 'Owner#method', or null. */
+function noArgConstructionOf (facts, inClass, cls, hotClasses) {
+  const classes = [lazyClass(facts, inClass), ...hotClasses].filter(Boolean)
+  for (const parsed of classes) {
+    for (const m of parsed.codes) {
+      const ev = eventsFor(facts, parsed, m)
+      for (let i = 0; i < ev.length; i++) {
+        const e = ev[i]
+        if (e.k !== 'call' || e.r.owner !== cls || e.r.name !== '<init>' || e.r.desc !== '()V') continue
+        if (ev.slice(Math.max(0, i - 3), i).some((x) => x.k === 'new' && x.v === cls)) return `${parsed.className}#${m.method}`
+      }
+    }
+  }
+  return null
+}
+
+function mirrorEchoOf (facts, sites, hotClasses) {
+  const s2c = sites.filter((s) => s.loginMarked && s.msgClass && (s.direction === 'LOGIN_TO_CLIENT' || (s.loginPacketMarked && s.direction !== 'LOGIN_TO_SERVER')))
+  const c2s = sites.filter((s) => s.loginMarked && s.msgClass && s.direction === 'LOGIN_TO_SERVER' && s.index && s.index.const != null && s.index.const >= 0 && s.index.const <= 255)
+  const inbound = new Set(s2c.map((s) => s.msgClass))
+  const replies = new Set(c2s.map((s) => s.msgClass))
+  if (inbound.size !== 1 || replies.size !== 1) {
+    if (inbound.size || replies.size) facts.abstains.push(`mirror reply: ${inbound.size} inbound login class(es), ${replies.size} reply class(es)`)
+    return null
+  }
+  const inClass = [...inbound][0]
+  const reply = c2s[0]
+  if (inClass === reply.msgClass) return null
+  if (new Set(c2s.map((s) => s.index.const)).size !== 1) { facts.abstains.push(`mirror reply: ${reply.msgClass} registered under several indices`); return null }
+  const constructedAt = noArgConstructionOf(facts, inClass, reply.msgClass, hotClasses)
+  if (!constructedAt) { facts.abstains.push(`mirror reply: no site constructs ${reply.msgClass} with <init>()V`); return null }
+  const a = bufferLayoutOf(facts, inClass)
+  const b = bufferLayoutOf(facts, reply.msgClass)
+  if (!a || !b) { facts.abstains.push(`mirror reply: the buffer layout of ${!a ? inClass : reply.msgClass} is not a plain member sequence`); return null }
+  if (JSON.stringify(a.reads) !== JSON.stringify(b.reads) || JSON.stringify(a.writes) !== JSON.stringify(b.writes)) { facts.abstains.push(`mirror reply: ${reply.msgClass} and ${inClass} differ in layout`); return null }
+  return {
+    index: reply.index.const,
+    msgClass: reply.msgClass,
+    inboundClass: inClass,
+    constructedAt,
+    layout: a.reads.slice(),
+    encoderProof: `${b.writer} writes ${b.writes.length} member(s) in the order ${a.reader} reads them`,
+    evidence: `mirror reply: ${reply.msgClass} reads and writes the same ${a.reads.length} buffer member(s) as ${inClass} (${a.reads.join(', ')}), ${constructedAt} constructs it with <init>()V; explicit constant ${reply.index.const} at ${reply.className}#${reply.method}${reply.forwardedFrom ? ` (through ${reply.forwardedFrom})` : ''}`
+  }
 }
 
 // --- public API -------------------------------------------------------------
@@ -1438,6 +1888,9 @@ function assessLoginChannel (channelId, modsPaths) {
   }
   if (result.verdict === 'ack') {
     console.log(`[forge] derived ${channelId} login ack: index ${result.index} (${result.msgClass}; ${result.evidence}; ${Date.now() - started}ms)`)
+  } else if (result.verdict === 'echo') {
+    // HF110: the mirror reply - the inbound body behind the reply's own index, built at the handshake seat
+    console.log(`[forge] derived ${channelId} login echo: index ${result.index} (${result.msgClass}; ${result.evidence}${result.builtBy ? `; built by ${result.builtBy.jarName}` : ''}; ${Date.now() - started}ms)`)
   } else if (result.verdict === 'underivable' && result.reason === 'no-reply-needed') {
     // HF95: a tolerated decline is the right answer, never a missing one
     console.log(`[forge] ${channelId} login channel found in local jars and needs no reply (${result.reason}; ${result.evidence}; ${Date.now() - started}ms)`)
@@ -1677,7 +2130,7 @@ function assessUncached (channelId, paths) {
     // itself truncates), so it is unprovable — abstain into 'underivable'.
     if (r && r.index != null && r.index >= 0 && r.index <= 255) {
       const where = corroborationOf(facts, creation.className)
-      return { verdict: 'ack', ...r, ...where, namespaceProof: namespaceProofOf(facts, creation), evidence: `${r.evidence}${where.nestedChain.length ? ` (${where.corroboration}: ${where.jarName} -> ${where.nestedArtifact})` : ''}`, reply: Buffer.from([r.index]) }
+      return { verdict: 'ack', ...r, ...where, namespaceProof: namespaceProofOf(facts, creation), ...(creation.builtBy ? { builtBy: creation.builtBy } : {}), evidence: `${r.evidence}${where.nestedChain.length ? ` (${where.corroboration}: ${where.jarName} -> ${where.nestedArtifact})` : ''}`, reply: Buffer.from([r.index]) }
     }
   }
 
@@ -1685,6 +2138,16 @@ function assessUncached (channelId, paths) {
   // classify WHY, so the caller can surface an honest, channel-naming
   // failure instead of guessing.
   const fields = new Set(channelCreations.filter((c) => c.direct && c.channelField).map((c) => c.channelField))
+  const channelSites = regSitesOn(facts, hot).filter((site) => site.channelField && fields.has(site.channelField))
+  // HF110 (R2): no ack derives - a mirror reply is read next (the echo of the
+  // inbound body behind the reply's own index); an ack that derives above is
+  // never second-guessed by it
+  const echo = mirrorEchoOf(facts, channelSites, hot)
+  if (echo) {
+    const creation = channelCreations[0]
+    const where = corroborationOf(facts, creation.className)
+    return { verdict: 'echo', ...echo, ...where, namespaceProof: namespaceProofOf(facts, creation), ...(creation.builtBy ? { builtBy: creation.builtBy } : {}), evidence: `${echo.evidence}${where.nestedChain.length ? ` (${where.corroboration}: ${where.jarName} -> ${where.nestedArtifact})` : ''}` }
+  }
   let substantive = null
   // HF95: the login-marked sites of the channel, split by whether the server
   // waits for a reply to them. SimpleChannel.MessageBuilder#markAsLoginPacket
@@ -1696,27 +2159,37 @@ function assessUncached (channelId, paths) {
   // so the protocol's not-understood decline is the accepted answer there.
   const noReplySites = []
   let replySiteSeen = false
-  for (const parsed of hot) {
-    for (const m of parsed.codes) {
-      for (const site of extractRegSites(eventsFor(facts, parsed, m), parsed.className, m.method, indySitesOf(facts, parsed, m))) {
-        if (!site.channelField || !fields.has(site.channelField)) continue
-        // HF69a (C): a markAsLoginPacket site without a LOGIN_TO_SERVER
-        // direction is a payload the SERVER sends (cited in extractRegSites)
-        // — never the client's reply, so it cannot make the reply substantive
-        if (site.loginPacketMarked && site.direction !== 'LOGIN_TO_SERVER') {
-          if (site.noResponse) noReplySites.push(site)
-          else replySiteSeen = true
-          continue
-        }
-        if (site.loginMarked) replySiteSeen = true
-        if (site.loginMarked && site.msgClass && (!site.direction || site.direction === 'LOGIN_TO_SERVER') &&
-            !encoderProofOf(facts, site).empty) {
-          substantive = site.msgClass
-        }
-      }
+  for (const site of channelSites) {
+    // HF69a (C): a markAsLoginPacket site without a LOGIN_TO_SERVER
+    // direction is a payload the SERVER sends (cited in extractRegSites)
+    // — never the client's reply, so it cannot make the reply substantive
+    if (site.loginPacketMarked && site.direction !== 'LOGIN_TO_SERVER') {
+      if (site.noResponse) noReplySites.push(site)
+      else replySiteSeen = true
+      continue
+    }
+    if (site.loginMarked) replySiteSeen = true
+    if (site.loginMarked && site.msgClass && (!site.direction || site.direction === 'LOGIN_TO_SERVER') &&
+        !encoderProofOf(facts, site).empty) {
+      substantive = site.msgClass
     }
   }
   const where = corroborationOf(facts, channelCreations[0].className)
+  // HF110: a channel bound ONLY through a library's builder (every creation
+  // carries builtBy) with neither an ack nor a mirror is answered as the
+  // uncorroborated decline it is on the wire - with the library named, so the
+  // copy says who builds the channel and that no reply could be worked out
+  if (channelCreations.every((c) => c.builtBy)) {
+    const b = channelCreations[0].builtBy
+    return {
+      verdict: 'unknown',
+      builtBy: b,
+      why: facts.abstains.length ? facts.abstains.join('; ') : undefined,
+      ...where,
+      namespaceProof: namespaceProofOf(facts, channelCreations[0]),
+      evidence: `channel is built by ${b.jarName} (${b.className}) for the local jar ${where.jarName} but no provable login reply exists`
+    }
+  }
   const creator = `${channelCreations[0].className}${where.nestedChain.length ? `, nested in ${where.jarName} -> ${where.nestedArtifact}` : ''}`
   // HF95: every login-marked site is server-to-client with noResponse and no
   // client-to-server login site exists — nothing on this channel waits for a
@@ -1780,4 +2253,4 @@ function corroborationOf (facts, className) {
   }
 }
 
-module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, loginAssessmentKeyOf, loginAssessmentSource, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, configureJarDigestCache, _internal: { jarDigestStats, __clearJarDigests, digestStore, digestJar, indexDigest, classRunIds, extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor, isRlClass, ctorChainNs, helperNsOf, methodWritesNothing, encoderProofOf, indySitesOf, namespaceOwnership, namespaceProofOf } }
+module.exports = { LOGIN_ACK_DERIVATION_VERSION, isLoginAssessmentCached, loginAssessmentKeyOf, loginAssessmentSource, deriveLoginAck, assessLoginChannel, warmLoginAssessments, warmLoginAssessmentsDetailed, warmLoginAssessmentsSync, exportLoginAssessments, importLoginAssessments, configureJarDigestCache, _internal: { jarDigestStats, __clearJarDigests, digestStore, digestJar, indexDigest, classRunIds, extractRegSites, methodEvents, hasEmptyEncoder, counterSeed, resolveLocalIndex, findCreations, newFacts, indexJar, eventsFor, isRlClass, ctorChainNs, helperNsOf, methodWritesNothing, encoderProofOf, indySitesOf, namespaceOwnership, namespaceProofOf, regSitesOn, forwardedRegSites, crossJarCreations, bindBuilderCallee, mirrorEchoOf, bufferLayoutOf, paramTypes } }
