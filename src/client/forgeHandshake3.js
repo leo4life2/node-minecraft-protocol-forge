@@ -517,6 +517,36 @@ function resolveWrappedModLogin (client, channel, disc, body, options, era, afte
     } catch { /* receipts never break the reply path */ }
     return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index}${fromElsewhere}${assessed.jarName ? ` from ${assessed.jarName}${assessed.nestedArtifact ? ` -> ${assessed.nestedArtifact}` : ''}` : ''}` }
   }
+  if (assessed.verdict === 'echo') {
+    // HF110: the mirror reply - the reply class is the inbound class's own
+    // layout and the client constructs it from its own configuration (equal
+    // to the server's for a same-config client), so the reply is the bytes
+    // the SERVER produced (the inbound body after the index byte, unparsed,
+    // unmodified) behind the reply's own index. The jar's index and layout
+    // proof are the assessment's; the body is this query's. Never a guessed
+    // byte: a wrong body would be a server-side decode exception.
+    const reply = echoReplyOf(assessed, body)
+    try {
+      const attribution = announcedChannelAttribution(client, options, channel)
+      if (attribution && client) {
+        if (!Array.isArray(client.forgeLoginCorroboration)) client.forgeLoginCorroboration = []
+        client.forgeLoginCorroboration.push({
+          channel,
+          via: 'jar-derived-echo',
+          index: assessed.index,
+          jarEvidence: assessed.evidence,
+          announcedChannel: attribution.announcedChannel,
+          ownerMod: attribution.ownerMod,
+          ownerVersion: attribution.ownerVersion,
+          verdictSource: source,
+          ...nestingFacts(assessed),
+          ...builtByFacts(assessed)
+        })
+      }
+      noteNestedAnswer(channel, assessed)
+    } catch { /* receipts never break the reply path */ }
+    return { reply, via: `jar-derived echo index ${assessed.index}${fromElsewhere}${assessed.jarName ? ` from ${assessed.jarName}${assessed.nestedArtifact ? ` -> ${assessed.nestedArtifact}` : ''}` : ''}${assessed.builtBy && assessed.builtBy.jarName ? ` (built by ${assessed.builtBy.jarName})` : ''}` }
+  }
   if (assessed.verdict === 'underivable') {
     if (assessed.reason === 'substantive-reply') {
       // Jar-proven mandatory-and-unanswerable: the reply must carry data we
@@ -560,11 +590,11 @@ function resolveWrappedModLogin (client, channel, disc, body, options, era, afte
     // the same guard with a receipt (never a stream-corrupting late write).
     const acq = options && options.announcedModAcquisition
     if (acq && typeof acq.acquire === 'function' && attribution.ownerMod && isAcquirableVersion(attribution.ownerVersion)) {
-      return { pending: acquireThenResolve(client, channel, options, attribution, acq, era) }
+      return { pending: acquireThenResolve(client, channel, options, attribution, acq, era, body) }
     }
     if (isFml2Era(era)) return conventionAckOnFml2(client, channel, null, attribution, null)
-    declineUncorroboratedLogin(client, channel, attribution, null, modsPathsFor(options).length > 0)
-    return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution } }
+    declineUncorroboratedLogin(client, channel, attribution, null, modsPathsFor(options).length > 0, assessed.builtBy || null)
+    return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution, ...builtByFacts(assessed) } }
   }
   return null
 }
@@ -593,6 +623,7 @@ function acquisitionOutcomeWords (outcome) {
     case 'cap-exceeded': return 'its file exceeds the per-file size cap'
     case 'join-cap-exceeded': return 'this join already reached the acquisition cap'
     case 'budget-exceeded': return 'the registry lookup did not finish inside the login window'
+    case 'acquired-jar-library-built-no-reply': return 'the obtained jar creates that login channel through a library jar\'s builder, but no reply could be worked out from the two'
     case 'download-failed': return 'the download failed'
     case 'download-tries-exhausted': return 'the download attempts were used up'
     case 'acquired-jar-holds-no-channel': return 'the obtained jar does not create that login channel'
@@ -609,7 +640,7 @@ function acquisitionOutcomeWords (outcome) {
 // synchronous ladder does (same assessLoginChannel, same dispatch shapes).
 // Resolves to { reply, via } | { declined: true } | { failed: true } |
 // { silent: true } (the deadline law ended the connection) — never null.
-async function acquireThenResolve (client, channel, options, attribution, acq, era) {
+async function acquireThenResolve (client, channel, options, attribution, acq, era, body = null) {
   const modId = attribution.ownerMod
   const version = String(attribution.ownerVersion)
   // HF38: the acquisition budget is bounded by THIS query's login-window
@@ -660,6 +691,18 @@ async function acquireThenResolve (client, channel, options, attribution, acq, e
       console.log(`[forge] answering the modded login check on channel "${channel}" from ${from}: derived ack index ${assessed.index} (${assessed.msgClass}; ${assessed.evidence}; acquisition ${acquisition.outcome} in ${acquisition.ms}ms)`)
       return { reply: assessed.reply, via: `jar-derived ack index ${assessed.index} (acquired ${modId}@${version})`, acquired: true }
     }
+    if (assessed.verdict === 'echo') {
+      // HF110: the mirror reply over the acquired jar (and the local census it
+      // was assessed beside: the library that builds the channel sits there)
+      if (receipt) receipt.derived = `echo-index-${assessed.index}`
+      const reply = echoReplyOf(assessed, body)
+      try {
+        if (!Array.isArray(client.forgeLoginCorroboration)) client.forgeLoginCorroboration = []
+        client.forgeLoginCorroboration.push({ channel, via: 'jar-derived-echo (acquired)', index: assessed.index, jarEvidence: assessed.evidence, announcedChannel: attribution.announcedChannel, ownerMod: modId, ownerVersion: version, acquisition, ...nestingFacts(assessed), ...builtByFacts(assessed) })
+      } catch { /* receipts never break the reply path */ }
+      console.log(`[forge] answering the modded login check on channel "${channel}" from the ACQUIRED ${modId}@${version} jar: derived echo index ${assessed.index} (${assessed.msgClass}; ${assessed.evidence}${assessed.builtBy ? `; built by ${assessed.builtBy.jarName}` : ''}; acquisition ${acquisition.outcome} in ${acquisition.ms}ms)`)
+      return { reply, via: `jar-derived echo index ${assessed.index} (acquired ${modId}@${version}${assessed.builtBy && assessed.builtBy.jarName ? `, built by ${assessed.builtBy.jarName}` : ''})`, acquired: true }
+    }
     if (assessed.verdict === 'underivable') {
       if (receipt) receipt.derived = `underivable:${assessed.reason}`
       if (assessed.reason === 'substantive-reply') {
@@ -670,8 +713,17 @@ async function acquireThenResolve (client, channel, options, attribution, acq, e
       declineWrappedLoginHonestly(client, channel, Object.assign({}, assessed, { acquisition }))
       return { declined: true, assessed, acquired: true }
     }
-    if (receipt) receipt.derived = 'no-channel'
-    acquisition.outcome = 'acquired-jar-holds-no-channel'
+    if (assessed.builtBy) {
+      // HF110: the acquired jar and the census DO create the channel - through
+      // the library's builder - but no reply was derivable: the outcome says so
+      // (never 'holds no channel', which would be false)
+      if (receipt) receipt.derived = 'library-built-no-reply'
+      acquisition.outcome = 'acquired-jar-library-built-no-reply'
+      acquisition.builtBy = { jarName: assessed.builtBy.jarName, modId: assessed.builtBy.modId || null }
+    } else {
+      if (receipt) receipt.derived = 'no-channel'
+      acquisition.outcome = 'acquired-jar-holds-no-channel'
+    }
   }
   if (result && result.outcome === 'in-progress') {
     // THE DEADLINE LAW (HF20's shape): the download outran the login budget
@@ -702,8 +754,8 @@ async function acquireThenResolve (client, channel, options, attribution, acq, e
     return { silent: true }
   }
   if (isFml2Era(era)) return Object.assign(conventionAckOnFml2(client, channel, null, attribution, acquisition), { acquired: true })
-  declineUncorroboratedLogin(client, channel, attribution, acquisition, modsPathsFor(options).length > 0)
-  return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution, acquisition }, acquired: true }
+  declineUncorroboratedLogin(client, channel, attribution, acquisition, modsPathsFor(options).length > 0, (acquisition && acquisition.builtBy) || null)
+  return { declined: true, assessed: { verdict: 'unknown', reason: 'uncorroborated-by-local-jars', attribution, acquisition, ...builtByFacts(acquisition) }, acquired: true }
 }
 
 // The honest failure: no guessed bytes are ever sent for a channel we KNOW
@@ -778,7 +830,11 @@ const KNOWN_FATAL_ON_FML3 = 'On this Forge 1.18-1.20.1 server that decline ENDS 
 // parent that nests the owner but yielded no reply; the acquisition's own
 // outcome (a registry miss says how far the parent search looked); no jar
 // given at all; jars given but none creates the channel.
-function whyUnanswered (acquisition, jarsSeen) {
+function whyUnanswered (acquisition, jarsSeen, builtBy = null) {
+  if (builtBy && builtBy.jarName) {
+    // HF110: the channel is created - a library jar builds it for the owner - and no reply was derivable
+    return { code: 'library-built-no-reply', words: `the channel is built by ${builtBy.jarName}${builtBy.modId ? ` (mod ${builtBy.modId})` : ''} for that mod, and MinePal could not work out the reply that check needs` }
+  }
   if (acquisition && acquisition.parent) {
     const p = acquisition.parent
     return { code: 'nested-and-unread', words: `${p.fileName}${p.modId ? ` (mod ${p.modId}${p.version ? `@${p.version}` : ''})` : ''} nests it as ${p.nestedPath || 'a nested jar'}, but no provable reply could be derived from that nested jar` }
@@ -806,6 +862,21 @@ function nestingFacts (assessed) {
   }
 }
 
+// HF110: the library that builds the channel (the assessment's builtBy), as
+// receipt facts - the jar file name and its mod id, never a path.
+function builtByFacts (assessed) {
+  const b = assessed && assessed.builtBy
+  return b && b.jarName ? { builtBy: { jarName: b.jarName, modId: b.modId || null } } : {}
+}
+
+// HF110: the echo reply - the reply's own index byte, then the inbound body
+// EXACTLY as the server sent it (the bytes after the discriminator, unparsed,
+// unmodified). The assessment proves index + layout; the body is the query's.
+function echoReplyOf (assessed, body) {
+  const inbound = Buffer.isBuffer(body) ? body : Buffer.alloc(0)
+  return Buffer.concat([Buffer.from([assessed.index & 0xff]), inbound])
+}
+
 function noteNestedAnswer (channel, assessed) {
   if (!assessed || !Array.isArray(assessed.nestedChain) || assessed.nestedChain.length === 0) return
   console.log(`[forge] the modded login check on channel "${channel}" is answered from a NESTED jar: ${assessed.jarName} carries ${assessed.nestedArtifact} (${assessed.corroboration})`)
@@ -826,15 +897,15 @@ function noteNestedAnswer (channel, assessed) {
 // never worse than no instance at all, and join-viable on every server whose
 // message tolerates the vanilla-shaped answer (proven live: tacztweaks
 // accepts it).
-function declineUncorroboratedLogin (client, channel, attribution, acquisition, jarsSeen = true) {
+function declineUncorroboratedLogin (client, channel, attribution, acquisition, jarsSeen = true, builtBy = null) {
   const owner = attribution.ownerMod
     ? `mod "${attribution.ownerMod}"${attribution.ownerVersion ? ` (announced as ${attribution.ownerMod}@${attribution.ownerVersion})` : ''}`
     : 'one of its mods'
   // HF53: the decline is KNOWN to be fatal on FML3 when the message needs a
   // reply — the copy says so and names the channel, the owner, and why no
   // answer existed (HF23's acquisition outcome rides inside the why).
-  const why = whyUnanswered(acquisition, jarsSeen)
-  const evidence = `server-announced channel${attribution.announcedChannel ? ' (in the FML ModList)' : ''} attributed to ${owner}; no local jar carries it${acquisition ? `; acquisition ${acquisition.outcome}` : ''}; why ${why.code}`
+  const why = whyUnanswered(acquisition, jarsSeen, builtBy)
+  const evidence = `server-announced channel${attribution.announcedChannel ? ' (in the FML ModList)' : ''} attributed to ${owner}; ${builtBy && builtBy.jarName ? `built by ${builtBy.jarName} with no derivable reply` : 'no local jar carries it'}${acquisition ? `; acquisition ${acquisition.outcome}` : ''}; why ${why.code}`
   const message = `Answering the modded login check on channel "${channel}" with the protocol's not-understood decline. ` +
     `${KNOWN_FATAL_ON_FML3} ` +
     `The server itself announced this channel belongs to ${owner}; MinePal could not answer because ${why.words}. ` +
@@ -855,9 +926,10 @@ function declineUncorroboratedLogin (client, channel, attribution, acquisition, 
     announcedChannel: attribution.announcedChannel,
     acquisition: acquisition || null,
     knownFatalDecline,
-    parent: (acquisition && acquisition.parent) || null
+    parent: (acquisition && acquisition.parent) || null,
+    ...(builtBy && builtBy.jarName ? { builtBy: { jarName: builtBy.jarName, modId: builtBy.modId || null } } : {})
   })
-  client.emit('forgeLoginDeclined', { channel, reason: 'uncorroborated-by-local-jars', evidence, acquisition: acquisition || null, knownFatalDecline })
+  client.emit('forgeLoginDeclined', { channel, reason: 'uncorroborated-by-local-jars', evidence, acquisition: acquisition || null, knownFatalDecline, ...(builtBy && builtBy.jarName ? { builtBy: { jarName: builtBy.jarName, modId: builtBy.modId || null } } : {}) })
 }
 
 /**
