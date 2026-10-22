@@ -2175,21 +2175,6 @@ function assessUncached (channelId, paths) {
     }
   }
   const where = corroborationOf(facts, channelCreations[0].className)
-  // HF110: a channel bound ONLY through a library's builder (every creation
-  // carries builtBy) with neither an ack nor a mirror is answered as the
-  // uncorroborated decline it is on the wire - with the library named, so the
-  // copy says who builds the channel and that no reply could be worked out
-  if (channelCreations.every((c) => c.builtBy)) {
-    const b = channelCreations[0].builtBy
-    return {
-      verdict: 'unknown',
-      builtBy: b,
-      why: facts.abstains.length ? facts.abstains.join('; ') : undefined,
-      ...where,
-      namespaceProof: namespaceProofOf(facts, channelCreations[0]),
-      evidence: `channel is built by ${b.jarName} (${b.className}) for the local jar ${where.jarName} but no provable login reply exists`
-    }
-  }
   const creator = `${channelCreations[0].className}${where.nestedChain.length ? `, nested in ${where.jarName} -> ${where.nestedArtifact}` : ''}`
   // HF95: every login-marked site is server-to-client with noResponse and no
   // client-to-server login site exists — nothing on this channel waits for a
@@ -2204,6 +2189,23 @@ function assessUncached (channelId, paths) {
       ...where,
       namespaceProof: namespaceProofOf(facts, channelCreations[0]),
       evidence: `channel is created by a local jar (${creator}) and every login message it registers is marked noResponse — no reply is needed`
+    }
+  }
+  // HF110: a channel bound ONLY through a library's builder (every creation
+  // carries builtBy) with neither an ack nor a mirror is answered as the
+  // uncorroborated decline it is on the wire; read AFTER the HF95 tolerated
+  // classification (a library-built channel whose login messages all need no
+  // reply is the tolerated decline, never a known-fatal one) - with the library named, so the
+  // copy says who builds the channel and that no reply could be worked out
+  if (channelCreations.every((c) => c.builtBy)) {
+    const b = channelCreations[0].builtBy
+    return {
+      verdict: 'unknown',
+      builtBy: b,
+      why: facts.abstains.length ? facts.abstains.join('; ') : undefined,
+      ...where,
+      namespaceProof: namespaceProofOf(facts, channelCreations[0]),
+      evidence: `channel is built by ${b.jarName} (${b.className}) for the local jar ${where.jarName} but no provable login reply exists`
     }
   }
   return {
