@@ -350,10 +350,32 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // HF45: the command-tree reader (schema + protodef, per client) and the argument-type derivation (jar bytes only)
         './commandTreeParser', './commandArgumentTypeDerivation',
         // HF48-P2: the shared write table + the GENERATED mapping-era vocabulary (a local JSON, no network)
-        './friendlyByteBufWrites'])
+        './friendlyByteBufWrites',
+        // HF112: the runtime-name column of the packet-body table (GENERATED data, a local JSON: no network, no path, no host)
+        './data/packetBodyRuntimeNames.json'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }
     })
   }
+})
+
+// HF112: the runtime-name column data file ships path-free and host-free; its sources record (dev provenance beside it) names
+// only the two publishers it was generated from and carries checksums, never a local path.
+describe('PRIVACY LAW - HF112 runtime-name data', function () {
+  const DATA = path.join(SRC, 'data', 'packetBodyRuntimeNames.json')
+  const SOURCES = path.join(SRC, 'data', 'packetBodyRuntimeNames.sources.json')
+  it('the data file carries no path, no host and no URL', () => {
+    const text = fs.readFileSync(DATA, 'utf8')
+    assert.ok(!/https?:|\/Users\/|\/private\/|\/Volumes\/|\.(com|net|org)\b/.test(text), 'a path, host or url in the data file')
+    const data = JSON.parse(text)
+    for (const [v, col] of Object.entries(data.columns)) { assert.match(v, /^[0-9][\w.-]*$/); for (const k of Object.keys(col)) assert.ok(k === 'classes' || k === 'methods', `${v}.${k}`) }
+  })
+  it('the sources record names only the two publishers (FabricMC maven, Mojang piston/launchermeta) by URL and no local path', () => {
+    const text = fs.readFileSync(SOURCES, 'utf8')
+    assert.ok(!/\/Users\/|\/private\/|\/Volumes\/|~\//.test(text), 'a local path in the sources record')
+    const hosts = new Set([...text.matchAll(/https?:\/\/([^/"']+)/g)].map((m) => m[1]))
+    for (const h of hosts) assert.ok(['maven.fabricmc.net', 'launchermeta.mojang.com', 'piston-meta.mojang.com', 'piston-data.mojang.com'].includes(h), `unexpected host ${h}`)
+    assert.ok(hosts.size >= 3)
+  })
 })

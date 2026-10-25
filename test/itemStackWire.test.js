@@ -21,6 +21,12 @@ describe('HF35 r2 - ItemStack wire-shape derivation', function () {
     assert.strictEqual(r.ext.mixin.className, 'net/devtech/stacc/mixin/DesyncFixin')
     assert.strictEqual(r.ext.mixin.jar, 'stacc-api-1.7.0.jar')
   })
+  it('HF112: the varint-array primitive pairs write (writeVarIntArray([I)) and read (readVarIntArray()[I) under one protodef type; the Mojang spellings only (a runtime spelling is column data at scan time)', () => {
+    const { WRITE_PRIMS, READ_PRIMS } = require('../src/client/itemStackWireDerivation')
+    assert.equal(WRITE_PRIMS['writeVarIntArray:([I)'], 'varint-array')
+    assert.equal(READ_PRIMS['readVarIntArray:()[I'], 'varint-array')
+    assert.ok(!Object.keys(WRITE_PRIMS).concat(Object.keys(READ_PRIMS)).some((k) => /VarIntArray/.test(k) && /^method_/.test(k)), 'no hardcoded runtime method number for the new primitive')
+  })
   it('a mods folder without an item (de)serializer mixin yields NO extension (nothing recalled)', () => {
     const dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'hf35-nowire-'))
     const r = scanItemStackWireExtensions([dir])

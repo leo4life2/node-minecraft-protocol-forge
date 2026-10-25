@@ -125,13 +125,21 @@ describe('HF41 packet-body wire derivation (Immersive Portals, real trimmed jars
     return outPath
   }
 
-  it('abstain (no refmap): the Fabric jar without its refmaps names the intermediary targets it cannot map — nothing installed, never a guess', function () {
+  it('HF112 (was: abstain no-refmap): the Fabric jar without its refmaps derives through the game version\'s runtime-name column (the ctor-injected class_2708 is ClientboundPlayerPositionPacket by the column, the payload class_2658 too: the redirect rides); on a game version with no column the named mapping-unavailable abstain stands, never a guess', function () {
     const r = scanPacketBodyWireExtensions([rezip(FABRIC, /refmap.*\.json$/)], { version: '1.20.1' })
-    assert.equal(r.exts.length, 0)
-    assert.equal(r.abstain.reason, 'no-refmap')
-    assert.match(r.abstain.detail, /class_2708/, 'the ctor-injected ClientboundPlayerPositionPacket target is only nameable through the refmap (the move mixins name their Mojang owner in the injector string)')
-    assert.equal(r.abstain.mod.id, 'imm_ptl_core', 'the abstain names the mod')
-    assert.ok(r.abstain.mixins.length >= 1)
+    expectDerived(r, 'immersive-portals-5.2.0-mc1.20.1-fabric.trimmed.jar')
+    assert.equal(r.exts.find((e) => e.direction === 'toClient').resolvedBy, 'runtime-name', 'the ctor target resolved through the column')
+    assert.equal(r.redirect.channel, 'imm_ptl:rd')
+    // a version Fabric does not run on (the sources record says no-fabric; the table still has rows there) = no column = the named abstain
+    const sources = require('../src/client/data/packetBodyRuntimeNames.sources.json')
+    const noColumn = Object.entries(sources.versions).find(([v, x]) => x.verdict === 'no-fabric' && Object.keys(packetTableFor(v)).length)[0]
+    const u = scanPacketBodyWireExtensions([rezip(FABRIC, /refmap.*\.json$/)], { version: noColumn })
+    assert.equal(u.exts.length, 0)
+    assert.equal(u.abstain.reason, 'mapping-unavailable')
+    assert.match(u.abstain.detail, /class_2708/, 'the ctor-injected ClientboundPlayerPositionPacket target is only nameable through a mapping (the move mixins name their Mojang owner in the injector string)')
+    assert.ok(u.abstain.detail.includes(noColumn) && !/refmap/i.test(u.abstain.detail), u.abstain.detail)
+    assert.equal(u.abstain.mod.id, 'imm_ptl_core', 'the abstain names the mod')
+    assert.ok(u.abstain.mixins.length >= 1)
   })
 
   it('abstain (unpaired read): the server reads a tail int nobody in the jar writes (client write mixins removed) — an honest named stop', function () {
@@ -420,7 +428,7 @@ describe('HF41 r2: identity, abstain rows as data, and the 1.20.2+ install order
   it('an abstain carries its rows as data (owner class → table direction/packet, injected sides) + whether the jar wraps world packets: chat unpaired, chat paired (untabled), moves unpaired, no refmap', function () {
     const C = scanPacketBodyWireExtensions([bend('C-chat-unpaired-forge.jar', FORGE, CHAT.unpaired)], { version: '1.20.1' })
     assert.equal(C.abstain.reason, 'unpaired-read')
-    assert.deepEqual(C.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ServerboundChatPacket', direction: 'toServer', packet: null, sides: ['read'] }])
+    assert.deepEqual(C.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ServerboundChatPacket', direction: 'toServer', packet: null, sides: ['read'], resolvedBy: 'mojang-name' }])
     assert.equal(C.abstain.wraps, true)
     assert.equal(C.abstain.mod.version, '3.0.7')
     const C2 = scanPacketBodyWireExtensions([bend('C2-chat-paired-forge.jar', FORGE, CHAT.paired)], { version: '1.20.1' })
@@ -428,12 +436,15 @@ describe('HF41 r2: identity, abstain rows as data, and the 1.20.2+ install order
     assert.deepEqual(C2.abstain.packets.map((p) => [p.direction, p.packet, p.sides.sort().join('+')]), [['toServer', null, 'read+write']])
     const U = scanPacketBodyWireExtensions([bend('unpaired.jar', FORGE, { drop: (p) => /mixin\/client\/sync\/MixinServer(b|B)oundMovePlayerPacket(Pos|PosRot|Rot|StatusOnly)\.class$/.test(p) })], { version: '1.20.1' })
     assert.equal(U.abstain.reason, 'unpaired-read')
-    assert.deepEqual(U.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$Pos', direction: 'toServer', packet: 'position', sides: ['read'] }])
-    const E = scanPacketBodyWireExtensions([bend('norefmap.jar', FABRIC, { drop: (p) => /refmap.*\.json$/.test(p) })], { version: '1.20.1' })
-    assert.equal(E.abstain.reason, 'no-refmap')
+    assert.deepEqual(U.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$Pos', direction: 'toServer', packet: 'position', sides: ['read'], resolvedBy: 'mojang-name' }])
+    // HF112: no refmap + no runtime-name column for the version (a no-fabric version of the sources record) = mapping-unavailable; the rows ride as data
+    const sources = require('../src/client/data/packetBodyRuntimeNames.sources.json')
+    const noColumn = Object.entries(sources.versions).find(([v, x]) => x.verdict === 'no-fabric' && Object.keys(packetTableFor(v)).length)[0]
+    const E = scanPacketBodyWireExtensions([bend('norefmap.jar', FABRIC, { drop: (p) => /refmap.*\.json$/.test(p) })], { version: noColumn })
+    assert.equal(E.abstain.reason, 'mapping-unavailable')
     const byDir = (d) => E.abstain.packets.filter((p) => p.direction === d).map((p) => p.packet).sort()
     assert.deepEqual(byDir('toServer'), ['flying', 'look', 'position', 'position_look'], 'the resolved move rows ride along')
-    assert.deepEqual(E.abstain.packets.filter((p) => !p.direction).map((p) => p.class).sort(), ['net/minecraft/class_2658', 'net/minecraft/class_2708'], 'the intermediary classes the refmap would name')
+    assert.deepEqual(E.abstain.packets.filter((p) => !p.direction).map((p) => [p.class, p.resolvedBy]).sort(), [['net/minecraft/class_2658', null], ['net/minecraft/class_2708', null]], 'the runtime classes nothing maps on that version')
     assert.equal(E.abstain.wraps, true)
   })
 
@@ -724,9 +735,103 @@ describe('HF41-r: the value key is derived, StreamCodec-era buffer members and n
     assert.equal(r.abstain.reason, 'packet-target-not-derivable')
     assert.match(r.abstain.detail, /^ServerboundMovePlayerPacket\$Pos\.codec\(Lnet\/minecraft\/network\/FriendlyByteBuf;\)V receives a @Inject from qouteall\/imm_ptl\/core\/mixin\/client\/sync\/MixinServerboundMovePlayerPacketPos; ServerboundMovePlayerPacket\$Pos\.codec\(/)
     assert.match(r.abstain.detail, /not the read\/write\/ctor law this build follows/)
-    assert.deepEqual(r.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$Pos', direction: 'toServer', packet: 'position', sides: [] }])
+    assert.deepEqual(r.abstain.packets, [{ class: 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$Pos', direction: 'toServer', packet: 'position', sides: [], resolvedBy: 'mojang-name' }])
     assert.equal(r.abstain.mod.version, '3.0.7')
     const stacc = scanPacketBodyWireExtensions([STACC], { version: '1.20.1' })
     assert.deepEqual({ exts: stacc.exts, abstain: stacc.abstain }, { exts: [], abstain: null })
+  })
+})
+
+// --- HF112: the runtime-name column — Create for Fabric 6.0.8.1 build 1744 (mc 1.20.1), the REAL jar trimmed to the map data packet mixin ---
+// Ground truth (join-issues F47): a production Fabric jar's @Mixin literal is ALWAYS a runtime (intermediary) class name and its refmap
+// carries member strings only (73 % un-owned across Create / Sodium / Lithium / Fabric API / Architectury), so the owner class never came
+// from the refmap; the column generated from the published FabricMC intermediary x Mojang server mappings names it.
+describe('HF112 runtime-name resolution (Create for Fabric 6.0.8.1 build 1744, real trimmed jar)', function () {
+  const crypto = require('crypto')
+  const { mutateJar } = require('./helpers/jarMutate')
+  const { runtimeNameColumn, RESOLVED_BY } = require('../src/client/packetBodyWireDerivation')
+  const sources = require('../src/client/data/packetBodyRuntimeNames.sources.json')
+  const CREATE = path.join(__dirname, 'fixtures', 'hf112-create-fabric-6.0.8.1+build.1744-mc1.20.1.trimmed.jar')
+  const bent = (name, rules) => { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hf112-')); const p = path.join(dir, name); fs.writeFileSync(p, mutateJar(fs.readFileSync(CREATE), rules).buf); return p }
+  const sha = (s) => crypto.createHash('sha256').update(s).digest('hex')
+  const baseBytes = (o) => JSON.stringify(o, (k, v) => (k === 'version' ? '<v>' : ((k === 'resolvedBy' || k === 'providerOmitted') ? undefined : v))) // the two HF112 facts stripped = the base tree's serialisation
+  const noColumn = Object.entries(sources.versions).find(([v, x]) => x.verdict === 'no-fabric' && Object.keys(packetTableFor(v)).length)[0]
+  function expectMap (r) {
+    assert.equal(r.abstain, null, JSON.stringify(r.abstain))
+    assert.equal(r.exts.length, 1)
+    const [e] = r.exts
+    assert.equal(e.direction, 'toClient'); assert.equal(e.packet, 'map'); assert.equal(e.packetClass, 'net/minecraft/network/protocol/game/ClientboundMapItemDataPacket')
+    assert.equal(e.anchor, 'tail'); assert.equal(e.optional, false, 'the ctor reads the array unconditionally')
+    assert.deepEqual(e.fields, [{ name: 'packetBodyWire0', type: 'varint-array', source: 'provider' }])
+    assert.equal(e.resolvedBy, 'runtime-name', 'class_2683 resolved through the column, not the refmap')
+    assert.equal(e.mixin.className, 'com/simibubi/create/foundation/mixin/ClientboundMapItemDataPacketMixin')
+    assert.equal(r.provider, null, 'nothing to source: this client never writes the map data message')
+    assert.equal(r.providerOmitted, 'clientbound-only')
+    assert.equal(r.redirect, null)
+    assert.equal(r.mod.id, 'create')
+    return e
+  }
+  it('R1 + R2 + R3: the map data packet mixin (target class_2683, un-owned refmap members, readVarIntArray / writeVarIntArray by runtime name) derives on 1.20.1: toClient map + varint-array at the tail, resolvedBy runtime-name, provider none (clientbound-only)', function () {
+    expectMap(scanPacketBodyWireExtensions([CREATE], { version: '1.20.1' }))
+    expectMap(scanPacketBodyWireExtensions([path.dirname(CREATE)].map(() => CREATE), { version: '1.20.1' }))
+  })
+  it('R1 control (the refmap is not what names the owner): the fixture WITHOUT its refmap derives the same extension (the column maps the class and its write / buffer members)', function () {
+    const e = expectMap(scanPacketBodyWireExtensions([bent('create-norefmap.jar', { drop: (p) => /refmap.*\.json$/.test(p) })], { version: '1.20.1' }))
+    assert.equal(e.resolvedBy, 'runtime-name')
+  })
+  it('R1 control (outside the table): the @Mixin target rewritten to a runtime name the column lacks (class_2683 -> class_9683, class bytes + refmap) -> packet-class-not-in-table naming it, never a derived shape', function () {
+    const p = bent('create-othertarget.jar', { rewrite: (f, s) => (s.includes('class_2683') ? s.split('class_2683').join('class_9683') : undefined), text: (f, t) => (/refmap.*\.json$/.test(f) ? t.split('class_2683').join('class_9683') : undefined) })
+    const r = scanPacketBodyWireExtensions([p], { version: '1.20.1' })
+    assert.equal(r.exts.length, 0)
+    assert.equal(r.abstain.reason, 'packet-class-not-in-table')
+    assert.match(r.abstain.detail, /^net\/minecraft\/class_9683 is extended on the wire under a runtime name outside this build's packet table on 1\.20\.1$/)
+    assert.deepEqual(r.abstain.packets, [{ class: 'net/minecraft/class_9683', direction: null, packet: null, sides: ['read', 'write'], resolvedBy: null }])
+  })
+  it(`mapping-unavailable: the same jar on a game version with no column (${noColumn}: FabricMC publishes no intermediary, the sources record says so) -> the named abstain; the detail names the version and the targets and never the refmap; the rows carry resolvedBy null`, function () {
+    assert.equal(runtimeNameColumn(noColumn), null)
+    const r = scanPacketBodyWireExtensions([CREATE], { version: noColumn })
+    assert.equal(r.exts.length, 0)
+    assert.equal(r.abstain.reason, 'mapping-unavailable')
+    assert.equal(r.abstain.detail, `injection targets net/minecraft/class_2683 are runtime names and this build carries no runtime-name mapping for ${noColumn}`)
+    assert.ok(!/refmap|honest/i.test(r.abstain.detail))
+    assert.deepEqual(r.abstain.packets, [{ class: 'net/minecraft/class_2683', direction: null, packet: null, sides: ['read', 'write'], resolvedBy: null }])
+    assert.equal(r.abstain.mod.id, 'create')
+  })
+  it('resolvedBy is a closed set and the alias set says how each class resolved: refmap (the jar\'s own table), runtime-name (the column), mojang-name (as written), null (a runtime name nothing maps)', function () {
+    assert.deepEqual(RESOLVED_BY, ['refmap', 'runtime-name', 'mojang-name'])
+    const al = buildAliases(collectUnits(FABRIC), runtimeNameColumn('1.20.1'))
+    assert.equal(al.resolvedBy('net/minecraft/class_2828$class_2830'), 'refmap', 'the 5.2.0 refmap names this owner (an owner-qualified key)')
+    assert.equal(al.resolvedBy('net/minecraft/class_2683'), 'runtime-name')
+    assert.equal(al.resolveClass('net/minecraft/class_2683'), 'net/minecraft/network/protocol/game/ClientboundMapItemDataPacket')
+    assert.equal(al.resolveMethod('net/minecraft/class_2683', 'method_11052'), 'write')
+    assert.equal(al.resolveMethod('net/minecraft/class_2540', 'method_10806'), 'writeVarIntArray')
+    assert.equal(al.resolveMethod('net/minecraft/class_2540', 'method_10787'), 'readVarIntArray')
+    assert.equal(al.resolvedBy('net/minecraft/network/protocol/game/ClientboundRespawnPacket'), 'mojang-name')
+    assert.equal(al.resolvedBy('net/minecraft/class_999999'), null)
+    const bare = buildAliases(collectUnits(FABRIC))
+    assert.equal(bare.resolvedBy('net/minecraft/class_2683'), null, 'no column: a runtime name the refmap does not alias stays unresolved')
+    const col = runtimeNameColumn('1.20.1')
+    assert.equal(col.classes['net/minecraft/network/protocol/game/ClientboundMapItemDataPacket'], 'net/minecraft/class_2683')
+    assert.equal(runtimeNameColumn(null), null)
+  })
+  it('byte-identity: the Immersive Portals fixtures (5.2.0 Fabric, 3.0.7 Forge, 6.0.6 Fabric on 1.21.1) derive exactly the base tree\'s result once the two HF112 facts are stripped (sha256 pinned on 784755ce)', function () {
+    const pins = [[FABRIC, '1.20.1', '2d5444a7b0ec8abae4a8dd48cdd3a0eb7afc6c1fc36bb4f5110479a91b9655c4'], [FORGE, '1.20.1', 'fbd4e052bca185349994f8dd6a11d1d76bd42fedd973cde9250d195b4632840e'], [path.join(__dirname, 'fixtures', 'immersive-portals-6.0.6-mc1.21.1-fabric.trimmed.jar'), '1.21.1', '261da8b0eae38bcf78e80f9cedd990b53824bed7f2d6ff98e30378242e149c4b']]
+    for (const [jar, version, pin] of pins) assert.equal(sha(baseBytes(scanPacketBodyWireExtensions([jar], { version }))), pin, path.basename(jar))
+  })
+  it('R2: the varint-array tail codec round-trips (a varint count then that many varints), an absent tail reads null, and compileFor extends the 1.20.1 map container with it', function () {
+    const t = tailTypes(['varint-array'])
+    const name = 'pbw_tail_varint_array'
+    const buf = Buffer.alloc(64)
+    const end = t.Write[name][1]([3, 1, 300], buf, 0)
+    assert.deepEqual([...buf.subarray(0, end)], [3, 3, 1, 0xac, 0x02])
+    assert.equal(t.SizeOf[name][1]([3, 1, 300]), 5)
+    assert.deepEqual(t.Read[name][1](buf.subarray(0, end), 0), { value: [3, 1, 300], size: 5 })
+    assert.deepEqual(t.Read[name][1](Buffer.alloc(0), 0), { value: null, size: 0 })
+    assert.deepEqual(t.Read[name][1](Buffer.from([2, 7]), 0), { value: null, size: 0 }, 'a truncated array is not a value')
+    assert.equal(t.Write[name][1](null, buf, 0), 0)
+    const r = scanPacketBodyWireExtensions([CREATE], { version: '1.20.1' })
+    const protos = compileFor('1.20.1', r.exts)
+    const ser = protos.incoming.get('map') ? protos : null
+    assert.ok(ser, 'the map packet is the extended incoming packet')
   })
 })
