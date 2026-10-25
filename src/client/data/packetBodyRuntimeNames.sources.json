@@ -1,0 +1,794 @@
+{
+  "schema": 1,
+  "axis": "minecraft-data supportedVersions.pc",
+  "fabricIndex": {
+    "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/maven-metadata.xml",
+    "sha256": "bdf78bb897a3bc87637c082645fdf2447f4c440448c62fc9ba0d078379461b59",
+    "fetched": "2026-10-25"
+  },
+  "mojangManifest": {
+    "url": "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json",
+    "fetched": "2026-10-25"
+  },
+  "versions": {
+    "0.30c": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.10": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.10-pre1": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.10.1": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.10.2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.11": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.11.2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.12": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.12-pre4": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.12.1": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.12.2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.13": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.13.1": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.13.2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.13.2-pre1": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.13.2-pre2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.14": {
+      "verdict": "no-mojang-mappings",
+      "versionJson": "https://piston-meta.mojang.com/v1/packages/0fd01dd81eaa451d3130b1cf025a10f129585b10/1.14.json",
+      "checked": "2026-10-25"
+    },
+    "1.14.1": {
+      "verdict": "no-mojang-mappings",
+      "versionJson": "https://piston-meta.mojang.com/v1/packages/183e49ba0fabb5ef8a304f8f5907fa887f40c466/1.14.1.json",
+      "checked": "2026-10-25"
+    },
+    "1.14.3": {
+      "verdict": "no-mojang-mappings",
+      "versionJson": "https://piston-meta.mojang.com/v1/packages/e21618620e02be5a14543d1d17ffdba941d09aa8/1.14.3.json",
+      "checked": "2026-10-25"
+    },
+    "1.14.4": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.14.4/intermediary-1.14.4-v2.jar",
+        "sha256": "0d7786a3d6a4926a818d4cbb79ced019578f85ecc6ffdecb6d6725b5bd2706ea",
+        "tinySha256": "da0391b9ceb51874912dca640e9422ca8a15f359e4d94bc25703922ac196cede"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/be146d5f66a3627ed0a87c234c4d8dde8ab35098/1.14.4.json",
+        "url": "https://piston-data.mojang.com/v1/objects/c604a623b416a88a844979a6c55862c8a97510a9/server.txt",
+        "sha1": "c604a623b416a88a844979a6c55862c8a97510a9",
+        "sha256": "0d0e5ea0ce87d8decf8ce74a51da5460c54e8d463579def8c753ce2a0cb4849f"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.15": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.15/intermediary-1.15-v2.jar",
+        "sha256": "c87a3b68e0a50b8b26683c920590f4d1f96115a43438a6d4a8cff01cece6bcd5",
+        "tinySha256": "411e8ba017d8c17c5b1c7b928e94fcf7561d70c9d626b05eeb08fa6b53feed28"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/833322370ab320e77717097082effe1d124d48bd/1.15.json",
+        "url": "https://piston-data.mojang.com/v1/objects/25ff0e2b1104b8f06fe55b7675dd11b05c72f5f4/server.txt",
+        "sha1": "25ff0e2b1104b8f06fe55b7675dd11b05c72f5f4",
+        "sha256": "471ca72675ab3adb708b129e71502de52811ccd6c689dc1aece9c65c2eb1df93"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.15.1": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.15.1/intermediary-1.15.1-v2.jar",
+        "sha256": "4475ad61ec1f3764927cca400aee93f589699a2a1aadb930928aec5331c681e9",
+        "tinySha256": "08060c63972b793c8c57f2315496b3b100589db12a43ddb86cdff20f7d9132e9"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/18c3063de87ae126b4e017121219ba802be0755b/1.15.1.json",
+        "url": "https://piston-data.mojang.com/v1/objects/3a818e8d2f85b4a1ca6a35bac57be84e81d907a7/server.txt",
+        "sha1": "3a818e8d2f85b4a1ca6a35bac57be84e81d907a7",
+        "sha256": "351b42b709010923d67e8efe55811bfea3ce86fe9ae86da12cbc46a1e418711b"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.15.2": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.15.2/intermediary-1.15.2-v2.jar",
+        "sha256": "95fcc58cc3ab9900c60d335bcb8830a425076ade7648bfe2c4fcf05f2e70a0d6",
+        "tinySha256": "25b15e64a3e5a4fc156382d21357cb110af91bd4c5d30adb21b35f8d723d8cd2"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/e9d0adb8f642abe422909ede50f651b2b58a3573/1.15.2.json",
+        "url": "https://piston-data.mojang.com/v1/objects/8ccf85df7a3a1f1119352b21e9a2f6894f6c3f3a/server.txt",
+        "sha1": "8ccf85df7a3a1f1119352b21e9a2f6894f6c3f3a",
+        "sha256": "1ace1ef05c95993acfbe07019bfd08bf2ba27fbc04789addb6e017185fe3413e"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.16": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.16/intermediary-1.16-v2.jar",
+        "sha256": "6be11c154485056d0b0899946ae8a57391827be613afdf143f1bfe172c7fba18",
+        "tinySha256": "0fb8824e1efbeef3ddeeebd93fcae14a1d006f120be4a5bfa60e15cb19d770ed"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/e9d21d375f9c961f0e9731d4e463306d76e77c48/1.16.json",
+        "url": "https://piston-data.mojang.com/v1/objects/11120c39da4df293c4bd020896391fb9ddd6c2ba/server.txt",
+        "sha1": "11120c39da4df293c4bd020896391fb9ddd6c2ba",
+        "sha256": "9b19cc7d56e58258117e2fcc092f773b151682ecb2b1adb3de9832b3c450a30f"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.16-rc1": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.16-rc1/intermediary-1.16-rc1-v2.jar",
+        "sha256": "89ea160c4bebb35ec1795a3c920b6fabd3b34073eed74bb9d69cdedca64c652d",
+        "tinySha256": "1e5c3a583717ef691260d012c81d40132d213c102020ddcacd4237e6187844f3"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/49d94686688119e1d85d8c7ebc690b0f6d71ebd8/1.16-rc1.json",
+        "url": "https://piston-data.mojang.com/v1/objects/3ac6c8d2558ab4b6c9cde1cfd09a2ec4bca260c5/server.txt",
+        "sha1": "3ac6c8d2558ab4b6c9cde1cfd09a2ec4bca260c5",
+        "sha256": "87fab4adcd644513a79baea61d1703198d9378b5ebc879b0fc9313692719ffbc"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.16.1": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.16.1/intermediary-1.16.1-v2.jar",
+        "sha256": "1daffb2da1503d79ab3f9ea3cf258ec5045cc41204d2a1151321e26652f3c654",
+        "tinySha256": "0fb8824e1efbeef3ddeeebd93fcae14a1d006f120be4a5bfa60e15cb19d770ed"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/54fa3af57d041d2771e66d390197b2c0288e697c/1.16.1.json",
+        "url": "https://piston-data.mojang.com/v1/objects/11120c39da4df293c4bd020896391fb9ddd6c2ba/server.txt",
+        "sha1": "11120c39da4df293c4bd020896391fb9ddd6c2ba",
+        "sha256": "9b19cc7d56e58258117e2fcc092f773b151682ecb2b1adb3de9832b3c450a30f"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.16.2": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.16.2/intermediary-1.16.2-v2.jar",
+        "sha256": "7c43185c3692b419954940a82351805372168bf9bc768f1325cab818435fe263",
+        "tinySha256": "5adddac93c7390e1dc77c53f62a022562936414e33dbb21df3d99a08866474b0"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/998d9ef5770d05c20d760dc16cf85151f35009f2/1.16.2.json",
+        "url": "https://piston-data.mojang.com/v1/objects/40337a76c8486473e5990f7bb44b13bc08b69e7a/server.txt",
+        "sha1": "40337a76c8486473e5990f7bb44b13bc08b69e7a",
+        "sha256": "ad8df78fe4916a60203f075e9e383437cca894caecc47399181fd9ebdf9e19ce"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.16.3": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.16.3/intermediary-1.16.3-v2.jar",
+        "sha256": "6f729f4ca6f186caaf41469a9e5452bc5b6b08ed29de459d21c0cabfd5fc2e8c",
+        "tinySha256": "fc21bdf389b6dff42fae6922b70339eab2dc4992a0ace0d3f164cfe146151aeb"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/6485dd131ef68c968041a9f6fd73094b027e42e1/1.16.3.json",
+        "url": "https://piston-data.mojang.com/v1/objects/e75ff1e729aec4a3ec6a94fe1ddd2f5a87a2fd00/server.txt",
+        "sha1": "e75ff1e729aec4a3ec6a94fe1ddd2f5a87a2fd00",
+        "sha256": "453a1a8cfcceddacad3ec14c9aeaa920a747ee54dbfcc709610ceb0a0615b9ee"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.16.4": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.16.4/intermediary-1.16.4-v2.jar",
+        "sha256": "b2157a586b938bfbb97bc19b79b002026808c47c661cba85a71492c8c2caa8ab",
+        "tinySha256": "3dcb4afe5d8dd6dc503af3ad7f8e2392c3fca763ed5aeb69e2dfbfb81649f8f1"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/596ad61fda7612d9edf8881cf81869276bdb7f82/1.16.4.json",
+        "url": "https://piston-data.mojang.com/v1/objects/d9ae0e8e28475254855430ff051daaa0dd041a08/server.txt",
+        "sha1": "d9ae0e8e28475254855430ff051daaa0dd041a08",
+        "sha256": "bf353c200a8c687c161a43e561f1e6baa96961a18c85606b8aaf711483107e08"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.16.5": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.16.5/intermediary-1.16.5-v2.jar",
+        "sha256": "d2e35bbd6aa35c2fe0880e064ea428cb7e2355010903ebad67e4048348bc25a0",
+        "tinySha256": "7b96416b39b7633ddea09efad76e488a51504adb9a06b748c68a5df67001f4d2"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/fba9f7833e858a1257d810d21a3a9e3c967f9077/1.16.5.json",
+        "url": "https://piston-data.mojang.com/v1/objects/41285beda6d251d190f2bf33beadd4fee187df7a/server.txt",
+        "sha1": "41285beda6d251d190f2bf33beadd4fee187df7a",
+        "sha256": "b3732b0f031abce7083cac8e594427e70d2e19674b8de2c682630c39b64228a7"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.17": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.17/intermediary-1.17-v2.jar",
+        "sha256": "73fdcc1ac44a1cd373933432564559d666150c98ed4e3a3146314f84c50663a2",
+        "tinySha256": "4b27802d20794102ce20793846ae625b0ad2052c02dd870705d10f415137710d"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/0d9ace8a2ecfd1f4c782786f4b985a499240ff12/1.17.json",
+        "url": "https://piston-data.mojang.com/v1/objects/84d80036e14bc5c7894a4fad9dd9f367d3000334/server.txt",
+        "sha1": "84d80036e14bc5c7894a4fad9dd9f367d3000334",
+        "sha256": "ca5f9f025964263c6489cd202a781e303b7de467683cdf17a3fc30eebc9401b0"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.17.1": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.17.1/intermediary-1.17.1-v2.jar",
+        "sha256": "17e0f7e943bdbf8aeb70f42a2fc27ee677cfbf2c9bb3f31dd6c999bcaa619c09",
+        "tinySha256": "361f1098d871135377477f09b1a24ef46e25aff118fc124c96eb85c3b12ec17d"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/e0e7ab5ed6f55bbd874ef95be3c9356d67e64b57/1.17.1.json",
+        "url": "https://piston-data.mojang.com/v1/objects/f6cae1c5c1255f68ba4834b16a0da6a09621fe13/server.txt",
+        "sha1": "f6cae1c5c1255f68ba4834b16a0da6a09621fe13",
+        "sha256": "ede01b6b10b554ae3146d2c084a8bfa88f0ca4da3c6f51b7cae7a154f40f3457"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.18": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.18/intermediary-1.18-v2.jar",
+        "sha256": "3033dd59051fb3077cb53b9143ea76825741512cbde6b417e568a93d5339ce28",
+        "tinySha256": "8e5d4293aec9afa1403417937c3a2379c494962a3d91bed5dabe12d154842ddd"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/7367ea8b7cad7c7830192441bb2846be0d2ceeac/1.18.json",
+        "url": "https://piston-data.mojang.com/v1/objects/a8fe854e35a69df7289d3f03fc0821f6363f2238/server.txt",
+        "sha1": "a8fe854e35a69df7289d3f03fc0821f6363f2238",
+        "sha256": "3fb57135d017b878064181d0cf62c209e605edc01d7c30a1f61ebe371497a2a9"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.18.1": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.18.1/intermediary-1.18.1-v2.jar",
+        "sha256": "95382a2c002351560282ded0ab2cc8bacd17596a1e2939468ff95a2e19da41c6",
+        "tinySha256": "f96b6dec82eff26d89f4a3cdd8a1ec751063c7bed707ccbe2eedab16c0e5a93b"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/7ff864e988a2c29907154d5f9701e87e5d5e554a/1.18.1.json",
+        "url": "https://piston-data.mojang.com/v1/objects/9717df2acd926bd4a9a7b2ce5f981bb7e4f7f04a/server.txt",
+        "sha1": "9717df2acd926bd4a9a7b2ce5f981bb7e4f7f04a",
+        "sha256": "d34e7a9ba1305d7956f52534d96741c0ef37982054ff4a6337cb1828666c8eb8"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.18.2": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.18.2/intermediary-1.18.2-v2.jar",
+        "sha256": "fc9863bf2f3e93478b24f1c71c2ce316ebd9f768f408ab3a25cd575bf31340df",
+        "tinySha256": "da10ab8ccf380cce4b9e76018eec3e454e8b3cc5ff53c54c8e1bb6952dfc86e4"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/334b33fcba3c9be4b7514624c965256535bd7eba/1.18.2.json",
+        "url": "https://piston-data.mojang.com/v1/objects/e562f588fea155d96291267465dc3323bfe1551b/server.txt",
+        "sha1": "e562f588fea155d96291267465dc3323bfe1551b",
+        "sha256": "2a674d9721824beb424337dab39a2ec3553babf0fa4c75fde66706c73c17539a"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.19": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.19/intermediary-1.19-v2.jar",
+        "sha256": "4657eaac57a3474db3c2ee8843087dede87c5ab8560904b1d27f1b36d24fbdb4",
+        "tinySha256": "048eaa4d1343827c0a86d7a52dda433f9df747c38a44a5f3f31f0e7fcdeef414"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/14bbfb25fb1c1c798e3c9b9482b081a78d1f3a9d/1.19.json",
+        "url": "https://piston-data.mojang.com/v1/objects/1c1cea17d5cd63d68356df2ef31e724dd09f8c26/server.txt",
+        "sha1": "1c1cea17d5cd63d68356df2ef31e724dd09f8c26",
+        "sha256": "94804337669908d807e4a68e6a1bfd4900a2e251b2062b3a51b20229e565fb08"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.19.2": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.19.2/intermediary-1.19.2-v2.jar",
+        "sha256": "0f5dc71d6d24ec0f573953d005a66b0b2e02a85cc0302231e95c5e1a681f2767",
+        "tinySha256": "159792e0d60fc8131b4676fbac180ce0992de182da46cd4a7cf1dcbbcb9be271"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/ed548106acf3ac7e8205a6ee8fd2710facfa164f/1.19.2.json",
+        "url": "https://piston-data.mojang.com/v1/objects/ed5e6e8334ad67f5af0150beed0f3d156d74bd57/server.txt",
+        "sha1": "ed5e6e8334ad67f5af0150beed0f3d156d74bd57",
+        "sha256": "e3e93dac4d886924ff3b81ce5d210925b9e4112776fdef4d0e6d5fefb062a879"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.19.3": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.19.3/intermediary-1.19.3-v2.jar",
+        "sha256": "9b27e0cac7139ab842aa00d6a9771343a27d85a44b6ee3744dc89182694adf81",
+        "tinySha256": "b3e2ac19489d1c7b1547941cf4167973d62ef661608bd478a22bf3a6ee02f07f"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/ecb8a60f8f165e7d3aac763530b1eefbc2a2ab2d/1.19.3.json",
+        "url": "https://piston-data.mojang.com/v1/objects/bc44f6dd84cd2f3ad8c0caad850eaca9e82067e3/server.txt",
+        "sha1": "bc44f6dd84cd2f3ad8c0caad850eaca9e82067e3",
+        "sha256": "ddf7a228024f97fe37230ad7b334d2cdcde02e85553ed4639d3e85db96ac02e0"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.19.4": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.19.4/intermediary-1.19.4-v2.jar",
+        "sha256": "b50ac85a813e42b49deb127214643494dc9b434e637df737149a0a82c392e364",
+        "tinySha256": "2d1b7f104e9bd9024f2be764042e9606bab406e3e114600ac1575bd78d95b97a"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/50ee76030472297b1be01e414f3f29acd7112334/1.19.4.json",
+        "url": "https://piston-data.mojang.com/v1/objects/73c8bb982e420b33aad9632b482608c5c33e2d13/server.txt",
+        "sha1": "73c8bb982e420b33aad9632b482608c5c33e2d13",
+        "sha256": "097dd353bd96a1a8c0c1c16505e202957730ca5f1095f089487e7ced4a20fad8"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.20": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.20/intermediary-1.20-v2.jar",
+        "sha256": "0c2ad1c013702de04c24365aeaa6e93608bddd5d739face1386cf2dfcbf08b7d",
+        "tinySha256": "0f56559f3706d6c51daf5c99b4e09093ca0532a20be7640b1e9e231772010736"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/5afd728fb502548e8db0370687c4d04f9768999b/1.20.json",
+        "url": "https://piston-data.mojang.com/v1/objects/15e61168fd24c7950b22cd3b9e771a7ce4035b41/server.txt",
+        "sha1": "15e61168fd24c7950b22cd3b9e771a7ce4035b41",
+        "sha256": "87960812690dcde8ef67401ed53e50fbfa2166b9ec31f1274d6bbdb5d358112e"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.20.1": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.1/intermediary-1.20.1-v2.jar",
+        "sha256": "26b60a7dac40e19609cdf095f7124a79ea426d8a84344bc8883c7210f0294799",
+        "tinySha256": "f106be5e7b956f0581e933cccc82b002dc12675b568d3a0d6d272e537514821f"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/38d412af3b247e485c7f7e50ac25febc4e79ab1d/1.20.1.json",
+        "url": "https://piston-data.mojang.com/v1/objects/0b4dba049482496c507b2387a73a913230ebbd76/server.txt",
+        "sha1": "0b4dba049482496c507b2387a73a913230ebbd76",
+        "sha256": "dca153d20defb32cfac3f069c3bf77b3e13c30ae63847637479d3137e099bb72"
+      },
+      "classes": 13,
+      "generated": "2026-10-25"
+    },
+    "1.20.2": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.2/intermediary-1.20.2-v2.jar",
+        "sha256": "83f90dc66a56fb431c23ae219038be0617136b4389526528358dba5f33543e41",
+        "tinySha256": "360625c60503a69818662f8a5aca11f18db17be1be7900d2a562d6e1abf8b8af"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/96dbebfb2894bd7ffbddbc8c509c185473c85922/1.20.2.json",
+        "url": "https://piston-data.mojang.com/v1/objects/dced504a9b5df367ddd3477adac084cea8024ba4/server.txt",
+        "sha1": "dced504a9b5df367ddd3477adac084cea8024ba4",
+        "sha256": "d2e9d78ee5e4148555d1af15c85914968c8f0bbd5b4b18366c9e09937fbafa8c"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.20.3": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.3/intermediary-1.20.3-v2.jar",
+        "sha256": "9fb0359e51a3e40b48ebacb92522adfffc9a884c743332d51d369fc0f6db5392",
+        "tinySha256": "ccb8c3ea61540088db6bff4c8ecc06c8b89cfe1b61907ba95fef418b8eca221b"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/83458222e3b4fe8d6c069bfdac726f3d43fab053/1.20.3.json",
+        "url": "https://piston-data.mojang.com/v1/objects/c1cafe916dd8b58ed1fe0564fc8f786885224e62/server.txt",
+        "sha1": "c1cafe916dd8b58ed1fe0564fc8f786885224e62",
+        "sha256": "d8a75ea91dd9c8b83cffc7c65a4e65cc3933ded6aecdca13fd4fa52fba9770b2"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.20.4": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.4/intermediary-1.20.4-v2.jar",
+        "sha256": "c2df2c16cfdbf291a748aa937c80e79dc74cf7a3ef6266891d370a0e1f03cc4f",
+        "tinySha256": "ccb8c3ea61540088db6bff4c8ecc06c8b89cfe1b61907ba95fef418b8eca221b"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/ee2bc046cef978a91a7494e760a32d4f7f3e835c/1.20.4.json",
+        "url": "https://piston-data.mojang.com/v1/objects/c1cafe916dd8b58ed1fe0564fc8f786885224e62/server.txt",
+        "sha1": "c1cafe916dd8b58ed1fe0564fc8f786885224e62",
+        "sha256": "d8a75ea91dd9c8b83cffc7c65a4e65cc3933ded6aecdca13fd4fa52fba9770b2"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.20.5": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.5/intermediary-1.20.5-v2.jar",
+        "sha256": "28046838cdc3b2407113abd676744a5f87d263fedc424933b7b9c0acebdc4b7e",
+        "tinySha256": "41a685ee41b8d6ff99d0d6a3400569122fd0e65d727aa873b886cdc003421ff1"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/0a72c796b979e5eda34aca1e76c130beea5ab04c/1.20.5.json",
+        "url": "https://piston-data.mojang.com/v1/objects/14be97974a77b09eb8bca88ed9268445f0fde3e7/server.txt",
+        "sha1": "14be97974a77b09eb8bca88ed9268445f0fde3e7",
+        "sha256": "4b8e6fedfb206a9cd755696c9a30228ba167dfb66b91af393d8d3dd1a515244d"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.20.6": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.20.6/intermediary-1.20.6-v2.jar",
+        "sha256": "74cbb071d42fcc3e4cf6b3488806ccc8955a06b799926f1fe92a696cd98eccf3",
+        "tinySha256": "f6387f736b13909067e7e6c236fc35c67a73ad7c3eb7698ccefd2c44e7338b56"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/c16c1275df4c25b237c34cd1b11a3126c23f2f82/1.20.6.json",
+        "url": "https://piston-data.mojang.com/v1/objects/9e96100f573a46ef44caab3e716d5eb974594bb7/server.txt",
+        "sha1": "9e96100f573a46ef44caab3e716d5eb974594bb7",
+        "sha256": "4e5068e40a89c673b5541192ad7eab96289f6dcae704f577f8992bdf7c984aa3"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21/intermediary-1.21-v2.jar",
+        "sha256": "5567849f76f552ec3dac68bbb1da92d345e588bc28416cc176bfb9dda1bfd1ec",
+        "tinySha256": "1a94b05e8b9918f3d65b0d53f332706646e2abcfb67b559dcd0325cb2c5baa41"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/09183e46ebe8641c217098341be7fe9a6b7940e3/1.21.json",
+        "url": "https://piston-data.mojang.com/v1/objects/31c77994d96f05ba25a870ada70f47f315330437/server.txt",
+        "sha1": "31c77994d96f05ba25a870ada70f47f315330437",
+        "sha256": "c9d9fda3143c100fa0566099074fc5d912b8b7ef3cb5b84c87eab411bd5bfb51"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.1": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.1/intermediary-1.21.1-v2.jar",
+        "sha256": "e8bd6a4c39e235ee2dc73063558610775c72a2572fa0c6b32915b149074012a6",
+        "tinySha256": "75d0b68f55b133c91ff1f8f1089324e9db033f98906519f086807199522cb7ba"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/1757c8b1fbfc6b638504e1f6cceb05893f7389d5/1.21.1.json",
+        "url": "https://piston-data.mojang.com/v1/objects/03f8985492bda0afc0898465341eb0acef35f570/server.txt",
+        "sha1": "03f8985492bda0afc0898465341eb0acef35f570",
+        "sha256": "9d0b04bead421c8229aff14b534432bbc927bea642e7c8593d1276b8df8ba53f"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.10": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.10/intermediary-1.21.10-v2.jar",
+        "sha256": "3e62afb37aded204166ffdc23ec2eea86f5e9119f11c89d670fa7dd44e00369e",
+        "tinySha256": "227975a837fd85d83aecece0f7c0d95a17a8bfbb1716f8778f98f32fab23b9d4"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/e8a7596fa677c2b9f0c8aadf600ef0aae2bbe9d3/1.21.10.json",
+        "url": "https://piston-data.mojang.com/v1/objects/c5440743411a6fd7490fa18a4b6c5d8edf36d88b/server.txt",
+        "sha1": "c5440743411a6fd7490fa18a4b6c5d8edf36d88b",
+        "sha256": "6b90e3206eb288c1976e10e2369f3752e4e93ac7f0afe513754d390d07bb2ebb"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.11": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.11/intermediary-1.21.11-v2.jar",
+        "sha256": "f45b9530d0becae596fd48743e3ee1733cc2cdc69128cdb7d8d3571de163ab87",
+        "tinySha256": "a355c24bd12edc6f49c6860bb9bf8ee33e55eab4d4e2e0179c3c3c2dc3b27ca4"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/240f9560a4a6bc07faf42a7032a96b225f76e658/1.21.11.json",
+        "url": "https://piston-data.mojang.com/v1/objects/5621e9253f05fd57872bbe7f8ddf5f9a7d525955/server.txt",
+        "sha1": "5621e9253f05fd57872bbe7f8ddf5f9a7d525955",
+        "sha256": "7ffd98f77f403043748d56467aac287a58f8187a27d5d6b7ebcac70042b02b1c"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.3": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.3/intermediary-1.21.3-v2.jar",
+        "sha256": "8b38ede7155762250cb41b4a10ddb75fb0d450cb299abbde70987c8c4f503890",
+        "tinySha256": "938461e1f7019a431589c684ca813442fd8052f096033c2212c88885c5167014"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/8cebb441bb5b290ef03740a6fa4b33e4a0a1bfa8/1.21.3.json",
+        "url": "https://piston-data.mojang.com/v1/objects/c70e10f72ea65bb97e156143fd97c852dc958325/server.txt",
+        "sha1": "c70e10f72ea65bb97e156143fd97c852dc958325",
+        "sha256": "59ae80f623920a897587d375767a0d722074b3ddc1a5563feb0079f99e2a903c"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.4": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.4/intermediary-1.21.4-v2.jar",
+        "sha256": "2ca8d753e5338f78a44379567b391978ec694c08f681880f81ce76999da8ef51",
+        "tinySha256": "c5ec04dd0dc0c6b7a79e53abe19030e50c17bf6aa5a0079738f2aef8d2e884be"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/ee8ab0f6ec89b3127436d35e36aa766c1e85c3a9/1.21.4.json",
+        "url": "https://piston-data.mojang.com/v1/objects/0b1e60cc509cfb0172573ae56b436c29febbc187/server.txt",
+        "sha1": "0b1e60cc509cfb0172573ae56b436c29febbc187",
+        "sha256": "dae4a75ad2ca1d52d14e9c080e70e7fbb2888c3533c015ea2d970b2a15856639"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.5": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.5/intermediary-1.21.5-v2.jar",
+        "sha256": "20827c1b85fe6ccee6ee25ac0b3c42d28813697d60eb51faa850190ff4450764",
+        "tinySha256": "580a1ea3ea1bcbc059da1a99788551b0704ccac03c98cde9d9ef0c85105e0c34"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/fa9567d4298f0d2a9bf7f74fb478169967d92af3/1.21.5.json",
+        "url": "https://piston-data.mojang.com/v1/objects/f4812c1d66d0098a94616b19c21829e591d0af3a/server.txt",
+        "sha1": "f4812c1d66d0098a94616b19c21829e591d0af3a",
+        "sha256": "ecd2f68afe3333a4db26e1fb1d1c31551c379fef2f3235007fa739f7be038a7c"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.6": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.6/intermediary-1.21.6-v2.jar",
+        "sha256": "a5f6839bac61b7aa67acd6a33b955efcce2b2dafd3612088a1644a515ab67e79",
+        "tinySha256": "2cef47dbfe1e08fb1f28c597838e5e915bb199157eb6fb6e37b7029c66e91ac1"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/8137b78647df617d8a38754c4d61deedb74f9fa5/1.21.6.json",
+        "url": "https://piston-data.mojang.com/v1/objects/94d453080a58875d3acc1a9a249809767c91ed40/server.txt",
+        "sha1": "94d453080a58875d3acc1a9a249809767c91ed40",
+        "sha256": "c6fe95810b05dfec19fdbdfb8cbbb8f976923f7cb16fcc828a0b605a49d2c492"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.8": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.8/intermediary-1.21.8-v2.jar",
+        "sha256": "28c5e58cc82093327498edc7c62561b22421c8e80f51f3f90edb156b9b60262d",
+        "tinySha256": "913ebaebe96b4a208ef77481ff8fa90f3c6018307c0e69f05871e3f0fd220623"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/6b61868e9cc18b59f97241ac46cc84ab605c8152/1.21.8.json",
+        "url": "https://piston-data.mojang.com/v1/objects/eb1e1eb47cb740012fc82eacc394859463684132/server.txt",
+        "sha1": "eb1e1eb47cb740012fc82eacc394859463684132",
+        "sha256": "e373ba569839e6f3c7bd4880247f3e85577d92cde2c605adfa2024eb9cae503e"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.21.9": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/1.21.9/intermediary-1.21.9-v2.jar",
+        "sha256": "6a7a4523a8c215e512148407ce815c261853ed853192ee6ca5363eaeb0dd2bf1",
+        "tinySha256": "e99d46da02bd2d9ef62d0f60c614b97403b5ceb5388f329a6778a7d3720064d8"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/f928a4d0de2b6a48fac1e12e92516df7b5843002/1.21.9.json",
+        "url": "https://piston-data.mojang.com/v1/objects/587e016fe8a876cbc1cc98d73f9d0d79bfb32b2c/server.txt",
+        "sha1": "587e016fe8a876cbc1cc98d73f9d0d79bfb32b2c",
+        "sha256": "d65cf145581b63a6c84af66748436e390be962effdc4dfc8ab1b5460715b9ac5"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "1.7": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.8": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.9": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.9.1-pre2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.9.2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "1.9.4": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "15w40b": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "16w20a": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "16w35a": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "17w15a": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "17w18b": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "17w50a": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "20w13b": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/20w13b/intermediary-20w13b-v2.jar",
+        "sha256": "3d1d8469ccd1e9974923831d4fdc86e218cb16a76bbfea8e0b45c7b8c1a11048",
+        "tinySha256": "d90b62a3b7adc9fe133bdf98c849d308e32c8d7a223dcd34850c8f87512c17a2"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/430033af05f29add54241c55be62bbde6b640cd5/20w13b.json",
+        "url": "https://piston-data.mojang.com/v1/objects/a05fa86bac8bf9722f8d7295ea4997823f3b3c21/server.txt",
+        "sha1": "a05fa86bac8bf9722f8d7295ea4997823f3b3c21",
+        "sha256": "199fc0db0d753e7703f9ea0d6b8b7b3468eb8fbfe323abf14fe09ab87a573478"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "20w14a": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/20w14a/intermediary-20w14a-v2.jar",
+        "sha256": "acaf18d04cd2469d5d7dd821f7204f60a925fd519503d190c47fe49f9eaf4425",
+        "tinySha256": "89fb56daff5803e391d58563410c18f3a37127180dfbc7bf4f9576f239eb0015"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/1e548dbfeb7cb9aa76888b7308112c1a03cf0cc0/20w14a.json",
+        "url": "https://piston-data.mojang.com/v1/objects/1b2c98f855ef0f690e9d499d363fe5ee5969de62/server.txt",
+        "sha1": "1b2c98f855ef0f690e9d499d363fe5ee5969de62",
+        "sha256": "3becb03c8461133de1f4a24029ce682a05724d1c6713d5d4a06403252deebb30"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "21w07a": {
+      "verdict": "column",
+      "intermediary": {
+        "url": "https://maven.fabricmc.net/net/fabricmc/intermediary/21w07a/intermediary-21w07a-v2.jar",
+        "sha256": "89222a8a834c56a24cc0c19205edfe819ab3a1036c6a4cb52a1afd03699f29ca",
+        "tinySha256": "6f1d0884490035997e5e4489f8a0226c83d15aa10c414cc2d395c6d89647959f"
+      },
+      "mojang": {
+        "versionJson": "https://piston-meta.mojang.com/v1/packages/96476dbdb5d6689b3f1a47c025f1b7ad3630bd95/21w07a.json",
+        "url": "https://piston-data.mojang.com/v1/objects/66ebacdeccfdf8f6439f7a90234fc76e8ef5c5a6/server.txt",
+        "sha1": "66ebacdeccfdf8f6439f7a90234fc76e8ef5c5a6",
+        "sha256": "c7ae6a7547288bf237852a5553b7a029aa73a8a4f16c3cb713fafd3107b75492"
+      },
+      "classes": 12,
+      "generated": "2026-10-25"
+    },
+    "26.1": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "26.2": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    },
+    "26.3": {
+      "verdict": "no-fabric",
+      "checked": "2026-10-25"
+    }
+  }
+}
