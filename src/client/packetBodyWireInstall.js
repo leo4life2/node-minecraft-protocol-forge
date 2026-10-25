@@ -66,6 +66,17 @@ function tailTypes (types) {
       out.Read[name] = ['native', (buffer, offset) => (offset < buffer.length ? (varintRead(buffer, offset) || { value: null, size: 0 }) : { value: null, size: 0 })]
       out.Write[name] = ['native', (value, buffer, offset) => (value == null ? offset : varintWrite(value, buffer, offset))]
       out.SizeOf[name] = ['native', (value) => (value == null ? 0 : varintSize(value))]
+    } else if (type === 'varint-array') {
+      // HF112: FriendlyByteBuf.writeVarIntArray / readVarIntArray = a varint count then that many varints (protodef array{countType varint, type varint})
+      out.Read[name] = ['native', (buffer, offset) => {
+        if (offset >= buffer.length) return { value: null, size: 0 }
+        const n = varintRead(buffer, offset); if (!n) return { value: null, size: 0 }
+        const value = []; let o = offset + n.size
+        for (let i = 0; i < n.value; i++) { const x = varintRead(buffer, o); if (!x) return { value: null, size: 0 }; value.push(x.value); o += x.size }
+        return { value, size: o - offset }
+      }]
+      out.Write[name] = ['native', (value, buffer, offset) => { if (value == null) return offset; let o = varintWrite(value.length, buffer, offset); for (const v of value) o = varintWrite(v, buffer, o); return o }]
+      out.SizeOf[name] = ['native', (value) => (value == null ? 0 : value.reduce((n, v) => n + varintSize(v), varintSize(value.length)))]
     } else if (type === 'resource-key') {
       out.Read[name] = ['native', (buffer, offset) => (offset < buffer.length ? (utf8Read(buffer, offset) || { value: null, size: 0 }) : { value: null, size: 0 })]
       out.Write[name] = ['native', (value, buffer, offset) => (value == null ? offset : utf8Write(value, buffer, offset))]
@@ -304,7 +315,8 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
   client.minepalPacketBodyWire = receipt
   // HF77: a field's VALUE SOURCE is data on the extension — 'provider' (the int record the server syncs) or 'world-key'
   // (the key string the client stands in); the record provider is required only where a field is sourced from it
-  const needsProvider = spec.exts.some((e) => e.fields.some((f) => (f.source || 'provider') === 'provider'))
+  // HF112 (R3): the provider feeds the bytes this client writes - a clientbound-only extension is read off the wire and needs none
+  const needsProvider = spec.exts.some((e) => e.direction === 'toServer') && spec.exts.some((e) => e.fields.some((f) => (f.source || 'provider') === 'provider'))
   const usesWorldKey = spec.exts.some((e) => e.fields.some((f) => f.source === 'world-key'))
   receipt.heldMoves = 0
   if (needsProvider && !spec.provider) { receipt.reason = 'no-value-provider'; return receipt }
@@ -326,7 +338,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
   const guarded = spec.exts.filter((e) => e.direction === 'toServer' && e.guard && e.guard.armedBy)
   receipt.armed = guarded.length === 0
   const unwrap = spec.redirect && provider ? redirectUnwrapper(spec.redirect, protos, provider, receipt) : null
-  const valueWords = () => (usesWorldKey ? `world key the client stands in${observer.state.field ? ` (${observer.state.field})` : ''}${observer.key() != null ? ` = ${observer.key()}` : ''}` : `${spec.provider.compoundKey} value`)
+  const valueWords = () => (usesWorldKey ? `world key the client stands in${observer.state.field ? ` (${observer.state.field})` : ''}${observer.key() != null ? ` = ${observer.key()}` : ''}` : (spec.provider ? `${spec.provider.compoundKey} value` : 'bytes the server writes and this client reads'))
   // HF77: a guard the jar arms by a custom payload (the mod's own config handshake) is armed here by the same payload's
   // arrival, or by the server's register frame naming the handshake's channel (the server declares it runs the mod).
   // HF77 r2: the register frame rides the configuration phase and this install may run after it (the off-loop scan
@@ -385,7 +397,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
     receipt.installed = true
     const names = (m) => [...m.keys()].join(',')
     log(`[packet-wire] play protocol extended: toServer {${names(protos.outgoing)}} toClient {${names(protos.incoming)}} += ${spec.exts[0].fields.map((f) => f.type).join(',')} at ${spec.exts[0].anchor} ` +
-      `(derived from ${spec.mod?.name || spec.jar}: ${spec.exts[0].mixin?.className} in ${spec.jar}${spec.exts[0].mixin?.nested ? ` nested ${spec.exts[0].mixin.nested}` : ''}; value = ${provider ? `${spec.provider.compoundKey}[dimension] synced on ${spec.provider.channels.map((c) => c.id).join(' | ')}` : `the ${valueWords()} as the vanilla resource-key string`}` +
+      `(derived from ${spec.mod?.name || spec.jar}: ${spec.exts[0].mixin?.className} in ${spec.jar}${spec.exts[0].mixin?.nested ? ` nested ${spec.exts[0].mixin.nested}` : ''}; value = ${provider ? `${spec.provider.compoundKey}[dimension] synced on ${spec.provider.channels.map((c) => c.id).join(' | ')}` : (usesWorldKey ? `the ${valueWords()} as the vanilla resource-key string` : valueWords())}` +
       (spec.redirect ? `; world packets wrapped in custom_payload ${spec.redirect.channel} [${spec.redirect.header.map((h) => h.source).join(',')}] are unwrapped for this dimension` : '') + ')')
   }
   client.on('state', swap)

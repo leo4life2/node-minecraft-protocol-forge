@@ -83,6 +83,7 @@ const CONST_RETURN_OPS = new Set([0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x10
 // Minecraft varint helpers; owner-agnostic because mixins call them through a
 // @Shadow on the mixin class itself)
 const WRITE_PRIMS = {
+  'writeVarIntArray:([I)': 'varint-array', // HF112: a varint count + that many varints (FriendlyByteBuf's own member; its runtime spelling is column data)
   'writeInt:(I)': 'i32',
   'writeShort:(I)': 'i16',
   'writeByte:(I)': 'i8',
@@ -96,6 +97,7 @@ const WRITE_PRIMS = {
   'method_10791:(J)': 'varlong'
 }
 const READ_PRIMS = {
+  'readVarIntArray:()[I': 'varint-array', // HF112
   'readInt:()I': 'i32',
   'readShort:()S': 'i16',
   'readByte:()B': 'i8',
