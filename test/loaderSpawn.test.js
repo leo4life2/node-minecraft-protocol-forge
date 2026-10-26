@@ -739,3 +739,78 @@ describe('D3 rider — the verifier\'s fuzz on the synthetic (same-layout) codec
     assert.ok(none <= 2, `no registry: ${none}/20000`)
   })
 })
+
+// --- HF113: the launcher library layout table + the tagged walk ---------------------------------
+
+describe('HF113 loader jar locator - the launcher library layouts are a DATA table; the walk probes its rows (tagged first, every row untagged)', () => {
+  const { collectNeoForgeUniversalJars, collectForgeUniversalJars, pickNeoForgeLoaderJars, pickForgeLoaderJars, LAUNCHER_LIBRARY_LAYOUTS, libraryLayoutRows } = require('../src/client/neoForgeLoaderLocator')
+  const layoutsJson = require('../src/client/data/launcherLibraryLayouts.json')
+  // a Modrinth-style tree: <root>/app/meta/libraries holds the jar, <root>/app/profiles/<p>/mods is the mods folder
+  const modrinthTree = (name, builds, { withJar = true } = {}) => {
+    const root = path.join(tmp, name)
+    const mods = path.join(root, 'app', 'profiles', 'world', 'mods')
+    fs.mkdirSync(mods, { recursive: true })
+    if (withJar) {
+      for (const v of builds) {
+        const d = path.join(root, 'app', 'meta', 'libraries', 'net', 'neoforged', 'neoforge', v)
+        fs.mkdirSync(d, { recursive: true })
+        fs.writeFileSync(path.join(d, `neoforge-${v}-universal.jar`), 'x')
+      }
+    }
+    return { root, mods }
+  }
+  it('the table: keyed by the launcher tags the mods-dir resolver returns, relative segments only (no separator, no home, no user name); the rows are the data file\'s', () => {
+    assert.deepStrictEqual(LAUNCHER_LIBRARY_LAYOUTS, layoutsJson.layouts)
+    assert.deepStrictEqual(Object.keys(LAUNCHER_LIBRARY_LAYOUTS).sort(), ['curseforge', 'modrinth', 'prism', 'vanilla'])
+    for (const [tag, rows] of Object.entries(LAUNCHER_LIBRARY_LAYOUTS)) {
+      assert.ok(Array.isArray(rows) && rows.length >= 1, tag)
+      for (const segs of rows) for (const seg of segs) assert.match(seg, /^[A-Za-z0-9_.-]+$/, `${tag}: segment ${seg}`)
+    }
+    assert.deepStrictEqual(LAUNCHER_LIBRARY_LAYOUTS.modrinth, [['meta', 'libraries']], 'the Modrinth App keeps its libraries under meta/libraries (the F48 host log)')
+    assert.deepStrictEqual(LAUNCHER_LIBRARY_LAYOUTS.curseforge, [['Install', 'libraries']])
+    assert.deepStrictEqual(LAUNCHER_LIBRARY_LAYOUTS.vanilla, [['libraries']])
+    // the row rule: tagged -> that tag's rows first, then every distinct row; untagged / unknown -> every distinct row
+    const all = libraryLayoutRows(null).map((s) => s.join('/'))
+    assert.deepStrictEqual([...all].sort(), ['Install/libraries', 'libraries', 'meta/libraries'])
+    assert.deepStrictEqual(libraryLayoutRows('modrinth').map((s) => s.join('/'))[0], 'meta/libraries')
+    assert.deepStrictEqual(libraryLayoutRows('curseforge').map((s) => s.join('/'))[0], 'Install/libraries')
+    assert.deepStrictEqual([...libraryLayoutRows('no-such-launcher').map((s) => s.join('/'))].sort(), ['Install/libraries', 'libraries', 'meta/libraries'])
+    assert.strictEqual(new Set(libraryLayoutRows('vanilla').map((s) => s.join('/'))).size, libraryLayoutRows('vanilla').length, 'no duplicate row')
+  })
+  it('the Modrinth-style tree: the jar under app/meta/libraries is found tagged modrinth AND untagged (the F48 class: the base walk found 0 - RED on 46b9560e); the pick claims it for the world game version', () => {
+    const { mods } = modrinthTree('hf113-modrinth', ['26.1.2.124'])
+    const tagged = collectNeoForgeUniversalJars([mods], { launcher: 'modrinth' })
+    const untagged = collectNeoForgeUniversalJars([mods])
+    assert.strictEqual(tagged.size, 1)
+    assert.strictEqual(untagged.size, 1)
+    assert.strictEqual(path.basename(tagged.get('26.1.2.124')), 'neoforge-26.1.2.124-universal.jar')
+    assert.strictEqual(tagged.get('26.1.2.124'), untagged.get('26.1.2.124'))
+    const pick = pickNeoForgeLoaderJars([mods], { mcVersion: '26.1.2', launcher: 'modrinth' })
+    assert.strictEqual(pick.version, '26.1.2.124')
+    assert.strictEqual(pickNeoForgeLoaderJars([mods], { mcVersion: '26.1.2' }).version, '26.1.2.124', 'untagged, the same jar')
+    assert.strictEqual(pickNeoForgeLoaderJars([mods], { mcVersion: '26.1.2', launcher: 'vanilla' }).version, '26.1.2.124', 'a wrong tag still reaches every row')
+  })
+  it('the known layouts find theirs byte-identically (libraries beside the mods folder, Install/libraries; tagged or not) and a tree with no jar under any row finds none', () => {
+    const inst = path.join(tmp, 'hf113-known'); const mods = path.join(inst, 'mods'); fs.mkdirSync(mods, { recursive: true })
+    for (const [segs, fam, builds] of [[['libraries'], 'neo', ['21.1.248', '26.1.2.124']], [['Install', 'libraries'], 'forge', ['1.20.1-47.3.0']]]) {
+      for (const b of builds) {
+        const d = path.join(inst, ...segs, 'net', fam === 'neo' ? 'neoforged' : 'minecraftforge', fam === 'neo' ? 'neoforge' : 'forge', b)
+        fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, `${fam === 'neo' ? 'neoforge' : 'forge'}-${b}-universal.jar`), 'x')
+      }
+    }
+    const neo = (opts) => [...collectNeoForgeUniversalJars([mods], opts).entries()].map(([k, v]) => `${k}=${path.relative(inst, v)}`).sort()
+    const forge = (opts) => [...collectForgeUniversalJars([mods], opts).entries()].map(([k, v]) => `${k}=${path.relative(inst, v)}`).sort()
+    const neoExpected = ['21.1.248=libraries/net/neoforged/neoforge/21.1.248/neoforge-21.1.248-universal.jar', '26.1.2.124=libraries/net/neoforged/neoforge/26.1.2.124/neoforge-26.1.2.124-universal.jar']
+    const forgeExpected = ['1.20.1-47.3.0=Install/libraries/net/minecraftforge/forge/1.20.1-47.3.0/forge-1.20.1-47.3.0-universal.jar']
+    for (const opts of [undefined, {}, { launcher: null }, { launcher: 'vanilla' }, { launcher: 'curseforge' }, { launcher: 'modrinth' }]) {
+      assert.deepStrictEqual(neo(opts), neoExpected, `neo ${JSON.stringify(opts)}`)
+      assert.deepStrictEqual(forge(opts), forgeExpected, `forge ${JSON.stringify(opts)}`)
+    }
+    assert.strictEqual(pickForgeLoaderJars([mods], { mcVersion: '1.20.1', launcher: 'curseforge' }).version, '1.20.1-47.3.0')
+    const { mods: empty } = modrinthTree('hf113-empty', ['26.1.2.124'], { withJar: false })
+    fs.mkdirSync(path.join(tmp, 'hf113-empty', 'app', 'meta', 'libraries'), { recursive: true })
+    assert.strictEqual(collectNeoForgeUniversalJars([empty], { launcher: 'modrinth' }).size, 0)
+    assert.strictEqual(collectNeoForgeUniversalJars([empty]).size, 0)
+    assert.deepStrictEqual(pickNeoForgeLoaderJars([empty], { mcVersion: '26.1.2', launcher: 'modrinth' }), { jars: [], version: null, matchedPreferred: false })
+  })
+})

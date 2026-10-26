@@ -738,3 +738,98 @@ describe('HF6 M1 — list==switch mechanical pin (declared contract vs handler c
     assert.deepStrictEqual([...HANDLED_CLIENTBOUND_CONFIG_CHANNELS].sort(), handledBySwitch)
   })
 })
+
+describe('HF113 - the built-in contract resolver (jar / table / pinned) and the source word', function () {
+  const fs = require('fs')
+  const path = require('path')
+  const crypto = require('crypto')
+  const { EventEmitter } = require('events')
+  const { installNeoForgeConfigNegotiation, resolveBuiltinContract, DECLARED_SOURCES, NEOFORGE_BUILTIN_COLUMNS, HANDLED_CLIENTBOUND_CONFIG_CHANNELS, TOLERATED_CLIENTBOUND_PLAY_CHANNELS } = require('../src/client/neoForgeConfig')
+  const { deriveNeoForgeComponents } = require('../src/client/neoForgePayloadDerivation')
+  const sha256 = (a) => crypto.createHash('sha256').update(a.join('\n')).digest('hex')
+  // the sorted pinned 14 (HANDLED + TOLERATED), b2 of the HF113 baseline
+  const PINNED_14_SHA256 = '1ba5ae0f16381a3e9cca8f34122419c7269a902a0da19109e7143b2ee8869ff5'
+  const TRIMMED_26_1_2 = path.join(__dirname, 'fixtures', 'hf113-neoforge-26.1.2.124.trimmed.jar')
+  const TRIMMED_21_11 = path.join(__dirname, 'fixtures', 'hf113-neoforge-21.11.45.trimmed.jar')
+  const fakeClient = (version) => { const c = new EventEmitter(); c.written = []; c.version = version; c.write = (name, params) => c.written.push({ name, params }); return c }
+  const declare = (client, options) => {
+    installNeoForgeConfigNegotiation(client, options)
+    client.emit('packet', { channel: 'neoforge:register', data: Buffer.alloc(0) }, { state: 'configuration', name: 'custom_payload' })
+    const frame = client.written.find((w) => w.params.channel === 'minecraft:register')
+    return frame ? frame.params.data.toString('utf8').split('\u0000').filter(Boolean) : []
+  }
+  const EMPTY = { configuration: [], play: [] }
+
+  it('the enum is closed (jar, table, pinned) and the pinned set is the 14 constants, sha-equal to the baseline literal', () => {
+    assert.deepStrictEqual(DECLARED_SOURCES, ['jar', 'table', 'pinned'])
+    assert.strictEqual(sha256([...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS].slice().sort()), PINNED_14_SHA256)
+    const r = resolveBuiltinContract({ components: EMPTY, mcVersion: '1.19.4' })
+    assert.strictEqual(r.source, 'pinned')
+    assert.deepStrictEqual(r.configuration, [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS])
+    assert.deepStrictEqual(r.play, [...TOLERATED_CLIENTBOUND_PLAY_CHANNELS])
+    assert.strictEqual(resolveBuiltinContract({ components: EMPTY, mcVersion: null }).source, 'pinned', 'no game version: pinned, never a guess')
+    assert.strictEqual(resolveBuiltinContract({}).source, 'pinned')
+  })
+  it('no jar + game version 26.1.2 -> the table\'s 26.1.2 column: recipe content declared, custom_time_packet (gone at 26.x) not declared, the handler configuration contract kept, source table; the same for 1.21.11 (21.11) and 26.3', () => {
+    for (const [mc, line] of [['26.1.2', '26.1.2'], ['1.21.11', '21.11'], ['26.3', '26.3'], ['26.1', '26.1']]) {
+      const r = resolveBuiltinContract({ components: EMPTY, mcVersion: mc })
+      assert.strictEqual(r.source, 'table', mc)
+      assert.strictEqual(r.line, line, mc)
+      assert.ok(r.play.includes('neoforge:recipe_content'), `${mc}: recipe content`)
+      assert.ok(!r.play.includes('neoforge:split'), `${mc}: split never declared`)
+      assert.deepStrictEqual(r.configuration, [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS], `${mc}: the configuration contract is the handler set`)
+      const expected = NEOFORGE_BUILTIN_COLUMNS[line].play.filter((x) => x.flow !== 'serverbound' && x.id !== 'neoforge:split').map((x) => x.id)
+      assert.deepStrictEqual(r.play, expected, `${mc}: the column's clientbound play ids, in the column's order`)
+    }
+    assert.ok(!resolveBuiltinContract({ components: EMPTY, mcVersion: '26.1.2' }).play.includes('neoforge:custom_time_packet'))
+    const c = fakeClient('26.1.2')
+    const declared = declare(c, { components: EMPTY })
+    assert.ok(declared.includes('neoforge:recipe_content'), 'declared over minecraft:register from the table')
+    assert.strictEqual(c.neoForgeConfig.declaredSource, 'table')
+    assert.strictEqual(c.neoForgeConfig.declaredListening.length, declared.length)
+    // the option outranks the client's version fact for a caller that holds a truer word
+    const c2 = fakeClient('26.1')
+    declare(c2, { components: EMPTY, mcVersion: '1.19.4' })
+    assert.strictEqual(c2.neoForgeConfig.declaredSource, 'pinned')
+  })
+  it('no jar + a game version without a column -> the pinned set (sha-equal to the baseline literal), source pinned; the 21.1 column equals the constants', () => {
+    const c = fakeClient('1.19.4')
+    const declared = declare(c, { components: EMPTY })
+    assert.strictEqual(sha256(declared.slice().sort()), PINNED_14_SHA256)
+    assert.strictEqual(c.neoForgeConfig.declaredSource, 'pinned')
+    const col = NEOFORGE_BUILTIN_COLUMNS['21.1']
+    const clientbound = (rows) => rows.filter((r) => r.flow !== 'serverbound' && r.id !== 'neoforge:split').map((r) => r.id).sort()
+    assert.deepStrictEqual(clientbound(col.play), [...TOLERATED_CLIENTBOUND_PLAY_CHANNELS].sort())
+    assert.deepStrictEqual(clientbound(col.configuration), [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS].sort())
+    // 1.21.1 itself resolves to the 21.1 column: byte-identical declaration to the pinned one
+    const c3 = fakeClient('1.21.1')
+    const d3 = declare(c3, { components: EMPTY })
+    assert.strictEqual(sha256(d3.slice().sort()), PINNED_14_SHA256, 'the 21.1 column declares exactly the pinned 14')
+    assert.strictEqual(c3.neoForgeConfig.declaredSource, 'table')
+  })
+  it('the trimmed 26.1.2.124 fixture read through the runtime reader -> the declared set carries recipe content and the source says jar; a jar whose build differs from the column wins (21.11.45 under a 26.1.2 word still declares its own set)', function () {
+    this.timeout(30000)
+    assert.ok(fs.existsSync(TRIMMED_26_1_2) && fs.statSync(TRIMMED_26_1_2).size < 300 * 1024, 'the trimmed fixture, well under 300 KB')
+    assert.ok(fs.existsSync(TRIMMED_21_11) && fs.statSync(TRIMMED_21_11).size < 300 * 1024)
+    const run = deriveNeoForgeComponents([TRIMMED_26_1_2])
+    assert.ok(run.components.play.some((x) => x.id === 'neoforge:recipe_content' && x.flow === 'clientbound'), 'the fixture registers recipe content playToClient')
+    const c = fakeClient('26.1.2')
+    const declared = declare(c, { components: run.components })
+    assert.ok(declared.includes('neoforge:recipe_content'))
+    assert.strictEqual(c.neoForgeConfig.declaredSource, 'jar')
+    assert.ok(c.neoForgeConfig.toleratedDerived.includes('neoforge:recipe_content'), 'the HF43 extras carry it')
+    assert.ok(!declared.includes('neoforge:split'))
+    // the jar wins over the column: the 21.11.45 fixture under a 26.1.2 word declares the 21.11 set (custom_time_packet still registered there), source jar
+    const run2 = deriveNeoForgeComponents([TRIMMED_21_11])
+    const c2 = fakeClient('26.1.2')
+    const d2 = declare(c2, { components: run2.components })
+    assert.strictEqual(c2.neoForgeConfig.declaredSource, 'jar')
+    assert.ok(d2.includes('neoforge:recipe_content') && d2.includes('neoforge:custom_time_packet'))
+    // the trimmed fixture pins the SAME set as the full jar (the stop rule): the full jar's sorted neoforge:* set, HF113_JAR_DIR when present
+    const full = process.env.HF113_JAR_DIR ? path.join(process.env.HF113_JAR_DIR, 'neoforge-26.1.2.124-universal.jar') : null
+    if (full && fs.existsSync(full)) {
+      const key = (r) => [...r.components.configuration, ...r.components.play].filter((x) => x.id.startsWith('neoforge:')).map((x) => `${x.id}|${x.flow}|${x.version}`).sort()
+      assert.deepStrictEqual(key(run), key(deriveNeoForgeComponents([full])), 'trimmed == full')
+    }
+  })
+})

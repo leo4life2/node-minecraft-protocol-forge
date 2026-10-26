@@ -549,7 +549,7 @@ describe('HF93 per-jar digest', function () {
   // digest-vs-raw byte identity below is the control, this sha is the set's listing (re-pinned over the grown set; 95d3c1db... before)
   // HF106: the two hf106-embeddium-*.jar fixtures (the trimmed real jar + its no-guard twin) joined the set (57fcd6a9... before)
   // HF112: the hf112-create-fabric-6.0.8.1+build.1744-mc1.20.1.trimmed.jar fixture (the map data packet mixin, a runtime-name @Mixin target) joined the set (e188a2eb... before)
-  const BASE_FIXTURE_SET_SHA = '703161804f4c5bfb530d557f27817655efcac6588374e1a63245f86b83cb6601' // HF110: the set grew by the hf110-* fixtures (the trimmed owner + library pair and the no-call-site twin); every earlier pair derives what it derived (the lane's bV control, pair by pair)
+  const BASE_FIXTURE_SET_SHA = 'cc5c8e84ca51069e19563a6712bcaf3f94aa8e7148c8ed5e72afd4c49b20229c' // HF113: the set grew by the two hf113-neoforge-*.trimmed.jar loader fixtures (no login channel in a loader jar: unknown, pair by pair; the HF110 set 70316180... stands inside it). HF110: the set grew by the hf110-* fixtures (the trimmed owner + library pair and the no-call-site twin); every earlier pair derives what it derived (the lane's bV control, pair by pair)
   const quiet = (fn) => { const o = console.log; console.log = () => {}; try { return fn() } finally { console.log = o } }
   const packOf = (tag) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `hf93-m3-${tag}-`))
