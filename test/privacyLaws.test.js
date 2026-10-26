@@ -352,7 +352,9 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         // HF48-P2: the shared write table + the GENERATED mapping-era vocabulary (a local JSON, no network)
         './friendlyByteBufWrites',
         // HF112: the runtime-name column of the packet-body table (GENERATED data, a local JSON: no network, no path, no host)
-        './data/packetBodyRuntimeNames.json'])
+        './data/packetBodyRuntimeNames.json',
+        // HF113: the per-line NeoForge built-in columns + the launcher library layout table (GENERATED / cited data, local JSON: no network, no path, no host)
+        './data/neoForgeBuiltins.json', './data/launcherLibraryLayouts.json'])
       for (const r of requires) {
         assert.ok(allowed.has(r), `${mod} requires '${r}', which is not an allowed local-parsing dependency`)
       }

@@ -101,6 +101,12 @@
 'use strict'
 
 const debug = require('../../debug')
+// HF113: the game-version axis rule the loader pick already carries (a column's build against the world game version)
+const { neoForgeBuildMatchesGameVersion } = require('./neoForgeLoaderLocator')
+// HF113: ONE COLUMN PER NEOFORGE LINE of the loader's own built-in payloads, written by
+// tools/gen-neoforge-builtins-table.js from the published universal jars through the
+// runtime's own jar reader (data, never typed; the sources record sits beside it)
+const NEOFORGE_BUILTIN_COLUMNS = Object.freeze(require('./data/neoForgeBuiltins.json').columns)
 
 const PROTOCOL_ORDINALS = { handshaking: 0, play: 1, status: 2, login: 3, configuration: 4 }
 const PROTOCOL_NAMES = ['handshaking', 'play', 'status', 'login', 'configuration']
@@ -160,6 +166,53 @@ const TOLERATED_CLIENTBOUND_PLAY_CHANNELS = Object.freeze([
   'neoforge:custom_time_packet',
   'neoforge:sync_attachments'
 ])
+
+// HF113 — THE ONE RESOLVER of the built-in contract both seats read (the claim
+// filter and the minecraft:register declaration). Where the set comes from is
+// written from what happened, a closed enum:
+//   jar    — the components handed in carry neoforge:* rows: the world's own loader
+//            jar was read (only the loader registers that namespace) and is the
+//            authority on its built-ins (HF43: the pinned contract + the jar's
+//            clientbound play extras, unchanged behaviour);
+//   table  — no jar row, and the table has the column of the world game
+//            version's line (neoForgeBuildMatchesGameVersion over the column's
+//            build): the play contract is that column's clientbound play ids
+//            (the server's own sends of that line - `neoforge:recipe_content`
+//            from the 21.11 line on - declared before PlayerList.placeNewPlayer
+//            ships them; checkPacket throws on an undeclared one and the join
+//            dies as "Invalid player data"); the configuration contract stays
+//            the HANDLER set (a configuration built-in we cannot answer is never
+//            declared, whatever a column lists);
+//   pinned — neither: the 21.1 constants above (the table's 21.1 column equals
+//            them; pinned by test).
+// Nothing here forbids or decides: the set is a fact of the line, said where it
+// is chosen (state.declaredSource) so the bundle can carry the word.
+const DECLARED_SOURCES = Object.freeze(['jar', 'table', 'pinned'])
+
+/** The table column whose line the world game version belongs to (null when the table has none). */
+function builtinColumnFor (mcVersion) {
+  if (typeof mcVersion !== 'string' || mcVersion.length === 0) return null
+  for (const [line, column] of Object.entries(NEOFORGE_BUILTIN_COLUMNS)) {
+    if (column && typeof column.build === 'string' && neoForgeBuildMatchesGameVersion(column.build, mcVersion)) return { line, column }
+  }
+  return null
+}
+
+/**
+ * @param {{components?: {configuration?: Array, play?: Array}, mcVersion?: string|null}} input
+ * @returns {{configuration: string[], play: string[], source: 'jar'|'table'|'pinned', line: string|null}}
+ */
+function resolveBuiltinContract ({ components, mcVersion } = {}) {
+  const rows = [...((components && components.configuration) || []), ...((components && components.play) || [])]
+  const jarRead = rows.some((c) => c && typeof c.id === 'string' && c.id.startsWith('neoforge:'))
+  if (jarRead) return { configuration: [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS], play: [...TOLERATED_CLIENTBOUND_PLAY_CHANNELS], source: 'jar', line: null }
+  const hit = builtinColumnFor(mcVersion)
+  if (hit) {
+    const play = (hit.column.play || []).filter((r) => r && typeof r.id === 'string' && r.flow !== 'serverbound' && r.id !== 'neoforge:split').map((r) => r.id)
+    return { configuration: [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS], play, source: 'table', line: hit.line }
+  }
+  return { configuration: [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS], play: [...TOLERATED_CLIENTBOUND_PLAY_CHANNELS], source: 'pinned', line: null }
+}
 
 // Vanilla `minecraft:register` payload body: NUL-separated channel ids, no
 // versions (DinnerboneProtocolUtils.CHANNELS_CODEC, 1.21.1 branch — the
@@ -647,6 +700,11 @@ const PONG_HOLD_MS = 2500
 
 function installNeoForgeConfigNegotiation (client, options = {}) {
   const rawComponents = options.components || { configuration: [], play: [] }
+  // HF113: the built-in contract from THE ONE resolver (jar / table / pinned); the
+  // world game version is the client's own fact (options.mcVersion for a caller that
+  // holds a truer word than client.version)
+  const builtins = resolveBuiltinContract({ components: rawComponents, mcVersion: options.mcVersion || (client && client.version) || null })
+  if (builtins.source === 'table') debug(`neoforge config: no loader jar read; the built-in contract is the table's ${builtins.line} column (${builtins.play.length} clientbound play built-ins)`)
   const declareListening = options.declareListening !== false
   // HF15 — the listen-only surface: sanitized here so a malformed id can
   // never ride a declaration frame (ids are jar-derived or hint-learned
@@ -712,8 +770,8 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     return false
   }
   const components = {
-    configuration: (rawComponents.configuration || []).filter(builtinFilter(HANDLED_CLIENTBOUND_CONFIG_CHANNELS)),
-    play: (rawComponents.play || []).filter(builtinFilter(TOLERATED_CLIENTBOUND_PLAY_CHANNELS, true))
+    configuration: (rawComponents.configuration || []).filter(builtinFilter(builtins.configuration)),
+    play: (rawComponents.play || []).filter(builtinFilter(builtins.play, true))
   }
   if (toleratedDerived.length > 0) {
     debug(`neoforge config: tolerating ${toleratedDerived.length} loader-derived clientbound play built-in(s) beyond the pinned list: ${toleratedDerived.join(', ')}`)
@@ -795,6 +853,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
     frozenRegistryCount: 0,
     dataMapsAnswered: false,
     declaredListening: null,
+    declaredSource: builtins.source, // HF113: where the declared built-in set came from (jar | table | pinned), written from what happened
     listenOnlyDeclared: null, // HF15: how many jar-derived listen-only ids rode the declaration
     queryAnswer: null, // HF8: {configuration, play, bytes} once answered (+ HF43 learned counts)
     serverQuery: null, // HF43: the server's own component sets from its neoforge:register query
@@ -1188,7 +1247,7 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
             // negotiation completes); the jar-derived listen-only surface
             // rides behind it, deduped. onMinecraftRegister is addAll-
             // additive server-side, so extra frames are lawful (HF8).
-            const contract = [...HANDLED_CLIENTBOUND_CONFIG_CHANNELS, ...TOLERATED_CLIENTBOUND_PLAY_CHANNELS, ...toleratedDerived]
+            const contract = [...builtins.configuration, ...builtins.play, ...toleratedDerived] // HF113: the resolver's set (jar / table / pinned) + the jar's extras
             const contractSet = new Set(contract)
             const extras = listenOnly.filter((id) => !contractSet.has(id))
             state.declaredListening = [...contract, ...extras]
@@ -1369,6 +1428,10 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
 
 module.exports = {
   installNeoForgeConfigNegotiation,
+  // HF113: the built-in contract resolver, its source enum and the per-line columns (data)
+  resolveBuiltinContract,
+  DECLARED_SOURCES,
+  NEOFORGE_BUILTIN_COLUMNS,
   CONFIG_PROOF_BUDGET_MS,
   PARKED_GRACE_MS,
   HOLD_TICK_MS,
