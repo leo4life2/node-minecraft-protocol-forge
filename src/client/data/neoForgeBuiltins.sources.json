@@ -1,0 +1,591 @@
+{
+  "axis": "minecraft-data versionsByMinecraftVersion.pc release names (what the client version fact carries) from the oldest game version a published line reaches",
+  "generated": "2026-10-26",
+  "generator": "tools/gen-neoforge-builtins-table.js",
+  "lines": {
+    "21": {
+      "build": "21.0.167",
+      "buildsPublished": 165,
+      "buildsRead": [
+        {
+          "build": "21.0.167",
+          "sha256": "9c68c9c2c8bb8314fde3f1a3cf890ff4ab74b804561ae6998a4b9308397725a5",
+          "size": 2873497,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "9c68c9c2c8bb8314fde3f1a3cf890ff4ab74b804561ae6998a4b9308397725a5",
+      "size": 2873497,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.0.167/neoforge-21.0.167-universal.jar",
+      "verdict": "column"
+    },
+    "20.2": {
+      "build": "20.2.93",
+      "buildsPublished": 79,
+      "buildsRead": [
+        {
+          "build": "20.2.93",
+          "sha256": "14738ecbf2b5322536c78c0a1de678ba457b3244a891f31efb5bac89eadee172",
+          "size": 2206894,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.20.2"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "14738ecbf2b5322536c78c0a1de678ba457b3244a891f31efb5bac89eadee172",
+      "size": 2206894,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/20.2.93/neoforge-20.2.93-universal.jar",
+      "verdict": "empty-read"
+    },
+    "20.3": {
+      "build": "20.3.8-beta",
+      "buildsPublished": 7,
+      "buildsRead": [
+        {
+          "build": "20.3.8-beta",
+          "sha256": "fe1f948efc857d55b59d073a9dc0ed1cd5baa4ce4dac3d2709054834d3258fb8",
+          "size": 2220878,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.20.3"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "fe1f948efc857d55b59d073a9dc0ed1cd5baa4ce4dac3d2709054834d3258fb8",
+      "size": 2220878,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/20.3.8-beta/neoforge-20.3.8-beta-universal.jar",
+      "verdict": "empty-read"
+    },
+    "20.4": {
+      "build": "20.4.253",
+      "buildsPublished": 245,
+      "buildsRead": [
+        {
+          "build": "20.4.253",
+          "sha256": "fb939de1e6aa86bba29255a8734380a993e66986bd76aa38a723c0275cb1b975",
+          "size": 2613550,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.20.4"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "fb939de1e6aa86bba29255a8734380a993e66986bd76aa38a723c0275cb1b975",
+      "size": 2613550,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/20.4.253/neoforge-20.4.253-universal.jar",
+      "verdict": "empty-read"
+    },
+    "20.5": {
+      "build": "20.5.21-beta",
+      "buildsPublished": 22,
+      "buildsRead": [
+        {
+          "build": "20.5.21-beta",
+          "sha256": "060f9d9860cf79aed21f724d854cede4058d0b6f55771c38e4af2df1eb77b13c",
+          "size": 2635774,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.20.5"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "060f9d9860cf79aed21f724d854cede4058d0b6f55771c38e4af2df1eb77b13c",
+      "size": 2635774,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/20.5.21-beta/neoforge-20.5.21-beta-universal.jar",
+      "verdict": "empty-read"
+    },
+    "20.6": {
+      "build": "20.6.144",
+      "buildsPublished": 128,
+      "buildsRead": [
+        {
+          "build": "20.6.144",
+          "sha256": "d92959aad10d9af0a83ced9cb1dc0f075ee0058ba8ca86ba64459da972d1bf0a",
+          "size": 2747764,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.20.6"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "d92959aad10d9af0a83ced9cb1dc0f075ee0058ba8ca86ba64459da972d1bf0a",
+      "size": 2747764,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/20.6.144/neoforge-20.6.144-universal.jar",
+      "verdict": "empty-read"
+    },
+    "21.1": {
+      "build": "21.1.265",
+      "buildsPublished": 260,
+      "buildsRead": [
+        {
+          "build": "21.1.265",
+          "sha256": "c12cf1a6cb0aa7792b13174b06088a4f54d8bcc92f6a32fcb03310b456936847",
+          "size": 3559126,
+          "source": "cache"
+        },
+        {
+          "build": "21.1.248",
+          "sha256": "90a56f70425711b4e1a4b94ff0c2904ae9f6d74ca6478b3b2152ac794a07b8e5",
+          "size": 3551268,
+          "source": "local"
+        }
+      ],
+      "gameVersions": [
+        "1.21.1"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "c12cf1a6cb0aa7792b13174b06088a4f54d8bcc92f6a32fcb03310b456936847",
+      "size": 3559126,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.1.265/neoforge-21.1.265-universal.jar",
+      "verdict": "column"
+    },
+    "21.10": {
+      "build": "21.10.64",
+      "buildsPublished": 63,
+      "buildsRead": [
+        {
+          "build": "21.10.64",
+          "sha256": "51dc4f8418cc0c067df2524bc220edef56097f475f60527d550992bed90a2b57",
+          "size": 3805764,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.10"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "51dc4f8418cc0c067df2524bc220edef56097f475f60527d550992bed90a2b57",
+      "size": 3805764,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.10.64/neoforge-21.10.64-universal.jar",
+      "verdict": "column"
+    },
+    "21.11": {
+      "build": "21.11.48",
+      "buildsPublished": 46,
+      "buildsRead": [
+        {
+          "build": "21.11.48",
+          "sha256": "95882e7dda195b8cdf8c7fcddd69c32b9163ca1c84cd33ea47a1afc9e51960a6",
+          "size": 3833335,
+          "source": "cache"
+        },
+        {
+          "build": "21.11.45",
+          "sha256": "0d9ab82c37319ed6514e8e28e5ab357ba5e9b8043ee4621333cf45b743039cba",
+          "size": 3831805,
+          "source": "local"
+        }
+      ],
+      "gameVersions": [
+        "1.21.11"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "95882e7dda195b8cdf8c7fcddd69c32b9163ca1c84cd33ea47a1afc9e51960a6",
+      "size": 3833335,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.11.48/neoforge-21.11.48-universal.jar",
+      "verdict": "column"
+    },
+    "21.2": {
+      "build": "21.2.1-beta",
+      "buildsPublished": 2,
+      "buildsRead": [
+        {
+          "build": "21.2.1-beta",
+          "sha256": "4616a73a23d27c02324117576875e5b8c22d2758865aa80842b77b1353d70c52",
+          "size": 3039711,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.2"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "4616a73a23d27c02324117576875e5b8c22d2758865aa80842b77b1353d70c52",
+      "size": 3039711,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.2.1-beta/neoforge-21.2.1-beta-universal.jar",
+      "verdict": "column"
+    },
+    "21.3": {
+      "build": "21.3.100",
+      "buildsPublished": 99,
+      "buildsRead": [
+        {
+          "build": "21.3.100",
+          "sha256": "a101bd8c87143cd5d716a3dd1f9ff76e4f5f0146a29b11a86e230e07c56bfd7c",
+          "size": 3534973,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.3"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "a101bd8c87143cd5d716a3dd1f9ff76e4f5f0146a29b11a86e230e07c56bfd7c",
+      "size": 3534973,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.3.100/neoforge-21.3.100-universal.jar",
+      "verdict": "column"
+    },
+    "21.4": {
+      "build": "21.4.161",
+      "buildsPublished": 158,
+      "buildsRead": [
+        {
+          "build": "21.4.161",
+          "sha256": "1d847bed89977be0e538f10e057330b95d6b35c2d16129fc2600cf5999353ae4",
+          "size": 3516015,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.4"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "1d847bed89977be0e538f10e057330b95d6b35c2d16129fc2600cf5999353ae4",
+      "size": 3516015,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.4.161/neoforge-21.4.161-universal.jar",
+      "verdict": "column"
+    },
+    "21.5": {
+      "build": "21.5.101",
+      "buildsPublished": 99,
+      "buildsRead": [
+        {
+          "build": "21.5.101",
+          "sha256": "be5409e8414d901e795f1043dda98f3a1da90be3a40c7aaee39fd56c9c98fe31",
+          "size": 3549359,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.5"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "be5409e8414d901e795f1043dda98f3a1da90be3a40c7aaee39fd56c9c98fe31",
+      "size": 3549359,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.5.101/neoforge-21.5.101-universal.jar",
+      "verdict": "column"
+    },
+    "21.6": {
+      "build": "21.6.20-beta",
+      "buildsPublished": 21,
+      "buildsRead": [
+        {
+          "build": "21.6.20-beta",
+          "sha256": "250dfe6b489b32c388427bb37a9883d06d679d26e71986055bbd0a5d26047b63",
+          "size": 3116736,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.6"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "250dfe6b489b32c388427bb37a9883d06d679d26e71986055bbd0a5d26047b63",
+      "size": 3116736,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.6.20-beta/neoforge-21.6.20-beta-universal.jar",
+      "verdict": "column"
+    },
+    "21.7": {
+      "build": "21.7.25-beta",
+      "buildsPublished": 26,
+      "buildsRead": [
+        {
+          "build": "21.7.25-beta",
+          "sha256": "44935718e180f5ef2dfcc79a8628a9b506cdd1b99e9fbab96cf0ce641609df65",
+          "size": 3171940,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.7"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "44935718e180f5ef2dfcc79a8628a9b506cdd1b99e9fbab96cf0ce641609df65",
+      "size": 3171940,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.7.25-beta/neoforge-21.7.25-beta-universal.jar",
+      "verdict": "column"
+    },
+    "21.8": {
+      "build": "21.8.57",
+      "buildsPublished": 56,
+      "buildsRead": [
+        {
+          "build": "21.8.57",
+          "sha256": "7ca66866927ec0f1d43706c4171b9de910ce5344e94b82d058e2fe1e634525df",
+          "size": 3644058,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.8"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "7ca66866927ec0f1d43706c4171b9de910ce5344e94b82d058e2fe1e634525df",
+      "size": 3644058,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.8.57/neoforge-21.8.57-universal.jar",
+      "verdict": "column"
+    },
+    "21.9": {
+      "build": "21.9.16-beta",
+      "buildsPublished": 17,
+      "buildsRead": [
+        {
+          "build": "21.9.16-beta",
+          "sha256": "7e74d4b2016bd10fd9b1ddd53695acf6f271e1c9c1e9923afb59cf69ebb06051",
+          "size": 3794962,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "1.21.9"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "7e74d4b2016bd10fd9b1ddd53695acf6f271e1c9c1e9923afb59cf69ebb06051",
+      "size": 3794962,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/21.9.16-beta/neoforge-21.9.16-beta-universal.jar",
+      "verdict": "column"
+    },
+    "26.1": {
+      "build": "26.1.0.19-beta",
+      "buildsPublished": 33,
+      "buildsRead": [
+        {
+          "build": "26.1.0.19-beta",
+          "sha256": "cd57bc3ce419023996b0ead6869a6f681810fde802d17efbcb26b9b689362ae6",
+          "size": 7464694,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "26.1"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "cd57bc3ce419023996b0ead6869a6f681810fde802d17efbcb26b9b689362ae6",
+      "size": 7464694,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.1.0.19-beta/neoforge-26.1.0.19-beta-universal.jar",
+      "verdict": "column"
+    },
+    "26.1.1": {
+      "build": "26.1.1.15-beta",
+      "buildsPublished": 14,
+      "buildsRead": [
+        {
+          "build": "26.1.1.15-beta",
+          "sha256": "27b547078f4cd15fac189bb048931d435f37fd7563126a3fcbe910ad308e4c73",
+          "size": 7496005,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "26.1.1"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "27b547078f4cd15fac189bb048931d435f37fd7563126a3fcbe910ad308e4c73",
+      "size": 7496005,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.1.1.15-beta/neoforge-26.1.1.15-beta-universal.jar",
+      "verdict": "column"
+    },
+    "26.1.2": {
+      "build": "26.1.2.124",
+      "buildsPublished": 122,
+      "buildsRead": [
+        {
+          "build": "26.1.2.124",
+          "sha256": "bff1179da50376fcfbb3f35155364ee9fdf0ccc291bbf76c115668b14d96a559",
+          "size": 7582245,
+          "source": "local"
+        }
+      ],
+      "gameVersions": [
+        "26.1.2"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "bff1179da50376fcfbb3f35155364ee9fdf0ccc291bbf76c115668b14d96a559",
+      "size": 7582245,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.1.2.124/neoforge-26.1.2.124-universal.jar",
+      "verdict": "column"
+    },
+    "26.2": {
+      "build": "26.2.0.93",
+      "buildsPublished": 92,
+      "buildsRead": [
+        {
+          "build": "26.2.0.93",
+          "sha256": "c9ce1b3ab2fc182b35a0a81f29720d194eda0a55f846d228432a533945bec85c",
+          "size": 7080511,
+          "source": "cache"
+        }
+      ],
+      "gameVersions": [
+        "26.2"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "c9ce1b3ab2fc182b35a0a81f29720d194eda0a55f846d228432a533945bec85c",
+      "size": 7080511,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.2.0.93/neoforge-26.2.0.93-universal.jar",
+      "verdict": "column"
+    },
+    "26.3": {
+      "build": "26.3.0.99",
+      "buildsPublished": 95,
+      "buildsRead": [
+        {
+          "build": "26.3.0.99",
+          "sha256": "1c41dc00c92e87cd874788ee51720e3217e238423b853ac13b8242cf1973a13e",
+          "size": 7163111,
+          "source": "cache"
+        },
+        {
+          "build": "26.3.0.95",
+          "sha256": "790360c3f8aab41b8538ee56da22c676772b7104907760f25477e24da1bc13d7",
+          "size": 7146136,
+          "source": "local"
+        }
+      ],
+      "gameVersions": [
+        "26.3"
+      ],
+      "publisherChecksum": "absent",
+      "setDiffersAcrossBuildsRead": false,
+      "sha256": "1c41dc00c92e87cd874788ee51720e3217e238423b853ac13b8242cf1973a13e",
+      "size": 7163111,
+      "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.3.0.99/neoforge-26.3.0.99-universal.jar",
+      "verdict": "column"
+    }
+  },
+  "metadata": {
+    "sha256": "12432eb10ceede9e3e30d96f7ff8e32c536ac4b6d3046d9a57259153860b06dd",
+    "source": "local",
+    "unparsedVersions": [
+      "0.25w14craftmine.3-beta",
+      "0.25w14craftmine.4-beta",
+      "0.25w14craftmine.5-beta"
+    ],
+    "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml",
+    "versions": 1852
+  },
+  "offAxisLines": [],
+  "reader": "neoForgePayloadDerivation.deriveNeoForgeComponents (the runtime loader-jar reader)",
+  "schema": 1,
+  "versions": {
+    "1.20.2": {
+      "line": "20.2",
+      "verdict": "no-column"
+    },
+    "1.20.3": {
+      "line": "20.3",
+      "verdict": "no-column"
+    },
+    "1.20.4": {
+      "line": "20.4",
+      "verdict": "no-column"
+    },
+    "1.20.5": {
+      "line": "20.5",
+      "verdict": "no-column"
+    },
+    "1.20.6": {
+      "line": "20.6",
+      "verdict": "no-column"
+    },
+    "1.21": {
+      "line": "21",
+      "verdict": "column"
+    },
+    "1.21.1": {
+      "line": "21.1",
+      "verdict": "column"
+    },
+    "1.21.10": {
+      "line": "21.10",
+      "verdict": "column"
+    },
+    "1.21.11": {
+      "line": "21.11",
+      "verdict": "column"
+    },
+    "1.21.2": {
+      "line": "21.2",
+      "verdict": "column"
+    },
+    "1.21.3": {
+      "line": "21.3",
+      "verdict": "column"
+    },
+    "1.21.4": {
+      "line": "21.4",
+      "verdict": "column"
+    },
+    "1.21.5": {
+      "line": "21.5",
+      "verdict": "column"
+    },
+    "1.21.6": {
+      "line": "21.6",
+      "verdict": "column"
+    },
+    "1.21.7": {
+      "line": "21.7",
+      "verdict": "column"
+    },
+    "1.21.8": {
+      "line": "21.8",
+      "verdict": "column"
+    },
+    "1.21.9": {
+      "line": "21.9",
+      "verdict": "column"
+    },
+    "26.1": {
+      "line": "26.1",
+      "verdict": "column"
+    },
+    "26.1.1": {
+      "line": "26.1.1",
+      "verdict": "column"
+    },
+    "26.1.2": {
+      "line": "26.1.2",
+      "verdict": "column"
+    },
+    "26.2": {
+      "line": "26.2",
+      "verdict": "column"
+    },
+    "26.3": {
+      "line": "26.3",
+      "verdict": "column"
+    }
+  }
+}

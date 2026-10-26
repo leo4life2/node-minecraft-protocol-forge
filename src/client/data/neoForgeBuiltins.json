@@ -1,0 +1,1457 @@
+{
+  "columns": {
+    "21": {
+      "build": "21.0.167",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ]
+    },
+    "21.1": {
+      "build": "21.1.265",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "21.10": {
+      "build": "21.10.64",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "21.11": {
+      "build": "21.11.48",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "21.2": {
+      "build": "21.2.1-beta",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ]
+    },
+    "21.3": {
+      "build": "21.3.100",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ]
+    },
+    "21.4": {
+      "build": "21.4.161",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ]
+    },
+    "21.5": {
+      "build": "21.5.101",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ]
+    },
+    "21.6": {
+      "build": "21.6.20-beta",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ]
+    },
+    "21.7": {
+      "build": "21.7.25-beta",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "21.8": {
+      "build": "21.8.57",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "21.9": {
+      "build": "21.9.16-beta",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:custom_time_packet"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "26.1": {
+      "build": "26.1.0.19-beta",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "26.1.1": {
+      "build": "26.1.1.15-beta",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "26.1.2": {
+      "build": "26.1.2.124",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "26.2": {
+      "build": "26.2.0.93",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    },
+    "26.3": {
+      "build": "26.3.0.99",
+      "configuration": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:extensible_enum_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:extensible_enum_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:feature_flags"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:feature_flags_ack"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:frozen_registry_sync_completed"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:frozen_registry_sync_start"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:known_registry_data_maps"
+        },
+        {
+          "flow": "serverbound",
+          "id": "neoforge:known_registry_data_maps_reply"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        }
+      ],
+      "play": [
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_add_entity"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_container_set_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:advanced_open_screen"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:auxiliary_light_data"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:config_file"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:recipe_content"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:registry_data_map_sync"
+        },
+        {
+          "flow": null,
+          "id": "neoforge:split"
+        },
+        {
+          "flow": "clientbound",
+          "id": "neoforge:sync_attachments"
+        }
+      ]
+    }
+  },
+  "keyedBy": "neoforge line (the game axis of the build: neoForgeLoaderLocator.neoForgeBuildGameAxis)",
+  "schema": 1
+}
