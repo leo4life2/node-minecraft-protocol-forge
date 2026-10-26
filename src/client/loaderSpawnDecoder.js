@@ -274,18 +274,20 @@ function describeVersion (client, id) {
 function selectLoaderJar (client, options, family) {
   const paths = modsPathsOf(options)
   const mc = client.version || null
+  // HF113: the launcher tag of the mods folder (the resolve result's word) steers the library-layout rows the locator probes
+  const launcher = (options && options.launcher) || (client && client.minepalModsDir && client.minepalModsDir.launcher) || null
   const announced = announcedLoaderVersion(client, options, family)
   if (family === 'neoforge') {
     const preferred = (options && options.neoForgeServerBuild) || announced || null
     // HF100: the pick is keyed on the world game version; a foreign-game-version
     // build is read as a stamped guess (today's jar), never claimed as the running loader
-    const pick = pickNeoForgeLoaderJars(paths, { preferredVersion: preferred, mcVersion: mc })
+    const pick = pickNeoForgeLoaderJars(paths, { preferredVersion: preferred, mcVersion: mc, launcher })
     const claim = neoForgeLoaderClaimOf(pick)
-    const foreign = claim.jars.length ? [] : [...collectForgeUniversalJars(paths).keys()].filter((v) => !mc || v.startsWith(`${mc}-`)).map((v) => `forge ${v}`)
+    const foreign = claim.jars.length ? [] : [...collectForgeUniversalJars(paths, { launcher }).keys()].filter((v) => !mc || v.startsWith(`${mc}-`)).map((v) => `forge ${v}`)
     return { jar: claim.jars[0] || null, version: claim.version, matchedPreferred: pick.matchedPreferred, announced, paths, foreign, loaderClaim: claim.kind, loaderAbstain: claim.abstain }
   }
-  const pick = pickForgeLoaderJars(paths, { mcVersion: mc, preferredVersion: mc && announced ? `${mc}-${announced}` : null })
-  const foreign = pick.jars.length ? [] : [...collectNeoForgeUniversalJars(paths).keys()].map((v) => `neoforge ${v}`)
+  const pick = pickForgeLoaderJars(paths, { mcVersion: mc, preferredVersion: mc && announced ? `${mc}-${announced}` : null, launcher })
+  const foreign = pick.jars.length ? [] : [...collectNeoForgeUniversalJars(paths, { launcher }).keys()].map((v) => `neoforge ${v}`)
   return { jar: pick.jars[0] || null, version: pick.version, matchedPreferred: pick.matchedPreferred, announced, paths, foreign }
 }
 

@@ -30,6 +30,26 @@
 
 const fs = require('fs')
 const path = require('path')
+// HF113: where each launcher keeps the loader's universal jar relative to an
+// ancestor of the mods folder - DATA keyed by the launcher tag the mods-dir
+// resolver returns (vanilla, curseforge, prism, modrinth); relative segments only.
+const LAUNCHER_LIBRARY_LAYOUTS = Object.freeze(require('./data/launcherLibraryLayouts.json').layouts)
+
+/**
+ * HF113: the library roots to probe under one ancestor, as segment lists: the
+ * tagged launcher's rows first, then every distinct row of the table (an
+ * untagged mods folder probes every row - the layout is a fact of the host's
+ * launcher, never guessed from a path's words).
+ */
+function libraryLayoutRows (launcher) {
+  const rows = []
+  const seen = new Set()
+  const push = (segs) => { const key = segs.join('/'); if (!seen.has(key)) { seen.add(key); rows.push(segs) } }
+  const tagged = typeof launcher === 'string' ? LAUNCHER_LIBRARY_LAYOUTS[launcher] : null
+  for (const segs of tagged || []) push(segs)
+  for (const list of Object.values(LAUNCHER_LIBRARY_LAYOUTS)) for (const segs of list) push(segs)
+  return rows
+}
 
 /** Segment-wise numeric-aware version compare (non-numeric segments compare as strings). */
 function compareNeoForgeVersions (a, b) {
@@ -152,14 +172,17 @@ function neoForgeLoaderClaimOf (picked) {
 /**
  * Every neoforge universal jar reachable from the mods folder(s):
  * Map<version, jarPath>. First hit wins per version (nearest tree).
+ * HF113: options.launcher = the launcher tag of the mods folder (the layout
+ * table's rows for that tag are probed first; untagged probes every row).
  */
-function collectNeoForgeUniversalJars (modsPaths) {
+function collectNeoForgeUniversalJars (modsPaths, options = {}) {
   const found = new Map()
+  const rows = libraryLayoutRows(options && options.launcher) // HF113: the launcher's library layout rows
   for (const modsDir of modsPaths || []) {
     let dir = path.resolve(modsDir)
     for (let depth = 0; depth < 5; depth++) {
       dir = path.dirname(dir)
-      for (const libRoot of [path.join(dir, 'libraries'), path.join(dir, 'Install', 'libraries')]) {
+      for (const libRoot of rows.map((segs) => path.join(dir, ...segs))) {
         const neoRoot = path.join(libRoot, 'net', 'neoforged', 'neoforge')
         let versions = []
         try { versions = fs.readdirSync(neoRoot) } catch { continue }
@@ -192,7 +215,7 @@ function collectNeoForgeUniversalJars (modsPaths) {
 function pickNeoForgeLoaderJars (modsPaths, options = {}) {
   const preferred = options.preferredVersion || null
   const mc = options.mcVersion || null
-  const found = collectNeoForgeUniversalJars(modsPaths)
+  const found = collectNeoForgeUniversalJars(modsPaths, { launcher: options.launcher || null })
   if (found.size === 0) return { jars: [], version: null, matchedPreferred: false }
   if (preferred && found.has(preferred)) {
     return { jars: [found.get(preferred)], version: preferred, matchedPreferred: true }
@@ -220,13 +243,14 @@ function pickNeoForgeLoaderJars (modsPaths, options = {}) {
 // (vanilla launcher, CurseForge Install/libraries, dedicated servers).
 
 /** Every forge universal jar reachable from the mods folder(s): Map<'<mc>-<forge>', jarPath>. */
-function collectForgeUniversalJars (modsPaths) {
+function collectForgeUniversalJars (modsPaths, options = {}) {
   const found = new Map()
+  const rows = libraryLayoutRows(options && options.launcher) // HF113: the same layout table as the NeoForge walk
   for (const modsDir of modsPaths || []) {
     let dir = path.resolve(modsDir)
     for (let depth = 0; depth < 5; depth++) {
       dir = path.dirname(dir)
-      for (const libRoot of [path.join(dir, 'libraries'), path.join(dir, 'Install', 'libraries')]) {
+      for (const libRoot of rows.map((segs) => path.join(dir, ...segs))) {
         const root = path.join(libRoot, 'net', 'minecraftforge', 'forge')
         let versions = []
         try { versions = fs.readdirSync(root) } catch { continue }
@@ -255,7 +279,7 @@ function collectForgeUniversalJars (modsPaths) {
 function pickForgeLoaderJars (modsPaths, options = {}) {
   const preferred = options.preferredVersion || null
   const mc = options.mcVersion || null
-  const found = collectForgeUniversalJars(modsPaths)
+  const found = collectForgeUniversalJars(modsPaths, { launcher: options.launcher || null })
   if (found.size === 0) return { jars: [], version: null, matchedPreferred: false }
   if (preferred && found.has(preferred)) return { jars: [found.get(preferred)], version: preferred, matchedPreferred: true }
   const sameMc = [...found.keys()].filter((v) => !mc || v.startsWith(`${mc}-`))
@@ -265,6 +289,9 @@ function pickForgeLoaderJars (modsPaths, options = {}) {
 }
 
 module.exports = {
+  // HF113: the launcher library layout table + its row rule
+  LAUNCHER_LIBRARY_LAYOUTS,
+  libraryLayoutRows,
   collectNeoForgeUniversalJars,
   pickNeoForgeLoaderJars,
   compareNeoForgeVersions,

@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "about": "HF113: where each launcher keeps the loader's universal jar relative to an ancestor of the instance's mods folder (the roots probed under <ancestor>/<segments>/net/neoforged/neoforge/<build>/ and net/minecraftforge/forge/<build>/). Keyed by the launcher tag modsDirResolver returns on its resolve result; an untagged mods folder probes every distinct row. Relative segments only.",
+  "layouts": {
+    "vanilla": [["libraries"]],
+    "curseforge": [["Install", "libraries"]],
+    "prism": [["libraries"]],
+    "modrinth": [["meta", "libraries"]]
+  }
+}
