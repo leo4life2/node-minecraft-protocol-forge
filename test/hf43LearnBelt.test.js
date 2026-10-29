@@ -65,6 +65,25 @@ describe('HF43 learn belt (lib)', function () {
     assert.strictEqual(by['m:main/4'].kind, 'other')
   })
 
+  it('HF118: a learned row stamped noFlow (the server declares no flow) clears the derived flow; without the stamp the derived flow stands byte for byte', () => {
+    const claimOf = (learnedPlay) => {
+      const c = makeClient()
+      installNeoForgeConfigNegotiation(c, {
+        components: { configuration: [], play: [{ id: 'm:sync', version: '1', flow: 'clientbound', optional: false }] },
+        learnedComponents: { configuration: [], play: learnedPlay },
+        pongHoldMs: 20
+      })
+      c.emit('packet', { channel: 'neoforge:register', data: Buffer.from([0]) }, meta)
+      return { c, reply: c.writes.find((w) => w.name === 'custom_payload' && w.params.channel === 'neoforge:register').params.data }
+    }
+    const bare = claimOf([])
+    const plain = claimOf([{ id: 'm:sync', version: '1', flow: null, optional: true, learnedFrom: 'named_missing' }])
+    assert.ok(Buffer.from(plain.reply).equals(Buffer.from(bare.reply)), 'a learned row with no flow and no stamp leaves the derived tuple as it was')
+    const cleared = claimOf([{ id: 'm:sync', version: '1', flow: null, noFlow: true, optional: true, learnedFrom: 'flow_missing' }])
+    assert.deepStrictEqual(decodeNetworkQuery(cleared.reply).play, [{ id: 'm:sync', version: '1', flow: null, optional: false }])
+    assert.strictEqual(cleared.c.neoForgeConfig.claimed.play[0].flow, null, 'the receipt carries the claim as sent')
+  })
+
   it('learned rows ride the claim STAMPED learned (never as derived), are receipted, and their payloads are dropped and counted', () => {
     const c = makeClient()
     installNeoForgeConfigNegotiation(c, {

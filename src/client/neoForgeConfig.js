@@ -797,7 +797,9 @@ function installNeoForgeConfigNegotiation (client, options = {}) {
         const lVersion = typeof row.version === 'string' && row.version !== '' ? row.version : null
         const changes = []
         if (lVersion !== null && derived.version !== lVersion) { changes.push(`version ${derived.version} -> ${lVersion}`); derived.version = lVersion }
-        if (lFlow !== null && derived.flow !== lFlow) { changes.push(`flow ${derived.flow} -> ${lFlow}`); derived.flow = lFlow }
+        // HF118: the server's flow.server.* rule taught that it declares NO flow
+        // for this channel (the learner stamps noFlow) - the derived flow goes
+        if (lFlow !== null && derived.flow !== lFlow) { changes.push(`flow ${derived.flow} -> ${lFlow}`); derived.flow = lFlow } else if (lFlow === null && row.noFlow === true && derived.flow) { changes.push(`flow ${derived.flow} -> none`); derived.flow = null }
         if (changes.length > 0) {
           derived.learnedOverDerived = true
           derived.source = `learned-over-derived:${row.learnedFrom || 'server'} (${changes.join(', ')}; was ${derived.source || 'derived'})`
