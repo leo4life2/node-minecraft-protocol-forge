@@ -170,3 +170,73 @@ describe('HF43 — 26.1 Identifier rename + string-helper chains + mod-presence 
     assert.strictEqual(claimSha(deriveNeoForgeComponents([path.join(FX, 'hf51-securitycraft-1.10.2.1.trimmed.jar')])), 'c83b535ded0e0b66')
   })
 })
+
+// HF127 R2 - THE PLATFORM-SERVICE PRESENCE BRANCH (f67: 24 of 30 refusals):
+// a mod constructor asks its own platform service whether another mod is
+// loaded (invokeinterface <IPlatform>.isModLoaded(String)Z; ifeq) and only
+// then subscribes a payload listener. The jar's own service implementation
+// (META-INF/services) reaches ModList.isLoaded, so the branch is a presence
+// gate: the listener's channel is claimed only when the named mod is in the
+// pack. Fixture: the REAL jar trimmed (test/fixtures/hf127-trim-jars.mjs) +
+// a manifest-only jar naming the gated mod.
+const ELYTRA = path.join(FX, 'hf127-elytraslot-neoforge-9.0.2+1.21.1.trimmed.jar')
+const PRESENCE_STUB = path.join(FX, 'hf127-presence-stub.jar')
+const BOOST = 'elytraslot:soul_elytra_boost'
+const MOD_CLASS = 'com/illusivesoulworks/elytraslot/ElytraSlotNeoForgeMod.class'
+function flipPresenceBranch (buf) { // ifeq -> ifne right after the service probe: the negated test of the same probe
+  const out = []
+  let flipped = 0
+  for (const e of zipCentralEntries(buf)) {
+    if (e.name.endsWith('/')) continue
+    let data = zipEntryData(buf, e)
+    if (e.name === MOD_CLASS) {
+      data = Buffer.from(data)
+      for (let i = 0; i + 9 < data.length; i++) if (data[i] === 0xb9 && data[i + 3] === 2 && data[i + 4] === 0 && data[i + 5] === 0x99 && data[i + 9] === 0xb8) { data[i + 5] = 0x9a; flipped++ } // the probe, ifeq over `aload_1; invokestatic <Plugin>.setup`
+    }
+    out.push({ name: e.name, data })
+  }
+  assert.strictEqual(flipped, 1, 'one presence branch flipped')
+  return buildJar(out)
+}
+
+describe('HF127 — the platform-service presence branch gates the listener it subscribes', function () {
+  this.timeout(60000)
+  const gateOf = (r) => r.diagnostics.presenceGates.filter((g) => g.kind === 'mod_presence' && g.modId === 'deeperdarker')
+
+  it('the gated mod absent from the pack: the listener channel is NOT claimed, the gate is receipted present=false and the abstain names the mod', () => {
+    const r = deriveNeoForgeComponents([ELYTRA])
+    assert.ok(!ids(r).includes(BOOST), ids(r).join(','))
+    const g = gateOf(r)
+    assert.strictEqual(g.length, 1, JSON.stringify(r.diagnostics.presenceGates))
+    assert.strictEqual(g[0].present, false); assert.strictEqual(g[0].whenPresent, true); assert.strictEqual(g[0].claimed, false)
+    assert.ok(/IPlatform\.isModLoaded -> NeoForgePlatform \(services file\) -> ModList\.isLoaded/.test(g[0].probe), g[0].probe)
+    assert.ok(r.diagnostics.abstains.some((a) => /DeeperDarkerPlugin\.registerPayloads: registrations gated on mod presence/.test(a) && /"deeperdarker" is not in the jar census/.test(a)), r.diagnostics.abstains.join(' | '))
+  })
+
+  it('the gated mod present (a manifest-only jar naming it): the channel IS claimed as before, the gate receipted present=true', () => {
+    const r = deriveNeoForgeComponents([ELYTRA, PRESENCE_STUB])
+    const c = r.components.play.find((x) => x.id === BOOST)
+    assert.ok(c, ids(r).join(','))
+    assert.strictEqual(c.flow, 'serverbound'); assert.strictEqual(c.version, 'elytraslot'); assert.strictEqual(c.optional, false)
+    const g = gateOf(r)
+    assert.strictEqual(g.length, 1); assert.strictEqual(g[0].present, true); assert.strictEqual(g[0].claimed, true)
+  })
+
+  it('the negated branch (ifne: the listener runs only when the mod is NOT loaded) is the same rule mirrored, never inverted', () => {
+    const neg = tmpJar('ely-negated.jar', flipPresenceBranch(fs.readFileSync(ELYTRA)))
+    const absent = deriveNeoForgeComponents([neg])
+    assert.ok(ids(absent).includes(BOOST), 'claimed when the mod is absent')
+    assert.strictEqual(gateOf(absent)[0].whenPresent, false)
+    const present = deriveNeoForgeComponents([neg, PRESENCE_STUB])
+    assert.ok(!ids(present).includes(BOOST), 'not claimed when the mod is present')
+    assert.strictEqual(gateOf(present)[0].claimed, false)
+  })
+
+  it('RED control: a service implementation that does not reach a loader presence probe is not a gate (the claim stays as before)', () => {
+    const m = mutateJar(fs.readFileSync(ELYTRA), { rewrite: (p, s) => (/NeoForgePlatform\.class$/.test(p) && s === 'net/neoforged/fml/ModList' ? 'net/neoforged/fml/ModLisX' : undefined) })
+    assert.ok(m.changed >= 1)
+    const r = deriveNeoForgeComponents([tmpJar('ely-noprobe.jar', m.buf)])
+    assert.ok(ids(r).includes(BOOST), ids(r).join(','))
+    assert.deepStrictEqual(gateOf(r), [])
+  })
+})

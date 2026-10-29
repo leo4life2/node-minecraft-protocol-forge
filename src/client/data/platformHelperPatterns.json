@@ -36,6 +36,65 @@
         }
       ],
       "notCited": "the currency mod of Case B (6 ids, MEconomy-1.0.5-NeoForge-1.21.1-1.21.7.jar sha1 069aead5d010dfde1c85a144482771d07257eb18) registers through the same helper but its jar is not on the mod-distribution host the lane may reach; its ids are learned by the belt as before"
+    },
+    {
+      "shape": "list-provider",
+      "providerDesc": "()Ljava/util/List;",
+      "entry": "a method taking the payload-registration event (HF127) that takes the registrar at a constant String (registrar(String) / versioned(String)), invokes a static no-argument in-index provider of that descriptor, iterates the returned list (List.iterator / Iterator.next) and hands each element's TypeAndCodec.type() to a PayloadRegistrar play* / configuration* / common* method",
+      "providerRule": "PROVEN STATIC from the provider bytes: only new TypeAndCodec(getstatic <message>.<Type field>, getstatic <message>.<codec field>) elements handed to one List.of (fixed or varargs arity), then areturn; any other instruction = the list is not proven static and the loop abstains by name",
+      "idRule": "list-provider",
+      "idRuleReads": "each element's Type field id read off its message class static initializer (ldc <path>; invokestatic <mod>.<helper>(String)ResourceLocation through resolveNamespaceHelper, or fromNamespaceAndPath / parse) - the same field read as the consumer-registrar row",
+      "versionRule": "registrar-string-constant",
+      "versionRuleReads": "the one constant String handed to registrar(String) / versioned(String) in the method; none or several distinct = abstain",
+      "flowRule": "the PayloadRegistrar method the loop invokes (REGISTRATION_METHODS); optional only when PayloadRegistrar.optional() is invoked in the method",
+      "sourceWord": "list-provider",
+      "cited": [
+        {
+          "jar": "scholar-neoforge-1.21.1-1.2.10.jar",
+          "sha256": "dd904e9cb225caad879962576af167129ae92a4b92305e48081387717be82c7d",
+          "url": "https://cdn.modrinth.com/data/fX4dIQCo/versions/ZIsoNOTJ/scholar-neoforge-1.21.1-1.2.10.jar",
+          "fixture": "hf127-scholar-neoforge-1.21.1-1.2.10.trimmed.jar",
+          "entryBytes": "io/github/mortuusars/scholar/neoforge/event/NeoForgeCommonEvents.registerPackets(RegisterPayloadHandlersEvent): ldc \"1\"; invokevirtual RegisterPayloadHandlersEvent.registrar(String); three loops: invokestatic S2CPackets/C2SPackets/CommonPackets.getDefinitions()List; List.iterator; Iterator.next; checkcast TypeAndCodec; TypeAndCodec.type(); TypeAndCodec.codec(); invokedynamic handle; PayloadRegistrar.playToClient / playToServer / playBidirectional",
+          "providerBytes": "C2SPackets.getDefinitions: 8 x (new TypeAndCodec; dup; getstatic <Msg>C2SP.TYPE; getstatic <Msg>C2SP.STREAM_CODEC; invokespecial TypeAndCodec.<init>); invokestatic List.of(8 args); areturn. S2CPackets / CommonPackets.getDefinitions: invokestatic List.of(); areturn (empty)",
+          "messageBytes": "LecternEditBookC2SP.<clinit>: ldc_w \"lectern_edit_book\"; invokestatic Scholar.resource(String)ResourceLocation (ldc \"scholar\"; aload_0; ResourceLocation.fromNamespaceAndPath); putstatic ID; new CustomPacketPayload$Type(ID); putstatic TYPE",
+          "decides": "the 8 scholar:* serverbound ids at version 1 of the f67 refusal (4 of them named by the host)"
+        }
+      ]
+    },
+    {
+      "shape": "builder-counter",
+      "entryArgs": "(Ljava/lang/String;)",
+      "entry": "a static call taking one constant String (the mod id) and returning an in-index builder interface, immediately chained (invokeinterface on that builder) with the mod's registrations (HF127)",
+      "helperRules": "READ from the helper bytes and VERIFIED before any row: the builder's sole implementation constructor builds the channel fromNamespaceAndPath(<mod id>, ldc <path>), one LinkedHashMap per registration kind and an AtomicInteger; each builder method feeds one map (through interface defaults, depth 2); a ()V body reads every map in a fixed order (the numbering order); a (String)String lambda reads the counter's getAndIncrement into a concat recipe and a withPath over the channel uses it; the sole concrete subclass takes event.registrar(channel.toLanguageKey()), invokes PayloadRegistrar.optional() only after reading the builder's optional flag, and registers through ONE PayloadRegistrar method",
+      "idRule": "builder-counter",
+      "idRuleReads": "<mod id>:<the recipe folded over (channel path, n)>, n counted over the consumer chain's registrations map by map in the freeze order, insertion order inside each map",
+      "versionRule": "channel-language-key",
+      "versionRuleReads": "<mod id>.<channel path> (ResourceLocation.toLanguageKey)",
+      "flowRule": "the one PayloadRegistrar method of the concrete handler (REGISTRATION_METHODS); optional only when the consumer chain calls the builder method that sets the flag",
+      "sourceWord": "builder-counter",
+      "cited": [
+        {
+          "jar": "puzzleslib-v21.1.66-mc1.21.1+neoforge.jar",
+          "sha256": "cb02de7e1d4a133746ec7b43a64eddc2cb621122cdc49e134a15272f456c31f2",
+          "fixture": "hf127-puzzleslib-v21.1.66-mc1.21.1+neoforge.trimmed.jar",
+          "helperBytes": "fuzs/puzzleslib/impl/network/NetworkHandlerRegistryImpl.<init>(String): new IdentityHashMap; new LinkedHashMap -> clientboundMessages; new LinkedHashMap -> serverboundMessages; new AtomicInteger -> discriminator; aload_1 ldc \"play\" fromNamespaceAndPath -> channelName. freeze(): clientboundMessages then serverboundMessages. lambda$registerMessageType$3(String): discriminator.getAndIncrement(); makeConcatWithConstants(String,I). NeoForgeNetworkHandler.lambda$freeze$10: channelName.toLanguageKey(); event.registrar(String); optional ifeq -> PayloadRegistrar.optional(); register(): PayloadRegistrar.playBidirectional",
+          "decides": "puzzleslib:play/0 (optional builder) on the library itself"
+        },
+        {
+          "jar": "EasyMagic-v21.1.4-1.21.1-NeoForge.jar",
+          "sha256": "e641a83dcd0dd1a66c545069a706349df94f5b64dc5a252944596439009a699f",
+          "fixture": "hf127-EasyMagic-v21.1.4-1.21.1-NeoForge.trimmed.jar",
+          "consumerBytes": "fuzs/easymagic/EasyMagic.<clinit>: ldc \"easymagic\"; invokestatic NetworkHandler.builder(String)Builder; registerSerializer(Class, StreamCodec); registerClientbound(ClientboundEnchantmentCluesMessage.class); putstatic NETWORK",
+          "decides": "easymagic:play/0 (named by the host in the f67 refusal)"
+        },
+        {
+          "jar": "EasyAnvils-v21.1.0-1.21.1-NeoForge.jar",
+          "sha256": "dcd0e562710a639b4fdd60a7500dc9404c6fbd1007215a088248ce1c57ccc6dc",
+          "fixture": "hf127-EasyAnvils-v21.1.0-1.21.1-NeoForge.trimmed.jar",
+          "consumerBytes": "fuzs/easyanvils/EasyAnvils.<clinit>: ldc \"easyanvils\"; NetworkHandler.builder; registerLegacyClientbound x2 / registerLegacyServerbound x2 interleaved (Supplier and StreamDecoder overloads)",
+          "decides": "easyanvils:play/0..3, clientbound first (play/2 named by the host in the f67 refusal)"
+        }
+      ]
     }
   ]
 }

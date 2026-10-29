@@ -2098,6 +2098,25 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         if (takeJump) jump(target)
         return
       }
+      if (flag && flag.k === 'modpresent') {
+        // HF127: a branch a mod-presence probe decides. Each arm is walked
+        // under a mod_presence gate scope carrying the condition it runs
+        // under (whenPresent true / false); the entry pass claims a listener
+        // gated there only when the pack census meets that condition. The arm
+        // that LEAVES AT ONCE registers nothing, so the continuation past the
+        // jump target belongs to the other condition:
+        //   ifeq (fallthrough = present): `if (present) { setup() }` -> the
+        //     fallthrough [next, target) under whenPresent; `if (present) return;`
+        //     -> the target onward under whenPresent=false.
+        //   ifne (fallthrough = absent): the mirror image.
+        const sc = state.jvmGateScopes || (state.jvmGateScopes = [])
+        const gateOf = (whenPresent) => ({ kind: 'mod_presence', modId: flag.modId, holder: flag.holder, probe: flag.probe, site: `${classInfo.className}.${method.method}`, whenPresent })
+        const fallthroughLeaves = armLeavesAtOnce(code, next) || armThrowsImmediately(code, next, cp)
+        const fallthroughPresent = flag.trueArm === 'fallthrough'
+        if (fallthroughLeaves) { sc.push({ gate: gateOf(!fallthroughPresent), frame, lo: target, hi: Infinity }); jump(target) } else sc.push({ gate: gateOf(fallthroughPresent), frame, lo: next, hi: target })
+        if (opts.walk) opts.walk.undecided = true
+        return
+      }
       if (flag && flag.k === 'jvmflag') {
         // HF106: a branch a JVM flag decides - the flag's TRUE arm is walked
         // under a jvm_property gate scope, the FALSE arm (a player's game: the
@@ -2385,12 +2404,12 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       case 0xc8: jump(pc + code.readInt32BE(pc + 1)); break // goto_w
       case 0x99: { // ifeq
         const v = stack.pop()
-        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v === 0, v && v.k === 'jvmflag' ? { ...v, trueArm: 'fallthrough' } : null)
+        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v === 0, v && (v.k === 'jvmflag' || v.k === 'modpresent') ? { ...v, trueArm: 'fallthrough' } : null)
         break
       }
       case 0x9a: { // ifne
         const v = stack.pop()
-        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v !== 0, v && v.k === 'jvmflag' ? { ...v, trueArm: 'jump' } : null)
+        condBranch(pc + code.readInt16BE(pc + 1), v && v.k === 'int', v && v.k === 'int' && v.v !== 0, v && (v.k === 'jvmflag' || v.k === 'modpresent') ? { ...v, trueArm: 'jump' } : null)
         break
       }
       case 0x9b: case 0x9c: case 0x9d: case 0x9e: { // iflt/ge/gt/le
@@ -2482,6 +2501,11 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // routes through the ordinary registrar recognition).
   if (recv && recv.k === 'lambda' && (!recv.sam || ref.name === recv.sam)) {
     return invokeLambda(index, state, opts, recv, argVals, push, hooks)
+  }
+  // HF127: a platform-service presence probe with a constant mod id -> a tagged value (see servicePresenceProbeOf)
+  if (callKind !== 'static' && ref.desc === '(Ljava/lang/String;)Z' && argVals.length === 1 && argVals[0] && argVals[0].k === 'str' && index.get(ref.owner)) {
+    const probe = servicePresenceProbeOf(index, state, ref)
+    if (probe) { push({ k: 'modpresent', modId: String(argVals[0].v), holder: ref.owner, probe }); return true }
   }
   // HF37 collection walk: forEach over a jar-populated collection applies
   // the consumer lambda to every populated element (bounded by the
@@ -3737,6 +3761,81 @@ const PRESENCE_PROBE_METHODS = new Set(['isLoaded', 'getModContainerById', 'getM
 const GATE_LAMBDA_DEPTH = 4
 const ALWAYS_PRESENT_MOD_IDS = new Set(['minecraft', 'neoforge', 'forge'])
 
+// HF127: THE PLATFORM-SERVICE PRESENCE PROBE (javap-verified on a
+// multi-loader mod's NeoForge build): a mod constructor asks its OWN platform
+// service whether another mod is loaded and only then runs a static setup
+// that subscribes a payload listener -
+//   getstatic <Services>.PLATFORM; ldc "<modid>";
+//   invokeinterface <IPlatform>.isModLoaded(String)Z; ifeq ...; invokestatic <Plugin>.setup(bus)
+// The interface call is a presence probe when the jar's own implementation of
+// it (the META-INF/services row for that interface, else its sole in-index
+// implementor) reaches a loader presence probe (PRESENCE_PROBE_OWNERS x
+// PRESENCE_PROBE_METHODS) in its body, followed through its lambdas and
+// in-index calls (bounded by GATE_LAMBDA_DEPTH). The evaluator then tags the
+// result ({k:'modpresent'}) and the branch it decides walks its arms under a
+// mod_presence gate scope (condBranch), so a listener subscribed in the arm is
+// gated on the pack census for the entry pass instead of fired - claimed only
+// when the arm's condition holds for that census. No mod name is read here.
+function presenceReachOf (index, info, m, depth, seen) {
+  if (!info || !m || !m.code || depth > GATE_LAMBDA_DEPTH) return null
+  const key = `${info.className}.${m.method}${m.desc}`
+  if (seen.has(key)) return null
+  seen.add(key)
+  let found = null
+  const follow = []
+  walkLinear(m.code, info.cp, (op, pc, cp, code) => {
+    if (found) return
+    if (op === 0xb6 || op === 0xb7 || op === 0xb8 || op === 0xb9) {
+      const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+      if (!ref) return
+      if (PRESENCE_PROBE_OWNERS.has(ref.owner) && PRESENCE_PROBE_METHODS.has(ref.name)) found = `${ref.owner.split('/').pop()}.${ref.name}`
+      else if (index.get(ref.owner)) follow.push(ref)
+    } else if (op === 0xba && info.bootstrapMethods) {
+      const c = cp[code.readUInt16BE(pc + 1)]
+      const impl = c ? resolveLambdaImpl(info, c.bsmIndex) : null
+      if (impl && impl.refKind >= 5 && impl.refKind <= 9 && index.get(impl.owner)) follow.push(impl)
+    }
+  })
+  if (found) return found
+  for (const ref of follow) {
+    const tInfo = index.get(ref.owner)
+    const tm = tInfo && tInfo.codes.find((c) => c.method === ref.name && c.desc === ref.desc && c.code)
+    const r = presenceReachOf(index, tInfo, tm, depth + 1, seen)
+    if (r) return r
+  }
+  return null
+}
+
+function servicePresenceProbeOf (index, state, ref) {
+  const cache = state.servicePresenceProbes || (state.servicePresenceProbes = new Map())
+  const key = `${ref.owner}.${ref.name}${ref.desc}`
+  if (cache.has(key)) return cache.get(key)
+  cache.set(key, null)
+  const own = index.get(ref.owner)
+  if (!own || own.codes.some((c) => c.method === ref.name && c.desc === ref.desc && c.code)) return null // a concrete body is not a service interface method
+  let impls = [...new Set((index.services && index.services.get(ref.owner)) || [])]
+  let via = 'services file'
+  if (impls.length === 0) {
+    const needle = Buffer.from(ref.owner)
+    impls = []
+    for (const name of index.raw.keys()) {
+      const bytes = index.rawBytes(name)
+      if (!bytes || !bytes.includes(needle)) continue
+      const info = index.get(name)
+      if (info && (info.interfaces || []).includes(ref.owner)) impls.push(name)
+    }
+    via = 'sole implementor'
+  }
+  if (impls.length !== 1) return null // none or ambiguous: the call stays unknown
+  const implInfo = index.get(impls[0])
+  const m = implInfo && implInfo.codes.find((c) => c.method === ref.name && c.desc === ref.desc && c.code)
+  const reach = presenceReachOf(index, implInfo, m, 0, new Set())
+  if (!reach) return null
+  const probe = `${ref.owner.split('/').pop()}.${ref.name} -> ${impls[0].split('/').pop()} (${via}) -> ${reach}`
+  cache.set(key, probe)
+  return probe
+}
+
 function presenceProbeOf (info) {
   let found = null
   for (const m of info.codes) {
@@ -4083,7 +4182,7 @@ function deriveModRootRegistrations (index, state, record) {
 
 function seedNamesOf (index, state) { return index.seedNames ? index.seedNames() : state.allClassNames }
 
-function gateKeyOf (gate) { return gate ? (gate.kind === 'jvm_property' ? `jvm_property|${gate.probe}|${gate.site}` : `${gate.modId}|${gate.holder}|${gate.probe}|${gate.site}`) : null }
+function gateKeyOf (gate) { return gate ? (gate.kind === 'jvm_property' ? `jvm_property|${gate.probe}|${gate.site}` : gate.kind === 'mod_presence' ? `mod_presence|${gate.modId}|${gate.whenPresent}|${gate.probe}|${gate.site}` : `${gate.modId}|${gate.holder}|${gate.probe}|${gate.site}`) : null }
 
 function freshDerivationState (read, diagnostics, deps = null) {
   const versionByModId = deps
@@ -4284,15 +4383,27 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // never registered on a player's game); the mod-presence kind stays an
     // instance-hosted fact as before. A listener method gated by name wins.
     const isStaticEntry = (method.flags & 0x0008) !== 0
-    const gateRow = presenceGates.get(`${info.className}#${method.method}${method.desc}`) || presenceGates.get(info.className) || null
-    const gate = isStaticEntry ? ((gateRow && gateRow.kind === 'jvm_property') ? gateRow : null) : gateRow
-    if (!isStaticEntry || gate) deps.gates[info.className] = gateKeyOf(gate)
+    const methodGateKey = `${info.className}#${method.method}${method.desc}`
+    const gateRow = presenceGates.get(methodGateKey) || presenceGates.get(info.className) || null
+    // HF127: a static listener subscribed under a mod-presence branch (mod_presence, keyed by its method) is gated as the jvm_property kind is
+    const gate = isStaticEntry ? ((gateRow && (gateRow.kind === 'jvm_property' || gateRow.kind === 'mod_presence')) ? gateRow : null) : gateRow
+    if (gate && gate.kind === 'mod_presence') deps.gates[methodGateKey] = gateKeyOf(gate)
+    else if (!isStaticEntry || gate) deps.gates[info.className] = gateKeyOf(gate)
+    if (gate && gate.kind === 'mod_presence') {
+      const present = censusHas(gate.modId)
+      const claimed = gate.whenPresent ? present : !present
+      diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, kind: 'mod_presence', modId: gate.modId, present, whenPresent: gate.whenPresent, claimed, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
+      if (!claimed) {
+        diagnostics.abstains.push(`${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} subscribes it only when ${gate.probe} answers ${gate.whenPresent ? 'loaded' : 'not loaded'} for "${gate.modId}", and "${gate.modId}" is ${present ? '' : 'not '}in the jar census — not claimed`)
+        continue
+      }
+    }
     if (gate && gate.kind === 'jvm_property') {
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, kind: 'jvm_property', present: false, probe: gate.probe, gateSite: gate.site })
       diagnostics.abstains.push(`${info.className}.${method.method}: registrations gated on a JVM flag — ${gate.site} subscribes it only under a jvm_property read by ${gate.probe}; a launch flag is absent on a player's game (client and integrated server alike), so its channels are left unclaimed`)
       continue
     }
-    if (gate) {
+    if (gate && gate.kind !== 'mod_presence') {
       const present = censusHas(gate.modId)
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, modId: gate.modId, present, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
       if (!present) {

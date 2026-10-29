@@ -1,0 +1,44 @@
+{
+  "hf127-scholar-neoforge-1.21.1-1.2.10.trimmed.jar": {
+    "original": "scholar-neoforge-1.21.1-1.2.10.jar",
+    "original_sha256": "dd904e9cb225caad879962576af167129ae92a4b92305e48081387717be82c7d",
+    "url": "https://cdn.modrinth.com/data/fX4dIQCo/versions/ZIsoNOTJ/scholar-neoforge-1.21.1-1.2.10.jar",
+    "entries": 14,
+    "sha256": "db0a910732dfd9908a947b9c1225f3a13f9c3990c3dbe84db94946d49edb5f06"
+  },
+  "hf127-elytraslot-neoforge-9.0.2+1.21.1.trimmed.jar": {
+    "original": "elytraslot-neoforge-9.0.2+1.21.1.jar",
+    "original_sha256": "d86adf384390c40b144a296ef4fc11b72fd81e2780b264bd9ceb7b5ab9147399",
+    "url": "https://cdn.modrinth.com/data/mSQF1NpT/versions/RX6A02W1/elytraslot-neoforge-9.0.2%2B1.21.1.jar",
+    "entries": 8,
+    "sha256": "9cbf4ba6b6e05534f30f5016febd23ea524bda8c8346ea6cba2751958295b524"
+  },
+  "hf127-puzzleslib-v21.1.66-mc1.21.1+neoforge.trimmed.jar": {
+    "original": "puzzleslib-v21.1.66-mc1.21.1+neoforge.jar",
+    "original_sha256": "cb02de7e1d4a133746ec7b43a64eddc2cb621122cdc49e134a15272f456c31f2",
+    "url": "https://cdn.modrinth.com/data/QAGBst4M/versions/kmN5PWk9/puzzleslib-v21.1.66-mc1.21.1%2Bneoforge.jar",
+    "entries": 6,
+    "sha256": "5da5fb8ec9b37ce81694725f078b754095f2c652ae9b7e91393e88d86ec50d94"
+  },
+  "hf127-EasyMagic-v21.1.4-1.21.1-NeoForge.trimmed.jar": {
+    "original": "EasyMagic-v21.1.4-1.21.1-NeoForge.jar",
+    "original_sha256": "e641a83dcd0dd1a66c545069a706349df94f5b64dc5a252944596439009a699f",
+    "url": "https://cdn.modrinth.com/data/9hx3AbJM/versions/MxbfrOEv/EasyMagic-v21.1.4-1.21.1-NeoForge.jar",
+    "entries": 3,
+    "sha256": "bd1076dd48129ba0627ae84a66827f7de6968cbf4e1d7a9769382c47bb680077"
+  },
+  "hf127-EasyAnvils-v21.1.0-1.21.1-NeoForge.trimmed.jar": {
+    "original": "EasyAnvils-v21.1.0-1.21.1-NeoForge.jar",
+    "original_sha256": "dcd0e562710a639b4fdd60a7500dc9404c6fbd1007215a088248ce1c57ccc6dc",
+    "url": "https://cdn.modrinth.com/data/OZBR5JT5/versions/fSQSKhdF/EasyAnvils-v21.1.0-1.21.1-NeoForge.jar",
+    "entries": 2,
+    "sha256": "4c024db1a9f693d2b018f443b8dbf42ca9950aa326e960cf1c405601f0564037"
+  },
+  "hf127-presence-stub.jar": {
+    "original": null,
+    "original_sha256": null,
+    "url": null,
+    "entries": 1,
+    "sha256": "a8ce00f58be58f41ec8c160b1a0f1c001dcd2e161aef73de7bf59a80a81f17d7"
+  }
+}
