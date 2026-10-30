@@ -494,10 +494,33 @@ function simulate (index, classInfo, method, state, opts = {}) {
   // `.optional()` is then unproven, never a false optional)
   opts.walk = opts.walk || {}
   const undecidedOnEntry = !!opts.walk.undecided
+  // HF130: the linear walk keeps the JVM's stack discipline across a
+  // conditional (the compared operands are popped) and a value-select whose
+  // arms REJOIN before the next registrar call walks ONE arm: the fallthrough
+  // arm ends in a forward goto to the join point and the other arm holds no
+  // registrar call (`playToClient(TYPE, CODEC, dist == CLIENT ? h1 : h2)` - the
+  // test picks a HANDLER, the registration is unconditional). Before, both
+  // arms' values piled onto the stack and the registrar call read its receiver
+  // and arguments two slots off - the registration silently dropped, no
+  // abstain. An arm that holds a registrar call is never skipped: it is walked
+  // through under the HF51 undecided flag exactly as before.
+  const arms = [] // forward conditional targets not yet passed
+  let skipTo = -1
   walkLinear(code, cp, (op, pc) => {
+    if (pc < skipTo) return
     // HF51: the linear walk decides no branch — an `.optional()` met past a
     // conditional is not a proven optional (see the registrar model)
-    if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) opts.walk.undecided = true
+    if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) {
+      opts.walk.undecided = true
+      pop(op >= 0x9f && op <= 0xa6 ? 2 : 1)
+      const target = pc + code.readInt16BE(pc + 1)
+      if (target > pc) arms.push(target)
+    }
+    if ((op === 0xa7 || op === 0xc8) && arms.length > 0) {
+      const target = pc + (op === 0xa7 ? code.readInt16BE(pc + 1) : code.readInt32BE(pc + 1))
+      const join = arms.filter((j) => j > pc && j <= target).sort((a, b) => b - a)[0]
+      if (join !== undefined && armRegistersNothing(code, cp, join, target)) skipTo = target
+    }
     switch (op) {
       case 0x01: push(UNKNOWN); break // aconst_null
       case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07: case 0x08:
@@ -708,8 +731,27 @@ function storeLookup (index, state, recv, keyId) {
   const populatedHere = recv.entries && recv.entries.length > 0
   return populatedHere || storeWriterKnown(index, state, recv) ? { k: 'null' } : UNKNOWN
 }
+// HF130: a store key or element read from ANOTHER class's static field is the
+// value that class's own initializer assigned - a payload class's TYPE handed
+// to a mod's static forwarder (`addNetworkMessage(TYPE, codec, handler)` ->
+// `MESSAGES.put(type, ..)`) keys the entry by the real id, so the registrar
+// callback that walks the map later receives the id, not an opaque key.
+// Resolved through the static-field family (Type, String, ResourceLocation).
+function resolveStoreKey (index, v, state) {
+  if (!v || v.k !== 'field') return v
+  const t = resolveTypeValue(index, v, state)
+  if (t !== null) return { k: 'type', v: t }
+  const s = resolveStringValue(index, v, state)
+  if (s !== null) return vStr(s)
+  const r = resolveReslocValue(index, v, state)
+  if (r !== null) return vResloc(r)
+  return v
+}
 function storeInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}) {
   if (!recv || !STORE_OWNER(ref.owner)) return false
+  argVals = argVals.slice()
+  if (argVals.length > 0) argVals[0] = resolveStoreKey(index, argVals[0], state) // HF130: the key / element position
+  if (argVals.length > 2 && ref.name === 'put') argVals[1] = resolveStoreKey(index, argVals[1], state) // a Table's column key
   if (recv.k === 'entry') {
     if (ref.name === 'getKey' && argVals.length === 0) { push(recv.key ?? UNKNOWN); return true }
     if (ref.name === 'getValue' && argVals.length === 0) { push(recv.value ?? UNKNOWN); return true }
@@ -1893,6 +1935,17 @@ function bindCtorFields (index, state, obj) {
 // with the condition unknown, prefer the arm that does not immediately
 // throw, so validation guards don't silently kill the harvest.)
 // the arm's first instruction ends the path (a return) or jumps away (goto)
+// HF130: true when the bytes [lo, hi) hold no registrar call - the other arm
+// of a value-select is a handler / codec pick, never a registration.
+function armRegistersNothing (code, cp, lo, hi) {
+  let registers = false
+  walkLinear(code, cp, (op, pc) => {
+    if (registers || pc < lo || pc >= hi || op < 0xb6 || op > 0xb9) return
+    const ref = cpRef(cp, code.readUInt16BE(pc + 1))
+    if (ref && (REGISTRATION_METHODS[ref.name] || ref.owner === REGISTRAR_TYPE)) registers = true
+  })
+  return !registers
+}
 function armLeavesAtOnce (code, startPc) {
   const op = code[startPc]
   return op === 0xb1 || op === 0xb0 || op === 0xac || op === 0xad || op === 0xae || op === 0xaf || op === 0xa7 || op === 0xc8
@@ -2512,6 +2565,15 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // population cap and the step budgets).
   if (recv && (recv.k === 'obj' || recv.k === 'collection' || recv.k === 'varr') && ref.name === 'forEach' &&
       argVals.length === 1 && argVals[0] && argVals[0].k === 'lambda') {
+    // HF130: Map.forEach takes a BiConsumer - every ENTRY hands (key, value)
+    // to the lambda (`MESSAGES.forEach((type, msg) -> registrar.playBidirectional(
+    // type, ..))`, the MCreator idiom). Before, the value alone was handed as
+    // to a Consumer, so the registrar read a message record where its payload
+    // type belonged and abstained "unresolved payload type id".
+    if (ref.desc === '(Ljava/util/function/BiConsumer;)V' && Array.isArray(recv.entries)) {
+      for (const e of recv.entries.slice(0, AGG_MAX_ITEMS)) invokeLambda(index, state, opts, argVals[0], [e.key, e.value], () => {}, hooks)
+      return true
+    }
     for (const item of (recv.items || []).slice(0, AGG_MAX_ITEMS)) invokeLambda(index, state, opts, argVals[0], [item], () => {}, hooks)
     return true
   }

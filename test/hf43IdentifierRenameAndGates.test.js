@@ -240,3 +240,31 @@ describe('HF127 — the platform-service presence branch gates the listener it s
     assert.deepStrictEqual(gateOf(r), [])
   })
 })
+
+// --- HF130 R2: a dist test that selects a HANDLER before the registrar call --
+// Sweep #88: `playToClient(S2CPayload.TYPE, CODEC, FMLEnvironment.dist == CLIENT
+// ? h1 : h2)` - the branches rejoin BEFORE the registrar call, so the
+// registration is unconditional. The linear walk pushed both arms' handlers
+// (and left the compared operands) so the registrar call read its receiver
+// two slots off and the registration silently dropped - no abstain. A
+// conditional whose arm holds a registrar call is still walked through.
+const PMWEXTRA = path.join(FX, 'hf130-pmwextra-0.1.7.trimmed.jar')
+
+describe('HF130 R2 — the handler-select ternary is not a gate', function () {
+  this.timeout(60000)
+
+  it('pmwextra:s2c is claimed clientbound at version 1, required, beside c2s serverbound; nothing abstains', () => {
+    const r = deriveNeoForgeComponents([PMWEXTRA])
+    const rows = r.components.play.filter((c) => c.id.startsWith('pmwextra:')).map((c) => [c.id, c.flow, c.version, !!c.optional]).sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    assert.deepStrictEqual(rows, [['pmwextra:c2s', 'serverbound', '1', false], ['pmwextra:s2c', 'clientbound', '1', false]])
+    assert.deepStrictEqual(r.diagnostics.abstains, [])
+  })
+
+  it('a real gate stays a gate: the HF127 mod-presence gate still withholds the listener when the mod is absent and claims it when present', () => {
+    const absent = deriveNeoForgeComponents([ELYTRA])
+    assert.ok(!ids(absent).includes(BOOST), ids(absent).join(','))
+    const g = absent.diagnostics.presenceGates.filter((x) => x.kind === 'mod_presence' && x.modId === 'deeperdarker')
+    assert.strictEqual(g.length, 1); assert.strictEqual(g[0].present, false); assert.strictEqual(g[0].claimed, false)
+    assert.ok(ids(deriveNeoForgeComponents([ELYTRA, PRESENCE_STUB])).includes(BOOST))
+  })
+})

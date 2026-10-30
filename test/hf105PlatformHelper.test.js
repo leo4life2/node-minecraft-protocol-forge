@@ -149,3 +149,44 @@ describe('HF127: the list-provider loop and the numbered-id builder rows', funct
     assert.deepStrictEqual(rowsOf(red, 'puzzleslib'), [])
   })
 })
+
+// --- HF130 R1: the static forwarder feeding a message map ------------------
+// Sweep #88 (a same-computer NeoForge 1.21.1 world carrying an MCreator-built
+// mod): the mod root holds a static message Map; a static forwarder
+// `addNetworkMessage(Type, codec, handler)` puts its PARAMETER into the map
+// from each message class's registerMessage (its own <clinit> TYPE); the
+// registrar callback `registrar(modId)` + `MESSAGES.forEach((type, msg) ->
+// registrar.playBidirectional(type, ..))` registers each entry. The reader
+// abstained "unresolved payload type id": the map key arrived as another
+// class's static-field placeholder and the BiConsumer forEach handed the
+// VALUE alone to the lambda. One rule covers every MCreator NeoForge 1.21 mod
+// (identical generated code).
+const FX130 = (n) => path.join(FX, n)
+const PMW_PLUS = FX130('hf130-pmw_plus-1.4.1-neoforge-1.21.1.trimmed.jar')
+const PMW_IDS = ['dev_console_buttons', 'guistate_update', 'key_main_open', 'main_2_buttons', 'main_3_buttons', 'main_4_buttons', 'main_5_buttons', 'main_buttons', 'play_player_animation'].map((p) => `pmw_plus:${p}`)
+
+describe('HF130 R1: the static forwarder feeding a message map a registrar callback registers', function () {
+  this.timeout(60000)
+
+  it('the trimmed fixtures are the pinned originals trimmed: each fixture sha256 and each original sha256 recorded by the trim script', () => {
+    const manifest = JSON.parse(fs.readFileSync(FX130('hf130-fixtures.json'), 'utf8'))
+    const originals = {
+      'hf130-pmw_plus-1.4.1-neoforge-1.21.1.trimmed.jar': '6688f6d863df7a2e0c16df965baf96c2d455e06d8bc4680153103a2fa26c0b40',
+      'hf130-pmwextra-0.1.7.trimmed.jar': '57548c120b1573b3272b0937b5454ba8391f135726bbb020f3937ce6ca3ff545'
+    }
+    assert.deepStrictEqual(Object.keys(manifest).sort(), Object.keys(originals).sort())
+    for (const [fixture, m] of Object.entries(manifest)) {
+      assert.strictEqual(crypto.createHash('sha256').update(fs.readFileSync(FX130(fixture))).digest('hex'), m.sha256, fixture)
+      assert.strictEqual(m.original_sha256, originals[fixture], `${fixture} original`)
+      assert.ok(/^https:\/\/cdn\.modrinth\.com\//.test(m.url), m.url)
+    }
+  })
+
+  it('the nine message ids bound at the forwarder call sites are claimed bidirectional, required, at the registrar string (the mod id, never the mods.toml version), with no unresolved line', () => {
+    const r = deriveNeoForgeComponents([PMW_PLUS])
+    const rows = r.components.play.filter((c) => c.id.startsWith('pmw_plus:')).map((c) => [c.id, c.flow ?? null, c.version, !!c.optional]).sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    assert.deepStrictEqual(rows, PMW_IDS.map((id) => [id, null, 'pmw_plus', false]))
+    assert.deepStrictEqual(r.components.configuration.filter((c) => c.id.startsWith('pmw_plus:')), [])
+    assert.ok(!r.diagnostics.abstains.some((a) => /unresolved payload type id/.test(a)), r.diagnostics.abstains.join(' | '))
+  })
+})

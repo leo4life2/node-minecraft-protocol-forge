@@ -1,0 +1,16 @@
+{
+  "hf130-pmw_plus-1.4.1-neoforge-1.21.1.trimmed.jar": {
+    "original": "pmw_plus-1.4.1-neoforge-1.21.1.jar",
+    "original_sha256": "6688f6d863df7a2e0c16df965baf96c2d455e06d8bc4680153103a2fa26c0b40",
+    "url": "https://cdn.modrinth.com/data/6U4BOZu8/versions/2ISjztSw/pmw_plus-1.4.1-neoforge-1.21.1.jar",
+    "entries": 12,
+    "sha256": "da72b14b67436dde67e70c245307ab0c1706c42c83e403f92a1fb4329d6b788c"
+  },
+  "hf130-pmwextra-0.1.7.trimmed.jar": {
+    "original": "pmwextra-0.1.7.jar",
+    "original_sha256": "57548c120b1573b3272b0937b5454ba8391f135726bbb020f3937ce6ca3ff545",
+    "url": "https://cdn.modrinth.com/data/EkOB83Jm/versions/ZyTr1sIc/pmwextra-0.1.7.jar",
+    "entries": 6,
+    "sha256": "96ba9d1b3327e2d36a573645e697ae4573b94753643beac195230d3147379325"
+  }
+}
