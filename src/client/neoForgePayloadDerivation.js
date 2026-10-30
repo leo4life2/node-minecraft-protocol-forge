@@ -494,32 +494,39 @@ function simulate (index, classInfo, method, state, opts = {}) {
   // `.optional()` is then unproven, never a false optional)
   opts.walk = opts.walk || {}
   const undecidedOnEntry = !!opts.walk.undecided
-  // HF130: the linear walk keeps the JVM's stack discipline across a
-  // conditional (the compared operands are popped) and a value-select whose
-  // arms REJOIN before the next registrar call walks ONE arm: the fallthrough
-  // arm ends in a forward goto to the join point and the other arm holds no
-  // registrar call (`playToClient(TYPE, CODEC, dist == CLIENT ? h1 : h2)` - the
-  // test picks a HANDLER, the registration is unconditional). Before, both
-  // arms' values piled onto the stack and the registrar call read its receiver
-  // and arguments two slots off - the registration silently dropped, no
-  // abstain. An arm that holds a registrar call is never skipped: it is walked
-  // through under the HF51 undecided flag exactly as before.
-  const arms = [] // forward conditional targets not yet passed
-  let skipTo = -1
+  // HF130 (r2): the linear walk keeps the JVM's stack discipline across a
+  // conditional (the compared operands are popped) and across arms that
+  // REJOIN: every forward conditional records the stack depth it leaves; when
+  // the fallthrough arm ends in a forward goto over the other arm, the values
+  // the fallthrough arm pushed are dropped and the other arm's values take
+  // their place at the join (`playToClient(TYPE, CODEC, dist == CLIENT ? h1 :
+  // h2)` - the test picks a HANDLER, the registration is unconditional).
+  // Before, both arms' values piled onto the stack and the registrar call read
+  // its receiver and arguments two slots off - the registration silently
+  // dropped, no abstain. NO instruction is skipped: both arms are walked (a
+  // registrar call or a helper call in either arm is seen exactly as before,
+  // under the HF51 undecided flag); only the operand stack is reconciled. The
+  // arm paired with a goto is the NEAREST open conditional target the goto
+  // jumps over (nested value-selects pair inner with inner).
+  const arms = [] // { target, depth }: forward conditional targets not yet passed, the stack depth at the branch
   walkLinear(code, cp, (op, pc) => {
-    if (pc < skipTo) return
+    for (let i = arms.length - 1; i >= 0; i--) if (arms[i].target <= pc) arms.splice(i, 1)
     // HF51: the linear walk decides no branch — an `.optional()` met past a
     // conditional is not a proven optional (see the registrar model)
     if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) {
       opts.walk.undecided = true
       pop(op >= 0x9f && op <= 0xa6 ? 2 : 1)
       const target = pc + code.readInt16BE(pc + 1)
-      if (target > pc) arms.push(target)
+      if (target > pc) arms.push({ target, depth: stack.length })
     }
     if ((op === 0xa7 || op === 0xc8) && arms.length > 0) {
       const target = pc + (op === 0xa7 ? code.readInt16BE(pc + 1) : code.readInt32BE(pc + 1))
-      const join = arms.filter((j) => j > pc && j <= target).sort((a, b) => b - a)[0]
-      if (join !== undefined && armRegistersNothing(code, cp, join, target)) skipTo = target
+      let join = null
+      for (const a of arms) if (a.target > pc && a.target <= target && (join === null || a.target < join.target)) join = a
+      if (join !== null) {
+        if (stack.length > join.depth) stack.length = join.depth
+        arms.splice(arms.indexOf(join), 1)
+      }
     }
     switch (op) {
       case 0x01: push(UNKNOWN); break // aconst_null
@@ -1935,17 +1942,6 @@ function bindCtorFields (index, state, obj) {
 // with the condition unknown, prefer the arm that does not immediately
 // throw, so validation guards don't silently kill the harvest.)
 // the arm's first instruction ends the path (a return) or jumps away (goto)
-// HF130: true when the bytes [lo, hi) hold no registrar call - the other arm
-// of a value-select is a handler / codec pick, never a registration.
-function armRegistersNothing (code, cp, lo, hi) {
-  let registers = false
-  walkLinear(code, cp, (op, pc) => {
-    if (registers || pc < lo || pc >= hi || op < 0xb6 || op > 0xb9) return
-    const ref = cpRef(cp, code.readUInt16BE(pc + 1))
-    if (ref && (REGISTRATION_METHODS[ref.name] || ref.owner === REGISTRAR_TYPE)) registers = true
-  })
-  return !registers
-}
 function armLeavesAtOnce (code, startPc) {
   const op = code[startPc]
   return op === 0xb1 || op === 0xb0 || op === 0xac || op === 0xad || op === 0xae || op === 0xaf || op === 0xa7 || op === 0xc8
