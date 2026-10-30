@@ -1,0 +1,23 @@
+{
+  "_about": "HF131 - THE PLAY-TABLE INJECTION ROW (playTableInjectionDerivation.js). A mod that injects its own packet type early into the CLIENTBOUND play template shifts every later vanilla id by one, so a pal decoding with the published table reads every play frame under the wrong name. The culprit is a bytecode SHAPE, never a mod list: a class whose constant pool carries a method reference to the version's protocol-builder add-packet method, whose mixin targets the version's GameProtocols class, and whose injector annotation names the clientbound builder lambda. One row per game version and mapping namespace; the names are the version's own (intermediary for Fabric jars, mojmap for NeoForge 1.20.5+ jars). A version without a row derives no_version_data and names no mod.",
+  "versions": {
+    "1.21.1": {
+      "intermediary": {
+        "gameProtocols": "net/minecraft/class_9095",
+        "protocolInfoBuilder": "net/minecraft/class_9147",
+        "packetType": "net/minecraft/class_9145",
+        "addPacket": "method_56454",
+        "clientboundBuilder": "method_55958",
+        "source": "FabricMC intermediary 1.21.1 over mojmap 1.21.1 (GameProtocols / ProtocolInfoBuilder / PacketType / addPacket / lambda$static$1); verified against the javap of the levelz 2.0.12 PlayStateFactoriesMixin bytes (test/fixtures/hf131-levelz-2.0.12.trimmed.jar)"
+      },
+      "mojmap": {
+        "gameProtocols": "net/minecraft/network/protocol/game/GameProtocols",
+        "protocolInfoBuilder": "net/minecraft/network/ProtocolInfoBuilder",
+        "packetType": "net/minecraft/network/protocol/PacketType",
+        "addPacket": "addPacket",
+        "clientboundBuilder": "lambda$static$1",
+        "source": "mojmap 1.21.1 (piston-meta server mappings); no fixture pins this namespace yet - a jar of this shape derives through the same rule"
+      }
+    }
+  }
+}

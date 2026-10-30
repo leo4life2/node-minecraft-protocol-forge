@@ -59,20 +59,95 @@ function isPartialReadError (err) {
   ))
 }
 
+// HF131 - THE PLAY-ENTRY LAW. On a host whose clientbound id table matches the
+// pal's, the first clientbound play frame this client parses is `login` (a
+// bundle_delimiter or a custom_payload may precede it). A decode failure of a
+// clientbound play frame BEFORE this client has parsed its own login frame - a
+// throw the base path would fail loudly on, a throw it would drop, or a partial
+// read that leaves bytes over - is not one exotic packet: it is the id table
+// itself (a mod that injects its own packet type early in the clientbound
+// template shifts every later vanilla id by one, so every frame reads under the
+// wrong name). The parser raises that ONCE as a typed fact it knows from the
+// frame that failed first, and SUSPENDS the stream from that frame on: no
+// misread frame is ever emitted as a packet event, so nothing downstream can
+// answer one. After login the base tolerance path stands byte for byte.
+const PLAY_ENTRY_PRELUDE = new Set(['bundle_delimiter', 'custom_payload'])
+const PLAY_TABLE_MISMATCH_PACKET = 'forge_play_table_mismatch'
+
+function playEntryOf (client) {
+  // per play deserializer (nmp swaps one in per state change; a re-entered play
+  // state begins with its own login frame again)
+  client._forgePlayEntry = { loginSeen: false, framesBeforeLogin: 0, mismatch: null }
+  return client._forgePlayEntry
+}
+
+function suspendedPacket (buffer, packetId) {
+  return {
+    data: { name: PLAY_TABLE_MISMATCH_PACKET, params: { id: packetId } },
+    metadata: { size: buffer.length },
+    buffer,
+    fullBuffer: buffer
+  }
+}
+
+function raisePlayTableMismatch (client, entry, buffer, packetId, packetName, outcome, cause) {
+  const fact = {
+    phase: 'play_entry',
+    first_id: packetId,
+    read_as: packetName,
+    outcome,
+    frames_before_login: entry.framesBeforeLogin
+  }
+  entry.mismatch = fact
+  const label = packetName || (packetId >= 0 ? `id ${packetId}` : 'unknown id')
+  console.warn(`[mc-parse] play-entry table mismatch: clientbound play frame id=${packetId} (${label}) failed (${outcome}) before this client's login frame; the stream is suspended from this frame on: ${cause && cause.message}`)
+  client.emit('play_table_mismatch', fact)
+  const handler = client._forgePlayTableMismatchHandler
+  if (typeof handler === 'function') {
+    try { handler(fact, cause) } catch (err) { debug(`play-table-mismatch handler threw: ${err.message}`) }
+  } else {
+    // no embedder owns the stop: fail loudly AND typed, never zombie
+    const typed = new Error(`play table mismatch at play entry: clientbound play frame id ${packetId}${packetName ? ` read as ${packetName}` : ''} failed (${outcome}) before login`)
+    typed.playTableMismatch = fact
+    typed.cause = cause
+    client.emit('error', typed)
+  }
+  return suspendedPacket(buffer, packetId)
+}
+
 function wrapDeserializer (client) {
   const deserializer = client.deserializer
   if (!deserializer || deserializer._forgeTolerant) return
   deserializer._forgeTolerant = true
+  const entry = playEntryOf(client)
   const parse = deserializer.parsePacketBuffer.bind(deserializer)
   deserializer.parsePacketBuffer = (buffer) => {
+    if (entry.mismatch) {
+      // HF131: suspended - the table is wrong, nothing is parsed or emitted
+      let packetId = -1
+      try { packetId = readVarInt(buffer, 0).value } catch (ignored) {}
+      return suspendedPacket(buffer, packetId)
+    }
     try {
       const packet = parse(buffer)
+      const name = packet.data && packet.data.name
       if (packet.metadata && packet.metadata.size !== buffer.length) {
+        if (!entry.loginSeen && name !== 'login' && !PLAY_ENTRY_PRELUDE.has(name)) {
+          // HF131: a frame that reads only partly under a name other than login
+          // before login - the table, not the body
+          let packetId = -1
+          try { packetId = readVarInt(buffer, 0).value } catch (ignored) {}
+          return raisePlayTableMismatch(client, entry, buffer, packetId, name || null, 'partial', new Error(`partial read ${packet.metadata.size}/${buffer.length}`))
+        }
         // partially-read packet (e.g. declare_commands with modded argument
         // parsers): keep the readable prefix, but stop FullPacketParser from
         // console-dumping the whole packet as hex
         debug(`partially parsed play packet ${packet.data && packet.data.name} (${packet.metadata.size}/${buffer.length} bytes)`)
         packet.metadata.size = buffer.length
+      }
+      if (!entry.loginSeen) {
+        if (name === 'login') entry.loginSeen = true
+        else entry.framesBeforeLogin++
       }
       return packet
     } catch (err) {
@@ -88,6 +163,13 @@ function wrapDeserializer (client) {
       } catch (ignored) {}
       const packetName = resolvePlayPacketName(client, packetId)
       const label = packetName || (packetId >= 0 ? `0x${packetId.toString(16)}` : 'unknown(id=-1)')
+
+      // HF131: before this client's login frame the failure is the id table,
+      // whatever the base path would have made of it (a loud failure or a drop)
+      if (!entry.loginSeen) {
+        const outcome = (packetName === null || CRITICAL_PACKETS.has(packetName)) ? 'throw' : 'drop'
+        return raisePlayTableMismatch(client, entry, buffer, packetId, packetName, outcome, err)
+      }
 
       // Critical packet, or an id/name that cannot even be resolved (protocol
       // skew - nothing about this stream can be trusted): surface the parse
@@ -136,9 +218,19 @@ function wrapDeserializer (client) {
  * is a no-op (client._tolerantPlayParser), and the per-deserializer
  * _forgeTolerant guard prevents a double wrap either way.
  *
+ * HF131: `onPlayTableMismatch(fact, cause)` lets the embedder own the stop on
+ * the play-entry table mismatch (it is called once, from the frame that failed
+ * first, after the stream is suspended); without it the parser emits a typed
+ * client 'error' (err.playTableMismatch = the fact) so a classified end runs.
+ * The first handler given wins; a later install without one keeps it.
+ *
  * @param {import('minecraft-protocol').Client} client client that is connecting to the server.
+ * @param {{onPlayTableMismatch?: function}} [opts]
  */
-module.exports = function installTolerantPlayParser (client) {
+module.exports = function installTolerantPlayParser (client, opts = {}) {
+  if (opts && typeof opts.onPlayTableMismatch === 'function' && !client._forgePlayTableMismatchHandler) {
+    client._forgePlayTableMismatchHandler = opts.onPlayTableMismatch
+  }
   if (client._tolerantPlayParser) return
   client._tolerantPlayParser = true
   debug('tolerant play deserializer installed')

@@ -190,3 +190,68 @@ describe('HF130 R1: the static forwarder feeding a message map a registrar callb
     assert.ok(!r.diagnostics.abstains.some((a) => /unresolved payload type id/.test(a)), r.diagnostics.abstains.join(' | '))
   })
 })
+
+// HF131 - THE CULPRIT FROM THE BYTES (src/client/playTableInjectionDerivation.js
+// over the per-version row of data/playTableInjectionPatterns.json): the jar of a
+// pack whose class bytes carry the add-packet reference into the CLIENTBOUND play
+// template. Fixture: test/fixtures/hf131-levelz-2.0.12.trimmed.jar, built by
+// test/fixtures/hf131-trim-jars.mjs from the sha256-pinned original.
+const { derivePlayTableInjection, CULPRIT_BASIS } = require('../src/client/playTableInjectionDerivation')
+const FX131 = (n) => path.join(FX, n)
+const LEVELZ = FX131('hf131-levelz-2.0.12.trimmed.jar')
+
+describe('HF131 R2: the culprit of a play-entry table mismatch is read from the jar bytes, never from a mod list', function () {
+  this.timeout(60000)
+
+  it('the trimmed fixture is the pinned original trimmed: the fixture sha256, the original sha256 and the official download URL recorded by the trim script', () => {
+    const manifest = JSON.parse(fs.readFileSync(FX131('hf131-fixtures.json'), 'utf8'))
+    assert.deepStrictEqual(Object.keys(manifest), ['hf131-levelz-2.0.12.trimmed.jar'])
+    const m = manifest['hf131-levelz-2.0.12.trimmed.jar']
+    assert.strictEqual(crypto.createHash('sha256').update(fs.readFileSync(LEVELZ)).digest('hex'), m.sha256)
+    assert.strictEqual(m.original_sha256, '7d4b004e3cc053e16b0b91141f8b6be2a147d7c2a42564d1fa1df4baed30df6b')
+    assert.strictEqual(m.entries, 4)
+    assert.ok(/^https:\/\/cdn\.modrinth\.com\//.test(m.url), m.url)
+  })
+
+  it('H131d: the jar whose mixin injects a packet type into the clientbound builder is named with add_packet_reference, its mod name from the manifest, the class and namespace as evidence', () => {
+    const r = derivePlayTableInjection({ paths: [LEVELZ], version: '1.21.1' })
+    assert.strictEqual(r.culprit_jar, 'hf131-levelz-2.0.12.trimmed.jar')
+    assert.strictEqual(r.culprit_basis, 'add_packet_reference')
+    assert.deepStrictEqual(r.culprit_mod, { id: 'levelz', name: 'LevelZ', version: '2.0.12' })
+    assert.strictEqual(r.matches.length, 1)
+    assert.strictEqual(r.matches[0].className, 'net/levelz/mixin/network/PlayStateFactoriesMixin')
+    assert.strictEqual(r.matches[0].namespace, 'intermediary')
+    assert.deepStrictEqual(r.abstained, [])
+    assert.strictEqual(r.jars, 1)
+    assert.ok(CULPRIT_BASIS.includes(r.culprit_basis))
+    // a folder path reads the same jar
+    const viaDir = derivePlayTableInjection({ paths: [FX], version: '1.21.1' })
+    assert.strictEqual(viaDir.culprit_jar, 'hf131-levelz-2.0.12.trimmed.jar', 'the one jar of the fixtures folder that carries the reference')
+    assert.strictEqual(viaDir.matches.length, 1, 'no other fixture jar of the earlier lanes is claimed')
+  })
+
+  it('H131d: the no-jar cases name no mod and say why - no_jar_matched (a pack without the reference), no_pack (nothing readable), no_version_data (a version without a row)', () => {
+    const none = derivePlayTableInjection({ paths: [FX131('hf127-presence-stub.jar'), FX131('hf130-pmwextra-0.1.7.trimmed.jar')], version: '1.21.1' })
+    assert.deepStrictEqual([none.culprit_jar, none.culprit_basis, none.culprit_mod, none.matches.length, none.jars], [null, 'no_jar_matched', null, 0, 2])
+    const empty = derivePlayTableInjection({ paths: [], version: '1.21.1' })
+    assert.deepStrictEqual([empty.culprit_jar, empty.culprit_basis, empty.culprit_mod, empty.jars], [null, 'no_pack', null, 0])
+    const missing = derivePlayTableInjection({ paths: [FX131('no-such-folder')], version: '1.21.1' })
+    assert.deepStrictEqual([missing.culprit_jar, missing.culprit_basis], [null, 'no_pack'])
+    const noRow = derivePlayTableInjection({ paths: [LEVELZ], version: '1.8' })
+    assert.deepStrictEqual([noRow.culprit_jar, noRow.culprit_basis, noRow.culprit_mod, noRow.jars], [null, 'no_version_data', null, 1])
+    const noVersion = derivePlayTableInjection({ paths: [LEVELZ] })
+    assert.strictEqual(noVersion.culprit_basis, 'no_version_data')
+  })
+
+  it('H131d: the row is data - every version row names the five members per namespace and no code path holds a mod name', () => {
+    const rows = require('../src/client/data/playTableInjectionPatterns.json')
+    for (const [version, namespaces] of Object.entries(rows.versions)) {
+      assert.ok(/^\d+\.\d+(\.\d+)?$/.test(version), version)
+      for (const [ns, names] of Object.entries(namespaces)) {
+        for (const k of ['gameProtocols', 'protocolInfoBuilder', 'packetType', 'addPacket', 'clientboundBuilder']) assert.ok(typeof names[k] === 'string' && names[k], `${version}/${ns}/${k}`)
+      }
+    }
+    const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'client', 'playTableInjectionDerivation.js'), 'utf8')
+    assert.ok(!/levelz|class_9\d+|method_5\d+/i.test(src), 'the reader carries no mod name and no mapped member literal; the row does')
+  })
+})

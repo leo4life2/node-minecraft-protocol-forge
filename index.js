@@ -48,6 +48,7 @@ module.exports = {
   deriveAckContracts: require('./src/client/neoForgePayloadDerivation').deriveAckContracts,
   // HF73b: the per-jar derivation (read units / derive a unit / assemble; the trail + deps check) for a caller that caches per jar
   neoForgePayloadDerivation: require('./src/client/neoForgePayloadDerivation'),
+  derivePlayTableInjection: require('./src/client/playTableInjectionDerivation').derivePlayTableInjection, // HF131: the jar whose bytes inject a packet type into the clientbound play template (the culprit of a play-entry table mismatch)
   annotationRegistryDerivation: require('./src/client/annotationRegistryDerivation'),
   listenOnlyDerivation: require('./src/client/listenOnlyDerivation'),
   loaderSpawnDerivation: require('./src/client/loaderSpawnDerivation'),
