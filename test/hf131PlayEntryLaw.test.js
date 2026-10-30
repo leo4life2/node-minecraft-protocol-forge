@@ -112,6 +112,15 @@ describe('HF131 the play-entry law: the first failing clientbound frame before l
     assert.strictEqual(loud.errors.length, 0)
   })
 
+  it('H131-fork-g: a first frame that fails under its own name login is no table shift - the base loud path (a raw client error), no table fact, no handler call', () => {
+    const r = harness({ handler: true })
+    quietWarn(() => r.feed([F.login.subarray(0, 3)]))
+    assert.strictEqual(r.handled.length, 0)
+    assert.strictEqual(r.facts.length, 0)
+    assert.strictEqual(r.errors.length, 1)
+    assert.strictEqual(r.errors[0].playTableMismatch, undefined)
+  })
+
   it('H131-fork-f: the install is idempotent and the first handler given wins', () => {
     const client = new Client(false, '1.21.1', {}, true)
     const calls = []

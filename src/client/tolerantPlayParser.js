@@ -165,8 +165,9 @@ function wrapDeserializer (client) {
       const label = packetName || (packetId >= 0 ? `0x${packetId.toString(16)}` : 'unknown(id=-1)')
 
       // HF131: before this client's login frame the failure is the id table,
-      // whatever the base path would have made of it (a loud failure or a drop)
-      if (!entry.loginSeen) {
+      // whatever the base path would have made of it (a loud failure or a drop);
+      // a frame read as login at the login id is no shift, so it keeps the base path
+      if (!entry.loginSeen && packetName !== 'login') {
         const outcome = (packetName === null || CRITICAL_PACKETS.has(packetName)) ? 'throw' : 'drop'
         return raisePlayTableMismatch(client, entry, buffer, packetId, packetName, outcome, err)
       }
