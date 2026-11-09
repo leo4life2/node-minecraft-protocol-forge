@@ -343,4 +343,18 @@ describe('HF92 - identical item-wire mixins collapse to one (a jar and its neste
     }
     assert.strictEqual(vanillaSlotBearingPackets('0.0.0'), null)
   })
+  it('HF140: the packet a server names in its decode kick resolves to the vanilla slot-bearing name per version (container_click -> window_click, set_creative_mode_slot -> set_creative_slot); a clientbound name, a non-slot packet, an untabled version or no name -> null', () => {
+    const { slotBearingServerPacketOf, MOJANG_SERVERBOUND_SLOT_PACKETS } = require('../src/client/itemStackWireInstall')
+    assert.deepStrictEqual(Object.keys(MOJANG_SERVERBOUND_SLOT_PACKETS).sort(), ['set_creative_slot', 'window_click'])
+    for (const v of ['1.20.1', '1.21.1']) {
+      assert.strictEqual(slotBearingServerPacketOf(v, 'serverbound/minecraft:container_click'), 'window_click', v)
+      assert.strictEqual(slotBearingServerPacketOf(v, 'serverbound/container_click'), 'window_click', v)
+      assert.strictEqual(slotBearingServerPacketOf(v, 'serverbound/minecraft:set_creative_mode_slot'), 'set_creative_slot', v)
+      assert.strictEqual(slotBearingServerPacketOf(v, 'serverbound/minecraft:move_player_pos'), null, v)
+      assert.strictEqual(slotBearingServerPacketOf(v, 'clientbound/minecraft:container_set_slot'), null, v)
+      assert.strictEqual(slotBearingServerPacketOf(v, 'minecraft:container_click'), null, v)
+    }
+    assert.strictEqual(slotBearingServerPacketOf('0.0.0', 'serverbound/minecraft:container_click'), null)
+    assert.strictEqual(slotBearingServerPacketOf('1.21.1', null), null)
+  })
 })

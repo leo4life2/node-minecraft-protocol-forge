@@ -203,4 +203,23 @@ function vanillaSlotBearingPackets (version) {
   return out
 }
 
-module.exports = { installItemStackWireExtension, compileFor, fillOutgoing, reconcileIncoming, slotBearingPackets, vanillaSlotBearingPackets }
+// HF140: the vanilla packet ids the SERVER names in a decode kick ("Failed to
+// decode packet 'serverbound/minecraft:container_click'", netty's words since
+// 1.20.2) for the slot-bearing serverbound packets minecraft-data names by its
+// own names. Vanilla's own identifiers, applied only to a name the version's
+// protocol JSON carries a slot in (the set above) — never a mod, never a list
+// of ours. A kick naming any other packet (or a clientbound one) is not a slot
+// kick and returns null.
+const MOJANG_SERVERBOUND_SLOT_PACKETS = { window_click: 'minecraft:container_click', set_creative_slot: 'minecraft:set_creative_mode_slot' }
+function slotBearingServerPacketOf (version, serverNamed) {
+  if (typeof serverNamed !== 'string') return null
+  const m = serverNamed.trim().match(/^serverbound\/((?:[a-z0-9_.-]+:)?[a-z0-9_]+)$/)
+  if (!m) return null
+  const id = m[1].includes(':') ? m[1] : `minecraft:${m[1]}`
+  const p = vanillaSlotBearingPackets(version)
+  if (!p) return null
+  for (const [nmp, mojang] of Object.entries(MOJANG_SERVERBOUND_SLOT_PACKETS)) if (mojang === id && p.toServer.has(nmp)) return nmp
+  return null
+}
+
+module.exports = { installItemStackWireExtension, compileFor, fillOutgoing, reconcileIncoming, slotBearingPackets, vanillaSlotBearingPackets, slotBearingServerPacketOf, MOJANG_SERVERBOUND_SLOT_PACKETS }
