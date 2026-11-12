@@ -30,6 +30,8 @@ const MODULES = ['jarAnalysis.js', 'loginAckDerivation.js', 'forgeHandshake3.js'
   'loginReplyBoundary.js', 'annotationRegistryDerivation.js', 'listenOnlyDerivation.js',
   // HF105: the platform-helper walk (a pure local bytecode parser: jarAnalysis + its own data table)
   'platformHelperDerivation.js',
+  // HF145: the class store and the pack queries (inflate once, the per-class filters, the kept result's recorded facts; requires only crypto + jarAnalysis)
+  'classFacts.js',
   // HF38: the login-window ledger/budget (requires only debug + the reply boundary, lazily)
   'loginWindow.js',
   // D3: the loader custom-spawn codec derivation + decoder (local loader jar only)
@@ -338,6 +340,8 @@ describe('PRIVACY LAW 3 - purpose-limited (no backend/telemetry deps)', function
         './loaderSpawnDerivation', './loaderSpawnDecoder', './neoForgeLoaderLocator',
         // D3 rider: the gate's dimension-bounds tracker (packet fields only, no requires)
         './worldBounds',
+        // HF145: the class store / pack queries of the shared index (local bytes only)
+        './classFacts',
         // HF35: owo handshake derivation + login byte primitives (local jar parse only)
         './owoHandshake', './loginBytes',
         // HF38: the login-window ledger (a clock + a ledger; no I/O)

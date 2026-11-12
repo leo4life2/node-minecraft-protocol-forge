@@ -77,6 +77,7 @@ const debug = require('../../debug')
 const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
 const { nestedJarEntriesOf } = require('./nestedJars') // HF53 rider: the one nested-jar rule
 const { deriveAnnotationRegistries } = require('./annotationRegistryDerivation')
+const { installClassFacts, unitViewOf, queryDepsHold } = require('./classFacts') // HF145: a class's facts once per read; a kept result records the facts it read
 const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveContainerCarriedListenChannels, assembleListenOnly } = require('./listenOnlyDerivation')
 // HF105 item A: the DIRECTION TABLE - the ordered rule shapes an enum packet
 // registry's direction is read by (data; every row cites the fixture jar + the
@@ -137,6 +138,9 @@ function collectJarClasses (jarPath, out, diagnostics, jarLabel) {
   }
   const unit = out.noteUnit ? out.noteUnit({ path: jarPath, label: jarLabel, sha1: crypto.createHash('sha1').update(buf).digest('hex') }) : null
   collectBufferClasses(buf, out, diagnostics, jarLabel, 0, unit)
+  // HF145: the read keeps ONE inflated copy of each class this jar provides and lets the jar's own buffer go here
+  // (it kept every jar whole for the whole read); a class is still inflated once
+  if (unit && out.bytesOf) for (const name of unit.classNames) out.bytesOf(out.raw.get(name))
 }
 
 // HF53 rider: nested jars through the one shared rule; the nesting bound
@@ -265,7 +269,7 @@ function makeClassIndex () {
       let info = null
       if (r) {
         try {
-          info = parseClassFile(zipEntryData(r.buf, r.entry))
+          info = parseClassFile(index.bytesOf(r)) // HF145: the one inflated copy of this class, shared with rawBytes
           if (info) info.jar = r.jar
         } catch { info = null }
       }
@@ -276,9 +280,11 @@ function makeClassIndex () {
       const r = raw.get(name)
       index.consult(r, name)
       if (!r) return null
-      try { return zipEntryData(r.buf, r.entry) } catch { return null }
+      return index.bytesOf(r) // HF145: inflated once per read (it was inflated on every call)
     }
   }
+  index.parsedPeek = (name) => parsed.get(name)
+  installClassFacts(index)
   return index
 }
 
@@ -1198,7 +1204,7 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
   if (hasOwn) {
     targets.push(ref.owner)
   } else if (kind === 'instance') {
-    for (const name of state.allClassNames) {
+    for (const name of index.descendantsOf(ref.owner)) { // HF145: only a descendant passes the subclass test below
       if (name === ref.owner) continue
       if (isSubclassOf(index, name, ref.owner)) {
         const info = index.get(name)
@@ -1310,7 +1316,7 @@ function dispatchEventHelper (index, ref, kind, recv, argVals, state, opts) {
   const resolved = findVirtualMethod(index, ref.owner, ref.name, ref.desc)
   if (resolved) targets.push(resolved)
   if (kind === 'instance') {
-    for (const name of state.allClassNames) {
+    for (const name of index.descendantsOf(ref.owner)) { // HF145: only a descendant passes the subclass test below
       if (name === ref.owner) continue
       if (isSubclassOf(index, name, ref.owner)) {
         const info = index.get(name)
@@ -1377,7 +1383,7 @@ function dispatchVirtual (index, ref, argVals, state, opts) {
   const targets = []
   const ownerInfo = index.get(ref.owner)
   if (ownerInfo && ownerInfo.codes.some((c) => c.method === ref.name && c.desc === ref.desc)) targets.push(ref.owner)
-  for (const name of state.allClassNames) {
+  for (const name of index.descendantsOf(ref.owner)) { // HF145: only a descendant passes the subclass test below
     if (name === ref.owner) continue
     if (isSubclassOf(index, name, ref.owner)) {
       const info = index.get(name)
@@ -1603,19 +1609,22 @@ function deriveEnumRegistries (index, state, markers, read = null) {
 function packFlowMarkersOf (index, read) {
   if (!read) return null
   if (!read.packFlowMarkers) {
-    const entries = []
-    for (const name of index.allNames()) {
-      const bytes = index.rawBytes(name)
-      if (!bytes || !bytes.includes('isAssignableFrom') || !(bytes.includes('playToClient') || bytes.includes('playToServer'))) continue
-      const info = index.get(name)
-      if (!info) continue
-      for (const m of info.codes) if (m.code) entries.push({ info, method: m })
-    }
-    read.packFlowMarkers = discoverFlowMarkers(index, entries)
-  } else if (index.focus) {
-    // a later unit reading the cached census depends on the pack it was read from
-    index.packScanned = true
+    // HF145: computed once per read under a capture; every unit that reads it replays the lookups it was computed from
+    const cap = index.capture(() => {
+      const entries = []
+      for (const name of index.namesIncluding('isAssignableFrom')) {
+        const bytes = index.rawBytes(name)
+        if (!bytes || !bytes.includes('isAssignableFrom') || !(bytes.includes('playToClient') || bytes.includes('playToServer'))) continue
+        const info = index.get(name)
+        if (!info) continue
+        for (const m of info.codes) if (m.code) entries.push({ info, method: m })
+      }
+      return discoverFlowMarkers(index, entries)
+    })
+    read.packFlowMarkers = cap.value
+    read.packFlowMarkersDeps = cap.deps
   }
+  index.replay(read.packFlowMarkersDeps)
   return read.packFlowMarkers
 }
 
@@ -1845,7 +1854,7 @@ function resolveGraftImpl (index, state, owner, name, desc) {
   if (state.aggCache.has(key)) return state.aggCache.get(key)
   let result = null
   const candidates = []
-  for (const cls of state.allClassNames) {
+  for (const cls of index.namesDeclaring(name, desc)) { // HF145: only a class with that coded method can be a candidate
     if (cls === owner) continue
     const bytes = index.rawBytes(cls)
     if (!bytes) continue
@@ -2827,7 +2836,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
     if (recv && (recv.k === 'field' || recv.k === 'instfield') && typeof recv.desc === 'string' && recv.desc.startsWith('L') && recv.desc.endsWith(';')) candidates.push(recv.desc.slice(1, -1))
     candidates.push(ref.owner)
     for (const iface of candidates) {
-      const impls = index.services.get(iface)
+      const impls = index.servicesOf(iface) // HF145: the list read is a recorded dependency
       if (impls && new Set(impls).size === 1 && index.get(impls[0]) && findVirtualMethod(index, impls[0], ref.name, ref.desc)) {
         const implRecv = { k: 'obj', cls: impls[0], fields: {}, fieldsBound: true, serviceImpl: true }
         return inlineDispatch(index, state, opts, implRecv, ref, argVals, push, hooks)
@@ -2908,7 +2917,7 @@ function findInvocationSites (index, state, target) {
   // owners whose invocation resolves to the target: itself + throw-only
   // stubs it grafts onto (glitchcore PacketHandler <- MixinPacketHandler)
   const ownerAliases = new Set([target.cls])
-  for (const cls of state.allClassNames) {
+  for (const cls of index.namesUnion(index.namesDeclaring(target.name, target.desc), target.name !== '<init>' ? index.descendantsOf(target.cls) : null)) { // HF145: a stub declares the method; an inheriting owner descends from the target
     if (cls === target.cls) continue
     const info = index.get(cls)
     if (!info) continue
@@ -2925,14 +2934,14 @@ function findInvocationSites (index, state, target) {
   // Factory.create service idiom) resolves to the target implementation —
   // but ONLY when the target is the unique coded implementer among that
   // ancestor's scanned subclasses (two-loader merged jars ship several).
-  for (const anc of state.allClassNames) {
+  for (const anc of index.ancestorsOf(target.cls)) { // HF145: only an ancestor of the target passes the subclass test below
     if (ownerAliases.has(anc)) continue
     if (!isSubclassOf(index, target.cls, anc)) continue
     const ancInfo = index.get(anc)
     if (!ancInfo) continue
     if (ancInfo.codes.some((c) => c.method === target.name && c.desc === target.desc)) continue
     let implementers = 0
-    for (const sub of state.allClassNames) {
+    for (const sub of index.namesDeclaring(target.name, target.desc)) { // HF145: an implementer declares the coded method
       if (!isSubclassOf(index, sub, anc) && sub !== anc) continue
       const subInfo = index.get(sub)
       if (subInfo && subInfo.codes.some((c) => c.method === target.name && c.desc === target.desc && !isThrowOnlyStub(c))) implementers++
@@ -2941,7 +2950,7 @@ function findInvocationSites (index, state, target) {
     if (implementers === 1) ownerAliases.add(anc)
   }
   const aliasSimple = [...ownerAliases].map((o) => o.split('/').pop())
-  for (const cls of state.allClassNames) {
+  for (const cls of index.namesIncludingAny(aliasSimple)) { // HF145: the classes whose bytes name an alias (the test below, asked once per read)
     const bytes = index.rawBytes(cls)
     if (!bytes) continue
     if (!aliasSimple.some((s) => bytes.includes(s))) continue
@@ -3169,7 +3178,7 @@ function collectFocusInstances (index, state, focusCls) {
     if (focusClinit) evaluateMethod(index, focusInfo, focusClinit, state, { locals: [], recordPutstatic: true }, {})
     state.aggInlineAll = true
     const referencing = []
-    for (const cls of state.allClassNames) {
+    for (const cls of index.namesIncludingAny(scopeSimple)) { // HF145: the classes whose bytes name a scope class
       if (scope.has(cls)) continue
       const bytes = index.rawBytes(cls)
       if (!bytes) continue
@@ -3247,7 +3256,7 @@ function populateOwnRegistries (index, state, info, fieldNames, entryMethod) {
   const simple = cls.split('/').pop()
   const producers = []
   let capped = false
-  for (const name of state.allClassNames) {
+  for (const name of index.namesIncluding(simple)) { // HF145: the classes whose bytes name it
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes(simple)) continue
     const pinfo = index.get(name)
@@ -3871,12 +3880,12 @@ function servicePresenceProbeOf (index, state, ref) {
   cache.set(key, null)
   const own = index.get(ref.owner)
   if (!own || own.codes.some((c) => c.method === ref.name && c.desc === ref.desc && c.code)) return null // a concrete body is not a service interface method
-  let impls = [...new Set((index.services && index.services.get(ref.owner)) || [])]
+  let impls = [...new Set((index.services && index.servicesOf(ref.owner)) || [])] // HF145: the list read is a recorded dependency
   let via = 'services file'
   if (impls.length === 0) {
     const needle = Buffer.from(ref.owner)
     impls = []
-    for (const name of index.raw.keys()) {
+    for (const name of index.namesIncluding(needle)) { // HF145: a recorded pack query (the sweep of every class recorded nothing)
       const bytes = index.rawBytes(name)
       if (!bytes || !bytes.includes(needle)) continue
       const info = index.get(name)
@@ -3935,7 +3944,7 @@ function lambdaConstructs (index, impl, depth, out, seen) {
 
 function deriveModPresenceGates (index, state) {
   const holders = new Map()
-  for (const name of state.allClassNames) {
+  for (const name of index.namesIncludingAny(PRESENCE_PROBE_OWNERS)) { // HF145
     const bytes = index.rawBytes(name)
     if (!bytes) continue
     let mentions = false
@@ -3950,7 +3959,7 @@ function deriveModPresenceGates (index, state) {
   const gates = new Map()
   if (holders.size === 0) return gates
   const walkedLambdas = new Set()
-  for (const name of state.allClassNames) {
+  for (const name of index.namesIncludingAny(holders.keys())) { // HF145
     const bytes = index.rawBytes(name)
     if (!bytes) continue
     let hit = null
@@ -3979,7 +3988,7 @@ function deriveModPresenceGates (index, state) {
   // a gated class ALSO constructed outside any walked lambda body is not
   // gated — the plain construction registers regardless of the key.
   if (gates.size > 0) {
-    for (const name of state.allClassNames) {
+    for (const name of index.namesIncludingAny(gates.keys())) { // HF145: the names at the loop's start; the body re-tests against the gates still standing
       const bytes = index.rawBytes(name)
       if (!bytes) continue
       const gatedHere = [...gates.keys()].filter((g) => bytes.includes(g))
@@ -4022,7 +4031,7 @@ function deriveModRootRegistrations (index, state, record) {
   const summary = { roots: 0, listeners: 0, registrations: 0, resolvedIds: 0, unresolvedIds: 0, droppedUnprovenOrder: 0, budgetExhausted: false, listenerSites: [], rows: [], steps: 0, unitBudget: MOD_ROOT_UNIT_STEP_BUDGET, totalBudget: MOD_ROOT_TOTAL_STEP_BUDGET, exhaustedUnits: [] }
   diagnostics.modRoot = summary
   const roots = []
-  for (const name of seedNamesOf(index, state)) {
+  for (const name of (index.focus ? seedNamesOf(index, state) : index.namesIncluding('/Mod;'))) { // HF145
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes('/Mod;')) continue
     const info = index.get(name)
@@ -4279,16 +4288,23 @@ function readNeoForgeJarUnits (jarPaths, opts = {}) {
   const index = makeClassIndex()
   const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0, presenceGates: [] }
   for (const p of jarPaths) collectJarClasses(p, index, diagnostics, path.basename(p))
+  for (const u of index.units) u.view = unitViewOf(u) // HF145: a unit's identity for a kept result = its content and the class names it provides
   const versionByModId = Object.create(null)
   for (const j of diagnostics.jars) for (const id of j.modIds || []) if (j.modVersion && !versionByModId[id]) versionByModId[id] = j.modVersion
   const read = { index, units: index.units, diagnostics, versionByModId, allClassNames: [...index.raw.keys()], gates: new Map(), readMs: 0 }
   const gateState = freshDerivationState(read, diagnostics)
   gateState.jvmFlagProbes = (opts && Array.isArray(opts.jvmFlagProbes)) ? opts.jvmFlagProbes : null // HF106: the table (a test hands a copy with a row dropped)
+  // HF145: the two pack passes are stretches of the read's plan - timed, and told to the caller as each ends
+  read.passMs = { gates: 0, roots: 0 }
+  const stretch = (i, t0) => { read.passMs[i === 1 ? 'gates' : 'roots'] = Date.now() - t0; if (opts && typeof opts.onStretch === 'function') { try { opts.onStretch(i) } catch { /* an observer only */ } } }
+  let passStart = Date.now()
   try {
     read.gates = deriveModPresenceGates(index, gateState)
   } catch (err) {
     diagnostics.errors.push(`presence-gate derivation failed (${err.message})`)
   }
+  stretch(1, passStart)
+  passStart = Date.now()
   // HF43-r MOD-ROOT WALK (see deriveModRootRegistrations): a PACK pass - every
   // @Mod constructor runs in the loader's order and a listener one root
   // registered iterates registration objects OTHER roots populated (HF51: a
@@ -4308,6 +4324,7 @@ function readNeoForgeJarUnits (jarPaths, opts = {}) {
   } catch (err) {
     diagnostics.errors.push(`mod-root walk failed (${err.message})`)
   }
+  stretch(2, passStart)
   read.modRootResolved = gateState.modRootResolved || new Set()
   // HF106: the classes / listener methods a mod root subscribes only under a JVM flag join the gate map
   for (const [k, g] of (gateState.jvmGates || new Map())) if (!read.gates.has(k)) read.gates.set(k, g)
@@ -4342,7 +4359,7 @@ function censusOfRead (read) {
  * every namespace version it looked up must read the same, and every entry's
  * presence-gate verdict must read the same. Returns { ok, why }.
  */
-function unitDependenciesHold (read, { trailSha1s = [], deps = null } = {}) {
+function unitDependenciesHold (read, { trailSha1s = [], deps = null, view = null, orderViews = null } = {}) {
   const have = new Set(read.units.map((u) => u.sha1).filter(Boolean))
   for (const h of trailSha1s) if (!have.has(h)) return { ok: false, why: `trail jar ${String(h).slice(0, 12)} changed or gone` }
   if (deps) {
@@ -4366,6 +4383,11 @@ function unitDependenciesHold (read, { trailSha1s = [], deps = null } = {}) {
     }
     for (const [site, resolved] of Object.entries(deps.rootResolved || {})) {
       if (read.modRootResolved.has(site) !== !!resolved) return { ok: false, why: `mod-root walk verdict of ${site} changed` }
+    }
+    // HF145: the views (shadowing, order), the services lists and the pack queries this result recorded
+    if (Array.isArray(deps.packViews) || view || orderViews) {
+      const q = queryDepsHold(read, { view, orderViews, deps })
+      if (!q.ok) return q
     }
   }
   return { ok: true, why: null }
@@ -4391,6 +4413,8 @@ function deriveNeoForgeJarUnit (read, unit, { seedRegistrations = [], modRootPas
   index.trail = new Set()
   index.missed = new Set()
   index.packScanned = false
+  index.scans = new Set()
+  index.servicesRead = new Map()
   try {
     return deriveUnitBody(read, unit, state, diagnostics, deps, metaVersionFor, started, seedRegistrations, modRootPass)
   } finally {
@@ -4398,6 +4422,8 @@ function deriveNeoForgeJarUnit (read, unit, { seedRegistrations = [], modRootPas
     index.trail = null
     index.missed = null
     index.packScanned = false
+    index.scans = null
+    index.servicesRead = null
   }
 }
 
@@ -4766,10 +4792,16 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
   // HF73b r2 the absence facts (the index's law above)
   deps.missed = [...index.missed].sort()
   deps.packCensus = index.packScanned ? packCensusOf(read) : null
+  // HF145: the pack queries this unit asked, the services lists it read, and the pack it was derived in (by view)
+  deps.scans = [...(index.scans || [])].sort()
+  deps.services = Object.fromEntries(index.servicesRead || [])
+  deps.packViews = read.units.map((u) => u.view).filter(Boolean)
   return {
     path: unit.path,
     label: unit.label,
     sha1: unit.sha1,
+    view: unit.view ?? null,
+    orderViews: read.units.filter((u) => u.view && (u === unit || index.trail.has(u.path))).map((u) => u.view),
     trail: [...index.trail].sort(),
     deps,
     claims,

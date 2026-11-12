@@ -432,7 +432,7 @@ function resolveBuilderCounterShape (index, state, builderType, h) {
   if (!iface) return null
   const needle = Buffer.from(builderType)
   const impls = []
-  for (const name of index.raw.keys()) {
+  for (const name of (index.namesIncluding ? index.namesIncluding(needle) : index.raw.keys())) { // HF145: a recorded pack query (the sweep of every class recorded no dependency on the pack)
     const b = index.rawBytes(name)
     if (!b || !b.includes(needle)) continue
     const info = index.get(name)
@@ -500,7 +500,7 @@ function resolveBuilderCounterShape (index, state, builderType, h) {
   if (!withPath) return null
   // (5) the concrete handler: the registrar at channel.toLanguageKey(), the optional flag, ONE PayloadRegistrar method
   const subs = []
-  for (const name of index.raw.keys()) {
+  for (const name of (index.namesIncluding ? index.namesIncluding(Buffer.from(impl.className)) : index.raw.keys())) { // HF145: a recorded pack query
     const b = index.rawBytes(name)
     if (!b || !b.includes(Buffer.from(impl.className))) continue
     const info = index.get(name)

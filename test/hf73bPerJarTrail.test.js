@@ -107,20 +107,21 @@ describe('HF73b — the per-jar derivation records, per jar, the jars its cross-
   // NOT in the pack - a pack-wide scan holds only while the pack's class
   // census is the one it scanned; a lookup that missed holds only while the
   // class is still absent.
-  it('T7 a library that registers what a MOD populates into its container is slotted alone (its population scan is pack-wide: deps.packCensus); the mod ADDED -> the slot does not hold (the census why), the re-derived pack equals the cold one; the stale unit assembled would have missed the id (the hole, closed)', () => {
+  it('T7 a library that registers what a MOD populates into its container is slotted alone (its population scan is pack-wide: a recorded pack query, HF145); the mod ADDED -> the slot does not hold (the scan why), the re-derived pack equals the cold one; the stale unit assembled would have missed the id (the hole, closed)', () => {
     const d2 = fs.mkdtempSync(path.join(os.tmpdir(), 'hf73b-absence-')); const box = containerLibJar(d2); const cc = populatorJar(d2)
     const cold1 = D.deriveNeoForgeComponents([box]); const cold2 = D.deriveNeoForgeComponents([box, cc])
     assert.deepStrictEqual(cold1.listenOnly, [], 'alone: nothing populates the container (true)')
     assert.deepStrictEqual(cold2.listenOnly, ['synthcc:real_ping'], 'with the mod: its id')
     const read1 = D.readNeoForgeJarUnits([box]); const boxUnit = D.deriveNeoForgeJarUnit(read1, read1.units[0])
     assert.deepStrictEqual(boxUnit.trail, [], 'no other unit to consult')
-    assert.strictEqual(boxUnit.deps.packCensus, D.packCensusOf(read1), 'the population scan is pack-wide: the census it scanned')
-    assert.match(boxUnit.deps.packCensus, /^[0-9a-f]{40}$/)
+    assert.ok(boxUnit.deps.scans.length > 0, 'the population scan is pack-wide: the pack queries it asked are recorded (HF145: it was the census of every class name)')
+    assert.ok(boxUnit.deps.scans.every((id) => /^[imh]:./.test(id)), 'each query is a kind and a key')
+    assert.deepStrictEqual(boxUnit.deps.packViews, read1.units.map((u) => u.view), 'and the pack it was asked of, by view')
     assert.deepStrictEqual(D.unitDependenciesHold(read1, { trailSha1s: [], deps: boxUnit.deps }), { ok: true, why: null }, 'holds on the pack it scanned')
     const read2 = D.readNeoForgeJarUnits([box, cc])
     const hold = D.unitDependenciesHold(read2, { trailSha1s: [], deps: boxUnit.deps })
     assert.strictEqual(hold.ok, false)
-    assert.strictEqual(hold.why, 'the pack\'s class census changed (a jar added, removed or re-shaped) - this unit\'s resolution scanned the whole pack')
+    assert.strictEqual(hold.why, 'a pack-wide scan of this jar now matches a class of a new or changed jar (a byte pattern)')
     const ccUnit = D.deriveNeoForgeJarUnit(read2, read2.units[1])
     const stale = D.assembleNeoForgeComponents(read2, [D.derivePackUnit(read2), boxUnit, ccUnit])
     assert.deepStrictEqual(stale.listenOnly, [], 'the hole as it was: the stale unit served misses the id')

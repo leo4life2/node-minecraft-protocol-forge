@@ -184,7 +184,7 @@ describe('HF105 item A: enum-registry direction decided by the pack-scope marker
     const { readNeoForgeJarUnits, deriveNeoForgeJarUnit } = require('../src/client/neoForgePayloadDerivation')
     const read = readNeoForgeJarUnits([TFMG, DIESEL, CREATE])
     const tfmgUnit = deriveNeoForgeJarUnit(read, read.units.find((u) => u.path === TFMG))
-    assert.ok(tfmgUnit.deps.packCensus, 'pack census dependency recorded')
+    assert.ok(Array.isArray(tfmgUnit.deps.scans) && tfmgUnit.deps.scans.length > 0, 'the pack-wide scan is a recorded dependency (HF145: the pack queries it asked; it was the census of every class name)')
     assert.ok(tfmgUnit.trail.includes(CREATE), `trail ${JSON.stringify(tfmgUnit.trail)}`)
   })
 

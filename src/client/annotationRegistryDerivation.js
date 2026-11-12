@@ -421,7 +421,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
       abstain(`${site}: census provenance: jar-wide annotated (no clinit constants) — orphan channels possible`)
     }
     const censusClasses = []
-    for (const name of state.allClassNames) {
+    for (const name of (index.namesIncluding ? index.namesIncluding(annotationDescBytes) : state.allClassNames)) { // HF145: a recorded pack query (the byte test below, asked once per read)
       if (clinitCensus.size > 0) {
         if (!clinitCensus.has(name)) continue
       } else {
@@ -509,7 +509,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
   const unfinishableTasks = []
   if (siteJars.size > 0) {
     const tasksEventBytes = Buffer.from(TASKS_EVENT_TYPE, 'utf8')
-    for (const name of state.allClassNames) {
+    for (const name of (index.namesIncluding ? index.namesIncluding(tasksEventBytes) : state.allClassNames)) { // HF145: a recorded pack query (the byte test below, asked once per read)
       const rawInfo = index.raw.get(name)
       if (!rawInfo || !rawInfo.jar || !siteJars.has(rawInfo.jar.label)) continue
       const bytes = index.rawBytes(name)

@@ -214,7 +214,7 @@ function findSideSuffixes (index, factoryInfo) {
 function findCtorNamespaces (index, factoryName) {
   const namespaces = new Set()
   const needle = Buffer.from(factoryName, 'utf8')
-  for (const name of (index.allNames ? index.allNames() : [...index.raw.keys()])) { // HF73b: a resolution scan - pack-wide, every unit examined is on the trail
+  for (const name of (index.namesIncluding ? index.namesIncluding(needle) : [...index.raw.keys()])) { // HF145: a recorded pack query (HF73b: a resolution scan - every unit holding a match is on the trail)
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes(needle)) continue
     const info = index.get(name)
@@ -251,7 +251,7 @@ function findCtorNamespaces (index, factoryName) {
 function countCounterCallSites (index, factoryName, counterMethod) {
   let count = 0
   const needle = Buffer.from(factoryName, 'utf8')
-  for (const name of (index.allNames ? index.allNames() : [...index.raw.keys()])) { // HF73b: a resolution scan - pack-wide, every unit examined is on the trail
+  for (const name of (index.namesIncluding ? index.namesIncluding(needle) : [...index.raw.keys()])) { // HF145: a recorded pack query (HF73b: a resolution scan - every unit holding a match is on the trail)
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes(needle)) continue
     const info = index.get(name)
@@ -508,7 +508,7 @@ function findInclusiveSites (index, target, owners, cache) {
   const sites = []
   cache.set(key, sites)
   const needles = [...owners].map((o) => Buffer.from(simpleName(o), 'utf8'))
-  for (const cls of (index.allNames ? index.allNames() : [...index.raw.keys()])) { // HF73b: a resolution scan - pack-wide, every unit examined is on the trail
+  for (const cls of (index.namesIncludingAny ? index.namesIncludingAny(needles) : [...index.raw.keys()])) { // HF145: a recorded pack query (HF73b: a resolution scan - every unit holding a match is on the trail)
     let bytes
     try { bytes = index.rawBytes(cls) } catch { continue }
     if (!bytes || !needles.some((n) => bytes.includes(n))) continue
