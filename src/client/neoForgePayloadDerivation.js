@@ -130,10 +130,14 @@ const REGISTRATION_METHODS = {
 //   kind 'unread'          the reading stopped (a budget, too many targets, a
 //                          shape it does not follow): registrations exist there
 //                          that were not seen
-// A proven-optional registration ("safely unclaimed"), a presence gate the pack
-// census decides, a note about dropped overrides and an entry whose walk ended
-// without meeting a registration call write a sentence only: no registration
-// was left unresolved there.
+// An entry skipped at a gate (another mod's presence, a launch flag) is of kind
+// 'unread': the server's own mods and flags decide that gate, so a registration
+// the server requires can sit behind it unseen. The annotation-registry reader
+// hands its give-ups over the same way (annotationRegistryDerivation.js).
+// A proven-optional registration ("safely unclaimed": the server drops a channel
+// the client lacks), a note about dropped overrides and an entry whose walk
+// ended without meeting a registration call write a sentence only: no
+// registration a server can refuse for was left unresolved there.
 function noteUnresolvedSite (diagnostics, says, facts) {
   const reg = facts.reg || null
   const spec = reg && reg.method ? REGISTRATION_METHODS[reg.method] : null
@@ -151,6 +155,12 @@ function noteUnresolvedSite (diagnostics, says, facts) {
     id: facts.id || null,
     says
   })
+}
+
+// a registration whose registrar is PROVEN optional: its .optional() sits under no
+// condition the walk left undecided
+function provenOptional (reg) {
+  return !!(reg && reg.registrar && reg.registrar.optional && !reg.registrar.optionalUndecided)
 }
 
 function giveUp (diagnostics, says, facts) {
@@ -4262,15 +4272,19 @@ function deriveModRootRegistrations (index, state, record) {
     const says = `${d.site}: registry-counter ids (${d.ids.join(', ')}) whose counter ${d.holder.cls.split('/').pop()}.${d.holder.field} is advanced by ${d.holder.touches.size} independent listeners/roots — the registration order is not provable, unclaimed`
     diagnostics.abstains.push(says)
     // HF171: one row a registration; the computed id is not proven and is not handed on as one
-    for (const r of d.regs) noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg: r })
+    // a registration proven optional writes no row: the server drops it, nothing to refuse for
+    for (const r of d.regs) if (!provenOptional(r)) noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg: r })
   }
   const unresolvedSites = new Set()
+  const rowSites = new Set()
   for (const r of rows) {
     if (!r.unresolved) continue
     const site = `${r.site.split(' (mod-root')[0]}.${r.method} (via ${r.listenerSite})`
-    if (unresolvedSites.has(site)) continue
-    unresolvedSites.add(site)
-    giveUp(diagnostics, `${site}: the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed`, { kind: 'registration', reg: r })
+    const says = `${site}: the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed`
+    // the sentence once a site, as before; one row a site, of its first registration that is not proven optional
+    // (the server drops a proven-optional channel the client lacks: nothing to refuse for)
+    if (!unresolvedSites.has(site)) { unresolvedSites.add(site); diagnostics.abstains.push(says) }
+    if (!provenOptional(r) && !rowSites.has(site)) { rowSites.add(site); noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg: r }) }
   }
   for (const r of kept) {
     record(r)
@@ -4526,20 +4540,20 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       const claimed = gate.whenPresent ? present : !present
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, kind: 'mod_presence', modId: gate.modId, present, whenPresent: gate.whenPresent, claimed, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
       if (!claimed) {
-        diagnostics.abstains.push(`${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} subscribes it only when ${gate.probe} answers ${gate.whenPresent ? 'loaded' : 'not loaded'} for "${gate.modId}", and "${gate.modId}" is ${present ? '' : 'not '}in the jar census — not claimed`)
+        giveUp(diagnostics, `${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} subscribes it only when ${gate.probe} answers ${gate.whenPresent ? 'loaded' : 'not loaded'} for "${gate.modId}", and "${gate.modId}" is ${present ? '' : 'not '}in the jar census — not claimed`, { kind: 'unread', jar: state.unitJar, site: `${info.className}.${method.method}` })
         continue
       }
     }
     if (gate && gate.kind === 'jvm_property') {
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, kind: 'jvm_property', present: false, probe: gate.probe, gateSite: gate.site })
-      diagnostics.abstains.push(`${info.className}.${method.method}: registrations gated on a JVM flag — ${gate.site} subscribes it only under a jvm_property read by ${gate.probe}; a launch flag is absent on a player's game (client and integrated server alike), so its channels are left unclaimed`)
+      giveUp(diagnostics, `${info.className}.${method.method}: registrations gated on a JVM flag — ${gate.site} subscribes it only under a jvm_property read by ${gate.probe}; a launch flag is absent on a player's game (client and integrated server alike), so its channels are left unclaimed`, { kind: 'unread', jar: state.unitJar, site: `${info.className}.${method.method}` })
       continue
     }
     if (gate && gate.kind !== 'mod_presence') {
       const present = censusHas(gate.modId)
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, modId: gate.modId, present, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
       if (!present) {
-        diagnostics.abstains.push(`${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} keys ${gate.holder.split('/').pop()}("${gate.modId}") whose ${gate.probe} decides construction, and "${gate.modId}" is not in the jar census (${diagnostics.jars.length} jars) — this entry's channels unclaimed (the server registers them only with that mod loaded)`)
+        giveUp(diagnostics, `${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} keys ${gate.holder.split('/').pop()}("${gate.modId}") whose ${gate.probe} decides construction, and "${gate.modId}" is not in the jar census (${diagnostics.jars.length} jars) — this entry's channels unclaimed (the server registers them only with that mod loaded)`, { kind: 'unread', jar: state.unitJar, site: `${info.className}.${method.method}` })
         continue
       }
     }
@@ -4810,7 +4824,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
   // CONTRACTS (the mod's own task-finish protocol, jar-proven), which the
   // config responder answers so the mod's blocking configuration tasks can
   // complete. Fail-open: jars without the idiom contribute nothing here.
-  const annotationRun = deriveAnnotationRegistries(index, state, entryMethods)
+  const annotationRun = deriveAnnotationRegistries(index, state, entryMethods, (says, facts) => giveUp(state.diagnostics, says, { ...facts, jar: facts.jar || state.unitJar }))
   phaseNow = 3
   for (const c of annotationRun.components) {
     add(c.id, c.version, c.flow, c.optional, c.protocols, c.source, 'annotation-registry')

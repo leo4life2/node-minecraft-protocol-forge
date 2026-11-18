@@ -276,8 +276,12 @@ function findReplyShape (index, payloadClass) {
  * @returns {{components: Array, syncContracts: {contracts, consumeOnly,
  *            unfinishableTasks, registries}}}
  */
-function deriveAnnotationRegistries (index, state, entryMethods) {
+function deriveAnnotationRegistries (index, state, entryMethods, giveUp = null) {
   const abstain = (msg) => state.diagnostics.abstains.push(msg)
+  // HF171: a give-up after which a registration the server REQUIRES can stay unseen goes down the
+  // caller's road (a row beside the same sentence); with no road handed in it is the sentence alone
+  const unseen = (msg, facts) => (giveUp ? giveUp(msg, facts) : abstain(msg))
+  const jarOf = (info) => (info && info.jar && info.jar.label) || null
   const components = []
   const contracts = []
   const consumeOnly = []
@@ -323,7 +327,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
         }
       }
     }
-    if (!annotationCls) { abstain(`${site}: annotation-registry idiom without a provable annotation class`); continue }
+    if (!annotationCls) { unseen(`${site}: annotation-registry idiom without a provable annotation class`, { kind: 'unread', site, jar: jarOf(entryInfo) }); continue }
 
     // 2b. id formula: the (String)->ResourceLocation helper fed by
     // getSimpleName, chased for namespace + lowercase proof
@@ -339,7 +343,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
         }
       }
     }
-    if (!namespace) { abstain(`${site}: id-formula helper did not prove a namespace + lowercase transform`); continue }
+    if (!namespace) { unseen(`${site}: id-formula helper did not prove a namespace + lowercase transform`, { kind: 'unread', site, jar: jarOf(entryInfo) }); continue }
 
     // 2c. direction map: $SwitchMap holder x switch arms
     let directionByConst = null
@@ -385,7 +389,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
         }
       }
     }
-    if (!directionByConst) { abstain(`${site}: direction switch did not prove an enum->registrar mapping`); continue }
+    if (!directionByConst) { unseen(`${site}: direction switch did not prove an enum->registrar mapping`, { kind: 'unread', site, jar: jarOf(entryInfo) }); continue }
 
     // 2d. registrar version + optional from the ENTRY method
     let version = null
@@ -400,7 +404,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
       }
     }
     if (version === null && entryInfo.jar && entryInfo.jar.modVersion) version = entryInfo.jar.modVersion
-    if (version === null) { abstain(`${site}: annotation registry with no derivable registrar version`); continue }
+    if (version === null) { (optional ? abstain : unseen)(`${site}: annotation registry with no derivable registrar version`, { kind: 'unread', site, jar: jarOf(entryInfo) }); continue }
 
     // 3. census: annotated classes ∩ site-<clinit> class constants
     const clinitCensus = new Set()
@@ -441,7 +445,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
         .map((v) => v.constName)
       if (consts.length > 0) censusClasses.push({ name, consts })
     }
-    if (censusClasses.length === 0) { abstain(`${site}: annotation registry with an empty provable census`); continue }
+    if (censusClasses.length === 0) { (optional ? abstain : unseen)(`${site}: annotation registry with an empty provable census`, { kind: 'unread', site, jar: jarOf(entryInfo) }); continue }
 
     registries.push({ site, namespace, version, optional, annotation: annotationCls, classes: censusClasses.length })
     debug(`annotation-registry: ${site} -> ns=${namespace} version=${version} optional=${optional} census=${censusClasses.length}`)
@@ -453,7 +457,7 @@ function deriveAnnotationRegistries (index, state, entryMethods) {
       const id = idOf(name)
       for (const constName of consts) {
         const spec = directionByConst[constName]
-        if (!spec) { abstain(`${id}: direction ${constName} has no proven registrar mapping — that registration is unclaimed`); continue }
+        if (!spec) { (optional ? abstain : unseen)(`${id}: direction ${constName} has no proven registrar mapping — that registration is unclaimed`, { kind: 'undecided', id, site, jar: jarOf(entryInfo), reg: { registrar: { version, optional: false } } }); continue }
         components.push({
           id,
           version,
