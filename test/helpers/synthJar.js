@@ -192,8 +192,29 @@ class Asm {
 //     fields?: [{name, desc, flags?}],
 //     annotations?: [{type: 'Lfoo/Bar;', elements: [{name, enums:
 //       [{type: 'Lfoo/Dir;', const: 'X'}]}]}]  (RuntimeVisibleAnnotations),
+//       HF172: an element may instead carry `classes` (['Lfoo/Bar;'], the
+//       @Mixin value shape), `strings` (['name'], an injector's `method`
+//       shape), `annotations` (nested ones, the `at` shape) or `string`
+//       (ONE string, an @At value); a method may carry `annotations` too,
 //     bootstrapMethods?: [{refKind, owner, name, desc}],
-//     methods: [{name, desc, flags, code(asm)=>void}] }
+//     methods: [{name, desc, flags, annotations?, code(asm)=>void}] }
+const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16BE(v, 0); return b }
+const tag = (t) => Buffer.from(t, 'utf8')
+// one annotation structure (JVMS 4.7.16): the type and its element-value pairs
+function annotationBytes (cp, a) {
+  const chunks = [u16(cp.utf8(a.type)), u16((a.elements || []).length)]
+  for (const el of a.elements || []) {
+    chunks.push(u16(cp.utf8(el.name)))
+    if (typeof el.string === 'string') chunks.push(tag('s'), u16(cp.utf8(el.string)))
+    else if (el.classes) { chunks.push(tag('['), u16(el.classes.length)); for (const c of el.classes) chunks.push(tag('c'), u16(cp.utf8(c))) } else if (el.strings) { chunks.push(tag('['), u16(el.strings.length)); for (const s of el.strings) chunks.push(tag('s'), u16(cp.utf8(s))) } else if (el.annotations) { chunks.push(tag('['), u16(el.annotations.length)); for (const n of el.annotations) chunks.push(tag('@'), annotationBytes(cp, n)) } else {
+      chunks.push(tag('['), u16(el.enums.length))
+      for (const e of el.enums) chunks.push(tag('e'), u16(cp.utf8(e.type)), u16(cp.utf8(e.const)))
+    }
+  }
+  return Buffer.concat(chunks)
+}
+const annotationsBody = (cp, list) => Buffer.concat([u16(list.length), ...list.map((a) => annotationBytes(cp, a))])
+
 function buildClass (spec) {
   const cp = new ConstantPool()
   const thisIdx = cp.cls(spec.name)
@@ -225,26 +246,16 @@ function buildClass (spec) {
   let annoBody = null
   if (spec.annotations && spec.annotations.length > 0) {
     annoAttrName = cp.utf8('RuntimeVisibleAnnotations')
-    const chunks = []
-    const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16BE(v, 0); return b }
-    chunks.push(u16(spec.annotations.length))
-    for (const a of spec.annotations) {
-      chunks.push(u16(cp.utf8(a.type)), u16((a.elements || []).length))
-      for (const el of a.elements || []) {
-        chunks.push(u16(cp.utf8(el.name)))
-        chunks.push(Buffer.from('[', 'utf8'), u16(el.enums.length))
-        for (const e of el.enums) {
-          chunks.push(Buffer.from('e', 'utf8'), u16(cp.utf8(e.type)), u16(cp.utf8(e.const)))
-        }
-      }
-    }
-    annoBody = Buffer.concat(chunks)
+    annoBody = annotationsBody(cp, spec.annotations)
   }
 
   const methods = spec.methods.map((m) => {
     const asm = new Asm(cp)
     m.code(asm)
-    return { nameIdx: cp.utf8(m.name), descIdx: cp.utf8(m.desc), flags: m.flags != null ? m.flags : 0x0009, body: asm.code() }
+    const row = { nameIdx: cp.utf8(m.name), descIdx: cp.utf8(m.desc), flags: m.flags != null ? m.flags : 0x0009, body: asm.code() }
+    // HF172: a method's own RuntimeVisibleAnnotations (an injector on a mixin's handler)
+    if (m.annotations && m.annotations.length > 0) { row.annoName = cp.utf8('RuntimeVisibleAnnotations'); row.anno = annotationsBody(cp, m.annotations) }
+    return row
   })
 
   const parts = []
@@ -294,7 +305,7 @@ function buildClass (spec) {
     mh.writeUInt16BE(m.flags, 0)
     mh.writeUInt16BE(m.nameIdx, 2)
     mh.writeUInt16BE(m.descIdx, 4)
-    mh.writeUInt16BE(1, 6) // one attribute: Code
+    mh.writeUInt16BE(m.anno ? 2 : 1, 6) // attributes: Code, and the method's annotations when it has any
     const codeLen = 12 + m.body.length
     const ah = Buffer.alloc(6)
     ah.writeUInt16BE(codeAttr, 0)
@@ -305,6 +316,12 @@ function buildClass (spec) {
     cb.writeUInt32BE(m.body.length, 4)
     const tail = Buffer.alloc(4) // exception_table_length=0, attributes_count=0
     parts.push(mh, ah, cb, m.body, tail)
+    if (m.anno) {
+      const h = Buffer.alloc(6)
+      h.writeUInt16BE(m.annoName, 0)
+      h.writeUInt32BE(m.anno.length, 2)
+      parts.push(h, m.anno)
+    }
   }
   const classAttrs = []
   if (bsmAttrName != null) {

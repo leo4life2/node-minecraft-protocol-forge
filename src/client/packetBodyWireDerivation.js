@@ -441,6 +441,9 @@ function scanClass (parsed, aliases, unit, load) {
   const targets = [].concat(mixin.elements.value || [], mixin.elements.targets || [])
     .filter((t) => typeof t === 'string').map((t) => t.replace(/^L|;$/g, '').replace(/\./g, '/'))
   const found = { className: parsed.className, targets, jar: path.basename(unit.jarPath), nested: unit.nested, mod: unit.mod, injections: [], payloadInjections: [], otherTargets: [], handles: [], unresolved: [] }
+  // HF172: every class the @Mixin names, resolved the way an injection's owner is. A method reference without an owner is ONE row, on the
+  // first class (below); the mixin's injections land in every class it names, and a stop of this jar holds back all of them (touchedClasses)
+  found.targetOwners = targets.map((raw) => ({ owner: aliases.resolveClass(raw), resolved: aliases.resolvedBy(raw) !== null }))
   for (const m of parsed.methods) {
     for (const a of annsAt(parsed, m.annotationsAt, m.invisibleAnnotationsAt)) {
       const inj = String(a.type).match(INJECTOR_RE)
@@ -880,11 +883,13 @@ function instructionsSet (row) {
 }
 
 // HF172: the packet classes a jar's mixins inject into - the owner of every read / write / ctor injection and the tabled owner of every
-// injection outside that law (scanClass names the owner of both). null = they cannot be told: an owner is a runtime name and this game
-// version carries no runtime-name column that says which class it is (with a column such an owner is outside the packet table).
+// injection outside that law (scanClass names the owner of both), and beside each of them every other class its mixin names, under the
+// same test: a mixin's injections land in every class of its @Mixin, and a reference without an owner is a row on the first one only.
+// null = they cannot be told: an owner or a named class is a runtime name and this game version carries no runtime-name column that says
+// which class it is (with a column such a class is outside the packet table).
 function touchedClasses (mixins, version) {
   const table = packetTableFor(version)
-  const rows = mixins.flatMap((m) => [...m.injections, ...(m.otherTargets || [])])
+  const rows = mixins.flatMap((m) => [...m.injections, ...(m.otherTargets || [])].flatMap((r) => [r, ...(m.targetOwners || []).filter((t) => t.owner !== r.owner).map((t) => ({ owner: t.owner, resolved: t.resolved, side: r.side }))]))
   if (!runtimeNameColumn(version) && rows.some((r) => !r.resolved)) return null
   const out = new Set()
   for (const r of rows) if (r.resolved && (r.side || table[r.owner])) out.add(r.owner)
@@ -948,7 +953,6 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
     if (spec.abstain) { stops.push({ result: { ...spec, mod: spec.abstain.mod }, touches: touchedClasses(mixins, version) }); continue }
     if (!spec.exts.length) continue
     const wraps = mixins.some((m) => (m.payloadInjections || []).length > 0)
-    if (derived) { stops.push({ result: { exts: [], provider: null, abstain: { reason: 'multiple-packet-wire-mods', detail: `${derived.mod?.name || derived.jar} and ${path.basename(jarPath)} both extend packet bodies — their order on the wire is not derivable`, packets: extPackets([...derived.exts, ...spec.exts]), wraps: wraps || !!derived.redirect, mixins: [] }, mod: derived.mod }, touches: null }); continue } // two jars that both extend packet bodies: the named stop of before, it holds back everything
     // HF77: a resource-key extension's value is the world key the client stands in — no record, no channel; the
     // int-record provider is derived only where a field is provider-sourced (5.x / 3.x derive byte for byte as before)
     // HF112 (R3): the record provider feeds the bytes this client WRITES - a serverbound extension; a clientbound-only extension is read
@@ -961,6 +965,10 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
     if (prov.abstain) { stops.push({ result: { exts: [], provider: null, abstain: { ...prov.abstain, mixins: mixins.map((m) => `${m.className} in ${m.jar}${m.nested ? ` nested ${m.nested}` : ''}`), mod, jar: path.basename(jarPath), packets: extPackets(spec.exts), wraps }, mod }, touches: touchedClasses(mixins, version) }); continue }
     const rd = deriveRedirect(mixins, load, prov.provider)
     if (rd.abstain) { stops.push({ result: { exts: [], provider: null, abstain: { ...rd.abstain, mod, jar: path.basename(jarPath), packets: extPackets(spec.exts), wraps: true }, mod }, touches: touchedClasses(mixins, version) }); continue }
+    // HF172: the stop of two jars stands BELOW the stops of one jar, so the result does not depend on the order the jars are read in: a jar that
+    // stops at its provider or its redirect is that jar's own stop (it holds back the classes it touches) whether it is read before or after
+    // the jar that derives; only two jars that both derive to the end are the named stop of two
+    if (derived) { stops.push({ result: { exts: [], provider: null, abstain: { reason: 'multiple-packet-wire-mods', detail: `${derived.mod?.name || derived.jar} and ${path.basename(jarPath)} both extend packet bodies — their order on the wire is not derivable`, packets: extPackets([...derived.exts, ...spec.exts]), wraps: wraps || !!derived.redirect, mixins: [] }, mod: derived.mod }, touches: null }); continue } // two jars that both extend packet bodies: the named stop of before, it holds back everything
     derived = { exts: spec.exts, provider: prov.provider, providerOmitted: !needsProvider && providerSourced ? 'clientbound-only' : null, redirect: rd.redirect, abstain: null, mod, jar: path.basename(jarPath), nested: spec.exts[0].mixin.nested }
   }
   return { ...settleScan(derived, stops, empty), ...receipts }

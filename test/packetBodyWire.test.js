@@ -872,6 +872,30 @@ describe('HF172 one jar\'s stop is its own, a payload before the install is kept
   const LOOK = { x: 1, y: 2, z: 3, yaw: 0, pitch: 0, onGround: true }
   const channelsOf = (spec) => { const a = spec.exts.map((e) => e.guard && e.guard.armedBy).find((g) => g && g.channel); return [a.channel, a.reply].filter(Boolean) }
   const serverPositionWithTheExtension = (c) => c.emit('packet', { x: 0, y: 64, z: 0, yaw: 0, pitch: 0, flags: 0, teleportId: 1, packetBodyWire0: 0 }, { state: 'play', name: 'position' })
+  // HF172 round 3: what the cases below add
+  const { buildClass } = require('./helpers/synthJar')
+  const POSROT = 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$PosRot'
+  const respawn = (c, key) => { const o = {}; let x = o; const p = worldKeyFieldOf(c.version, 'respawn') || ['worldName']; p.slice(0, -1).forEach((k) => { x = x[k] = {} }); x[p[p.length - 1]] = key; c.emit('packet', o, { state: 'play', name: 'respawn' }) }
+  const packetsOf = (rows) => (rows || []).map((e) => `${e.direction}/${e.packet}`).sort()
+  // a MADE jar (its one class is written by the test helper, no mod's bytes): ONE mixin that names TWO move classes; its one injection
+  // stands outside the read / write law and its method reference carries no owner, so the injection lands in both classes
+  const twoTargets = () => {
+    const p = path.join(tmp, 'zz-two-targets.jar')
+    if (fs.existsSync(p)) return p
+    const mixin = buildClass({
+      name: 'synth/hf172/mixin/MixinTwoMoves',
+      annotations: [{ type: 'Lorg/spongepowered/asm/mixin/Mixin;', elements: [{ name: 'value', classes: [`L${POS};`, `L${POSROT};`] }] }],
+      methods: [{
+        name: 'onCodec',
+        desc: '(Lnet/minecraft/network/FriendlyByteBuf;Lorg/spongepowered/asm/mixin/injection/callback/CallbackInfo;)V',
+        flags: 0x0002,
+        annotations: [{ type: 'Lorg/spongepowered/asm/mixin/injection/Inject;', elements: [{ name: 'method', strings: ['codec'] }, { name: 'at', annotations: [{ type: 'Lorg/spongepowered/asm/mixin/injection/At;', elements: [{ name: 'value', string: 'HEAD' }] }] }] }],
+        code: (a) => a.ret()
+      }]
+    })
+    fs.writeFileSync(p, buildJar([{ name: 'synth/hf172/mixin/MixinTwoMoves.class', data: mixin }]))
+    return p
+  }
 
   for (const [label, order] of [['the widening jar read first', (w, o) => [w, o]], ['the other jar read first', (w, o) => [o, w]]]) {
     it(`a widening jar beside a jar with a lone injection outside the law into a clientbound class (${label}): the five extensions are derived and installed, the other jar's stop is reported in its own words`, function () {
@@ -910,12 +934,13 @@ describe('HF172 one jar\'s stop is its own, a payload before the install is kept
     assert.equal(r.abstain.packets.length, 10)
   })
 
-  it('a stopped jar that injects into the classes another jar extends holds those extensions back: every move class touched = nothing installed, the stop of before, and the held-back extensions are counted', function () {
+  it('a stopped jar that injects into the classes another jar extends holds those extensions back: every move class touched = nothing installed and the stop of before (both hold on the tree before the fix too, by design: it installed nothing there either), and what is new: the held-back extensions are named and counted', function () {
     const other = everyMove()
     const alone = scanPacketBodyWireExtensions([other], { version: '1.21.1' })
     const r = scanPacketBodyWireExtensions([WORLD_KEY_JAR, other], { version: '1.21.1' })
     assert.equal(r.exts.length, 0)
     assert.deepEqual(r.abstain, alone.abstain)
+    assert.ok(Array.isArray(r.heldBack), 'the scan names the extensions a stop held back (the tree before the fix has no such field: this line and the next are what is red there)')
     assert.equal(r.heldBack.length, 5, 'the five extensions of the widening jar, each on a class the stopped jar injects into')
     assert.ok(r.heldBack.every((h) => h.by.jar === path.basename(other) && h.by.reason === 'packet-target-not-derivable'))
     assert.equal(installPacketBodyWireExtension(mkClient('1.21.1'), r).installed, false)
@@ -970,5 +995,84 @@ describe('HF172 one jar\'s stop is its own, a payload before the install is kept
     c.emit('packet', { channel: spec.provider.channels.find((x) => x.framing === 'raw').id, data: dimSync() }, { state: 'play', name: 'custom_payload' })
     c.write('position_look', LOOK)
     assert.equal(c.writes.length, 2); assert.equal(c.bytes(1).length, 38); assert.equal(r.fills, 1)
+  })
+
+  it('a stopped jar whose ONE mixin names TWO move classes, its method reference without an owner, holds back BOTH classes in either order of the jars: the stop is reported, neither class is installed wide, and once the server has armed the wire the packet of the second class is held too', function () {
+    const other = twoTargets()
+    const alone = scanPacketBodyWireExtensions([other], { version: '1.21.1' })
+    assert.equal(alone.abstain.reason, 'packet-target-not-derivable', 'the made jar is a jar the scan stops at')
+    for (const jars of [[WORLD_KEY_JAR, other], [other, WORLD_KEY_JAR]]) {
+      const r = scanPacketBodyWireExtensions(jars, { version: '1.21.1' })
+      assert.equal(r.stops.length, 1); assert.equal(r.stops[0].reason, 'packet-target-not-derivable'); assert.equal(r.stops[0].jar, path.basename(other))
+      assert.deepEqual([...r.stops[0].touches].sort(), [POS, POSROT], 'every class the mixin names is a class the stopped jar changes, not the first one only')
+      assert.deepEqual(packetsOf(r.heldBack), ['toServer/position', 'toServer/position_look'])
+      assert.ok(r.heldBack.every((h) => h.by.jar === path.basename(other) && h.by.reason === 'packet-target-not-derivable'))
+      assert.deepEqual(packetsOf(r.exts), ['toClient/position', 'toServer/flying', 'toServer/look'])
+      const c = mkClient('1.21.1'); const rec = installPacketBodyWireExtension(c, r, { announcedChannels: channelsOf(r) })
+      assert.equal(rec.installed, true); assert.equal(rec.armed, true)
+      login(c, 'minecraft:overworld')
+      c.write('position_look', LOOK)
+      assert.equal(c.writes.length, 0, 'armed: the packet of the SECOND class the mixin names is held, neither wide nor plain'); assert.equal(rec.heldMoves, 1)
+      c.write('look', { yaw: 1, pitch: 1, onGround: true })
+      assert.equal(c.writes.length, 1, 'a class the stopped jar leaves alone still leaves wide'); assert.equal(rec.fills, 1)
+    }
+  })
+
+  it('a later spell of holding has its own 20 seconds: held, the record arrives, a move leaves filled, then a respawn into a world the record lacks: nothing ends before 20 s of the NEW spell, and at its 20 s the embedder is told once', function () {
+    const spec = scanPacketBodyWireExtensions([FABRIC], { version: '1.20.1' })
+    let t = 5000; const bound = []
+    const c = mkClient('1.20.1')
+    const r = installPacketBodyWireExtension(c, spec, { clock: () => t, holdMs: 20000, onHoldBound: (f) => bound.push(f) })
+    login(c, 'minecraft:overworld')
+    serverPositionWithTheExtension(c)
+    assert.equal(r.armed, true)
+    c.write('position_look', LOOK); t += 15000; c.write('position_look', LOOK)
+    assert.equal(c.writes.length, 0, 'the first spell: armed and no record yet'); assert.equal(r.heldMoves, 2); assert.deepEqual(bound, [])
+    c.emit('packet', { channel: spec.provider.channels.find((x) => x.framing === 'raw').id, data: dimSync() }, { state: 'play', name: 'custom_payload' })
+    c.write('position_look', LOOK)
+    assert.equal(c.writes.length, 1, 'the record came: the move leaves filled and the first spell is over'); assert.equal(c.bytes(0).length, 38); assert.equal(r.fills, 1)
+    respawn(c, 'minecraft:the_end') // a world the record has no entry for: the value is lost again
+    t += 6000 // 21 s after the FIRST spell began
+    c.write('position_look', LOOK)
+    assert.equal(c.writes.length, 1, 'held again'); assert.equal(r.heldMoves, 3)
+    assert.deepEqual(bound, [], 'the new spell starts its own clock at its first held move: 21 s after the first spell began nothing ends'); assert.ok(!r.holdEnded)
+    t += 19999; c.write('look', { yaw: 1, pitch: 1, onGround: true })
+    assert.deepEqual(bound, [], '19,999 ms of the new spell'); assert.equal(c.writes.length, 1)
+    t += 1; c.write('flying', { onGround: true })
+    assert.equal(bound.length, 1, '20 s of the new spell'); assert.deepEqual(bound[0], { source: 'provider', packet: 'flying', ms: 20000, moves: 3 }); assert.deepEqual(r.holdEnded, bound[0])
+    t += 5000; c.write('position', { x: 1, y: 2, z: 3, onGround: true })
+    assert.equal(bound.length, 1, 'told once'); assert.equal(c.writes.length, 1, 'and still nothing plain'); assert.equal(r.heldMoves, 6)
+  })
+
+  it('a kept payload reaches only the provider of its own channel: a valid record kept on ANOTHER channel is read by nobody, and the armed move is held', function () {
+    const spec = scanPacketBodyWireExtensions([FABRIC], { version: '1.20.1' })
+    // the record itself, valid for either framing a provider channel can have (as it is, and behind one index byte), on channels that are not the provider's
+    const elsewhere = [{ channel: 'some:other', data: dimSync() }, { channel: 'some:indexed', data: Buffer.concat([Buffer.from([0]), dimSync()]) }]
+    assert.ok(elsewhere.every((p) => !spec.provider.channels.some((x) => x.id === p.channel)))
+    const c = mkClient('1.20.1')
+    const r = installPacketBodyWireExtension(c, spec, { earlyPayloads: elsewhere })
+    assert.equal(r.provider.early, 0, 'no kept payload was the provider\'s to read'); assert.equal(r.provider.synced, 0); assert.equal(r.provider.rejected, 0); assert.equal(r.provider.ids, null)
+    login(c, 'minecraft:overworld')
+    serverPositionWithTheExtension(c)
+    assert.equal(r.armed, true)
+    c.write('position_look', LOOK)
+    assert.equal(c.writes.length, 0, 'armed and no value: the move is held'); assert.equal(r.heldMoves, 1); assert.equal(r.fills, 0)
+  })
+
+  it('the scan\'s result does not depend on the order the jars are read in: a jar that derives extensions and then stops at its provider is that jar\'s own stop, read before or after the jar that derives to the end', function () {
+    const CPOS = 'net/minecraft/network/protocol/game/ClientboundPlayerPositionPacket'
+    // a bend of the second fixture: three of its four move mixins are gone (it extends ONE move class and the clientbound position) and the
+    // transport reader of its record is gone (it stops at its provider); its identity is renamed
+    const stopper = bend('aa-provider-stop.jar', { drop: (p) => /q_misc_util\/MiscNetworking\.class$/.test(p) || /MixinServer(b|B)oundMovePlayerPacket(PosRot|Rot|StatusOnly)\.class$/.test(p), text: renamed })
+    const alone = scanPacketBodyWireExtensions([stopper], { version: '1.20.1' })
+    assert.equal(alone.abstain.reason, 'unknown-value-provider'); assert.deepEqual(packetsOf(alone.abstain.packets), ['toClient/position', 'toServer/position'])
+    const view = (r) => ({ exts: packetsOf(r.exts), abstain: r.abstain && r.abstain.reason, provider: !!r.provider, jar: r.jar || null, heldBack: (r.heldBack || []).map((h) => `${h.direction}/${h.packet} by ${h.by.reason} of ${h.by.jar}`).sort(), stops: (r.stops || []).map((s) => ({ reason: s.reason, jar: s.jar || null, touches: s.touches && [...s.touches].sort() })) })
+    const stopperFirst = view(scanPacketBodyWireExtensions([stopper, FABRIC], { version: '1.20.1' }))
+    const stopperLast = view(scanPacketBodyWireExtensions([FABRIC, stopper], { version: '1.20.1' }))
+    assert.deepEqual(stopperLast, stopperFirst, 'the same two jars, the other order: the same result')
+    assert.deepEqual(stopperLast.exts, ['toServer/flying', 'toServer/look', 'toServer/position_look'], 'the classes the stopped jar leaves alone are installed')
+    assert.deepEqual(stopperLast.heldBack, [`toClient/position by unknown-value-provider of ${path.basename(stopper)}`, `toServer/position by unknown-value-provider of ${path.basename(stopper)}`], 'the classes its own extensions name are held back')
+    assert.equal(stopperLast.abstain, null); assert.equal(stopperLast.jar, path.basename(FABRIC)); assert.equal(stopperLast.stops.length, 1)
+    assert.equal(stopperLast.stops[0].reason, 'unknown-value-provider'); assert.ok([CPOS, POS].every((k) => stopperLast.stops[0].touches.includes(k)))
   })
 })
