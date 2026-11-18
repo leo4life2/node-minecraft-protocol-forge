@@ -1,0 +1,247 @@
+{
+ "k-direct-undecided.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-plain.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-decided.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-callee.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-calleeplain.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-none.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: required channel with no derivable version — join will be refused by the server"
+  ],
+  "sites": 1
+ },
+ "k-direct-claimed.jar": {
+  "components": {
+   "configuration": [],
+   "play": [
+    {
+     "id": "kmod:direct",
+     "version": "7",
+     "flow": "clientbound",
+     "optional": false,
+     "source": "synth/k/Init",
+     "versionSource": "constant",
+     "versionFrom": "registrar-argument"
+    }
+   ]
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-shared-undecided.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated optional channel with unresolved version — safely unclaimed",
+   "kmod:two: aggregated optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-shared-plain.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated optional channel with unresolved version — safely unclaimed",
+   "kmod:two: aggregated optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-shared-decided.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated optional channel with unresolved version — safely unclaimed",
+   "kmod:two: aggregated optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-shared-callee.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [
+   "synth/k/Holder (deep walk from synth/k/Init.onRegister): playToClient optional registration with unresolved payload type id — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-shared-calleeplain.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [
+   "synth/k/Holder (deep walk from synth/k/Init.onRegister): playToClient optional registration with unresolved payload type id — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-shared-none.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated required channel with no derivable version — join will be refused by the server",
+   "kmod:two: aggregated required channel with no derivable version — join will be refused by the server"
+  ],
+  "sites": 2
+ },
+ "k-silent.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [
+   "synth/k/Init.onRegister: the registrar never reaches a registration (deep walk incl. 0 static registries) — no channel claimed from this entry"
+  ],
+  "sites": 0
+ },
+ "k-late.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-late-lib.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-late-entry.jar": {
+  "components": {
+   "configuration": [],
+   "play": [
+    {
+     "id": "kmod:late",
+     "version": "1",
+     "flow": "clientbound",
+     "optional": false,
+     "source": "synth/k/Late",
+     "versionSource": "constant",
+     "versionFrom": "registrar-argument"
+    }
+   ]
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-garbage.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-nested-bad.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ }
+}

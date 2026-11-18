@@ -130,14 +130,24 @@ const REGISTRATION_METHODS = {
 //   kind 'unread'          the reading stopped (a budget, too many targets, a
 //                          shape it does not follow): registrations exist there
 //                          that were not seen
+//   kind 'unseen'          HF175: nothing of the registrations there was seen (no
+//                          method, no direction, no id): an entry whose registrar
+//                          never reaches a registration, a jar or a nested jar that
+//                          could not be read, a jar in which a class asks the event
+//                          for a registrar in code no entry leads to. The row names the
+//                          jar and the entry or the class, nothing else
 // An entry skipped at a gate (another mod's presence, a launch flag) is of kind
 // 'unread': the server's own mods and flags decide that gate, so a registration
 // the server requires can sit behind it unseen. The annotation-registry reader
 // hands its give-ups over the same way (annotationRegistryDerivation.js).
 // A proven-optional registration ("safely unclaimed": the server drops a channel
-// the client lacks), a note about dropped overrides and an entry whose walk
-// ended without meeting a registration call write a sentence only: no
+// the client lacks) and a note about dropped overrides write a sentence only: no
 // registration a server can refuse for was left unresolved there.
+// HF175: PROVEN optional means the call of optional() was met with no undecided
+// condition before it on the walked path - in its own method and in the callers
+// that led there (provenOptional below). An optional() that is not proven is
+// handed over like a required registration: with no derivable version a row of
+// kind 'version', never "safely unclaimed".
 function noteUnresolvedSite (diagnostics, says, facts) {
   const reg = facts.reg || null
   const spec = reg && reg.method ? REGISTRATION_METHODS[reg.method] : null
@@ -168,6 +178,55 @@ function giveUp (diagnostics, says, facts) {
   noteUnresolvedSite(diagnostics, says, facts)
 }
 
+// HF175: can registrations exist behind an entry that reached none? Yes when the
+// entry asks the event for a registrar (a registrar nobody registers with went
+// somewhere the walk did not see) or hands the event or a registrar on: a call
+// whose parameters name one of the two types, a field put of one, a lambda that
+// captures one. An entry that does neither registers nothing by itself.
+function entryMayRegister (info, method) {
+  const cp = info.cp
+  const code = method.code
+  let may = false
+  walkLinear(code, cp, (op, pc) => {
+    if (may || op < 0xb3 || op > 0xba || op === 0xb4) return
+    const i = code.readUInt16BE(pc + 1)
+    let owner = null
+    let name = null
+    let desc = null
+    if (op === 0xba) {
+      const nat = cp[i] && cp[cp[i].natIndex]
+      desc = nat ? cpUtf8(cp, nat.descIndex) : null
+    } else {
+      const ref = cpRef(cp, i)
+      if (ref) { owner = ref.owner; name = ref.name; desc = ref.desc }
+    }
+    if (owner === EVENT_TYPE && name === 'registrar') { may = true; return }
+    if (!desc || owner === EVENT_TYPE || owner === REGISTRAR_TYPE) return
+    const given = desc.startsWith('(') ? desc.slice(1, desc.indexOf(')')) : desc
+    if (given.includes(`L${REGISTRAR_TYPE};`) || given.includes(`L${EVENT_TYPE};`)) may = true
+  })
+  return may
+}
+
+// HF175: the first class of a unit (by name) whose constant pool holds a call of
+// the event's registrar() (a method reference whose owner is the event); null
+// when no class of the unit asks the event for a registrar
+function eventAskerOf (index, unit) {
+  for (const name of [...(unit.classNames || [])].sort()) {
+    const bytes = index.rawBytes(name)
+    if (!bytes || !bytes.includes(EVENT_TYPE)) continue
+    const info = index.get(name)
+    if (!info || !info.cp) continue
+    for (let i = 1; i < info.cp.length; i++) {
+      const c = info.cp[i]
+      if (!c || !c.classIndex || !c.natIndex) continue
+      const ref = cpRef(info.cp, i)
+      if (ref && ref.owner === EVENT_TYPE && ref.name === 'registrar') return name
+    }
+  }
+  return null
+}
+
 // ---------- jar walking ----------
 
 // HF73b: every top-level jar read is a UNIT of the index (one per path, in
@@ -182,6 +241,7 @@ function collectJarClasses (jarPath, out, diagnostics, jarLabel) {
     buf = fs.readFileSync(jarPath)
   } catch (err) {
     diagnostics.errors.push(`${jarLabel}: unreadable (${err.message})`)
+    noteUnresolvedSite(diagnostics, `${jarLabel}: unreadable`, { kind: 'unseen', jar: jarLabel }) // HF175: nothing of this jar was read
     if (out.noteUnit) out.noteUnit({ path: jarPath, label: jarLabel, sha1: null, unreadable: err.message })
     return
   }
@@ -203,6 +263,7 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = nu
     entries = zipCentralEntries(buf)
   } catch (err) {
     diagnostics.errors.push(`${jarLabel}: bad zip (${err.message})`)
+    noteUnresolvedSite(diagnostics, `${jarLabel}: bad zip`, { kind: 'unseen', jar: jarLabel }) // HF175: nothing of this jar was read
     return
   }
   let modVersion = null
@@ -264,6 +325,7 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = nu
         collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${nested.get(e.name).relPath}`, depth + 1, unit)
       } catch (err) {
         diagnostics.errors.push(`${jarLabel}!${e.name}: nested jar unreadable (${err.message})`)
+        noteUnresolvedSite(diagnostics, `${jarLabel}!${e.name}: nested jar unreadable`, { kind: 'unseen', jar: `${jarLabel}!${nested.get(e.name).relPath}` }) // HF175
       }
     }
   }
@@ -2107,6 +2169,7 @@ function invokeLambda (index, state, opts, lam, args, push, hooks = {}) {
         locals: isStatic ? seedArgLocals(impl.desc, callArgs) : seedArgLocals(impl.desc, callArgs, recvVal ?? UNKNOWN),
         recordPutstatic: false,
         onReturn: (v) => { returned = v },
+        walk: opts.walk, // HF175: the callee inherits the caller's undecided flag
         onRegistration: opts.onRegistration
       }, hooks)
     } finally {
@@ -2162,7 +2225,12 @@ function concatWithConstants (classInfo, bsmIndex, captured) {
 
 function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks = {}) {
   state.aggCache = state.aggCache || new Map()
-  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags }, walk: { iterAdvances: 0 } }
+  // HF175: a callee inherits its caller's undecided flag (a helper reached past
+  // an undecided conditional is under it: an `.optional()` inside it is not
+  // proven); its own conditionals never leak back - the walk object is the
+  // method's own. The flag feeds provenOptional alone: no path and no claim
+  // of the walk reads it.
+  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags }, walk: { iterAdvances: 0, undecided: !!(opts.walk && opts.walk.undecided) } }
   const cp = classInfo.cp
   const code = method.code
   const stack = []
@@ -2918,6 +2986,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
           locals: seedArgLocals(ref.desc, argVals),
           recordPutstatic: false,
           onReturn: (v) => { returned = v },
+          walk: opts.walk, // HF175: the callee inherits the caller's undecided flag
           onRegistration: opts.onRegistration
         }, hooks)
       } finally {
@@ -2946,6 +3015,7 @@ function inlineDispatch (index, state, opts, recv, ref, argVals, push, hooks = {
       locals: seedArgLocals(ref.desc, argVals, recv),
       recordPutstatic: false,
       onReturn: (v) => { returned = v },
+      walk: opts.walk, // HF175: the callee inherits the caller's undecided flag
       onRegistration: opts.onRegistration
     }, hooks)
   } finally {
@@ -3448,6 +3518,7 @@ function resolveAggregatedRegistrations (index, state, pending) {
             versionFromParam: r.registrar ? !!r.registrar.versionFromParam : false,
             namespace: r.registrar ? r.registrar.namespace : null,
             optional: r.registrar ? r.registrar.optional : false,
+            optionalUndecided: provenOptional(r) ? false : !!(r.registrar && r.registrar.optional), // HF175: optional() met under a condition the walk did not decide
             flow: spec.flow,
             protocols: spec.protocols,
             method: r.method,
@@ -4506,6 +4577,8 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
   }
 
   const registrations = [...seedRegistrations]
+  const unseenEntries = [] // HF175: entries whose registrar or event left the walk with no registration reached
+  const silentSentences = new Set() // HF175: the sentences of the entries that reached no registration
   const silentEntries = []
   const presenceGates = read.gates
   const censusHas = (modId) => { const v = ALWAYS_PRESENT_MOD_IDS.has(modId) || diagnostics.jars.some((j) => (j.modIds || []).includes(modId)); deps.present[modId] = v; return v }
@@ -4652,7 +4725,13 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       if (entry.linearSites.length) diagnostics.unresolvedSites.push(...entry.linearSites)
     }
     if (registrations.length === before && !entry.soft) {
-      diagnostics.abstains.push(`${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size + own.size} static registr${registries.size + own.size === 1 ? 'y' : 'ies'}) — no channel claimed from this entry`)
+      const says = `${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size + own.size} static registr${registries.size + own.size === 1 ? 'y' : 'ies'}) — no channel claimed from this entry`
+      diagnostics.abstains.push(says)
+      silentSentences.add(says)
+      // HF175: an entry that asks the event for a registrar, or hands the event on, and reaches no registration lost it to code the
+      // walk did not see - registrations may exist there. Its row is written at the unit's end (below), unless another reader of
+      // this unit claimed from the entry's class. An entry that does neither registers nothing: the sentence alone, as before
+      if (entryMayRegister(info, method)) unseenEntries.push({ says, cls: info.className, site: `${info.className}.${method.method}` })
     }
   }
 
@@ -4691,7 +4770,11 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     if (version === null) {
       const metaVersion = metaVersionFor(reg.registrar && reg.registrar.namespace, reg.jar)
       if (optional) {
-        diagnostics.abstains.push(`${reg.id}: optional channel with unresolved version — safely unclaimed`)
+        // HF175: only a PROVEN optional is safely unclaimed. An optional() the walk
+        // did not decide is handed over (kind version) - and stays unclaimed and
+        // listen-only exactly as before: no claim row is added for it
+        if (provenOptional(reg)) diagnostics.abstains.push(`${reg.id}: optional channel with unresolved version — safely unclaimed`)
+        else giveUp(diagnostics, `${reg.id}: channel with unresolved version whose .optional() sits under a condition this walk could not decide — unclaimed, NOT safely unclaimed (a server that requires it names it in its refusal)`, { kind: 'version', id: reg.id, reg })
         listenOnlyNamed.push(reg.id)
         continue
       }
@@ -4760,7 +4843,9 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     if (version === null) {
       const metaVersion = metaVersionFor(row.namespace, row.jar)
       if (row.optional) {
-        diagnostics.abstains.push(`${row.id}: aggregated optional channel with unresolved version — safely unclaimed`)
+        // HF175: as above, for a registration several call sites share
+        if (!row.optionalUndecided) diagnostics.abstains.push(`${row.id}: aggregated optional channel with unresolved version — safely unclaimed`)
+        else giveUp(diagnostics, `${row.id}: aggregated channel with unresolved version whose .optional() sits under a condition this walk could not decide — unclaimed, NOT safely unclaimed (a server that requires it names it in its refusal)`, { kind: 'version', id: row.id, flow: row.flow, protocols: row.protocols, jar: (row.jar && row.jar.label) || state.unitJar })
         listenOnlyNamed.push(row.id)
         continue
       }
@@ -4856,6 +4941,30 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     listen = { factory: factoryIds, fabric: fabricIds, container: containerIds }
   } catch (err) {
     diagnostics.errors.push(`listen-only derivation failed (${err.message}) — declaration rides the handler contract alone`)
+  }
+
+  // HF175 (K2): the rows of the entries that lost their registrar (collected in
+  // the entry pass above), then a jar in which a class ASKS THE EVENT for a
+  // registrar while this reading holds NOTHING of the jar (no claim, no
+  // listen-only id, no row, no registration met, no sentence of another reader):
+  // the code that asks was never entered (no method of the jar takes the event),
+  // so nothing above fired. One row of the jar, naming the first such class. A
+  // jar that only RECEIVES a registrar (a library's helper) registers when an
+  // entry of another jar hands it one, and that entry is read where it lives.
+  for (const u of unseenEntries) {
+    // another reader of this unit that accounted for the entry's class (a claim from it, a sentence about it with or
+    // without its own row: an enum or annotation registry, a platform helper) has said what is known of it
+    const outer = u.cls.split('$')[0]
+    const names = (text) => { const at = typeof text === 'string' ? text.indexOf(outer) : -1; return at >= 0 && !/[A-Za-z0-9_/]/.test(text.charAt(at + outer.length)) }
+    if (claims.some((c) => names(c.source)) || diagnostics.abstains.some((a) => a !== u.says && names(a)) || (diagnostics.unresolvedSites || []).some((x) => names(x.site))) continue
+    noteUnresolvedSite(diagnostics, u.says, { kind: 'unseen', jar: state.unitJar, site: u.site })
+  }
+  const heldNothing = claims.length === 0 && listenOnlyNamed.length === 0 && registrations.length === 0 &&
+    (diagnostics.unresolvedSites || []).length === 0 && diagnostics.abstains.every((a) => silentSentences.has(a)) &&
+    !(listen && ((listen.factory || []).length > 0 || (listen.fabric || []).length > 0 || (listen.container || []).length > 0))
+  if (heldNothing) {
+    const asker = eventAskerOf(index, unit)
+    if (asker) giveUp(diagnostics, `${asker}: this jar asks the event for a payload registrar in code no entry of it leads to — nothing of its registrations was read`, { kind: 'unseen', jar: state.unitJar, site: asker })
   }
 
   // HF73b r2 the absence facts (the index's law above)
