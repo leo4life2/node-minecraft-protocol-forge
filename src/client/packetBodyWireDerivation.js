@@ -879,11 +879,46 @@ function instructionsSet (row) {
   return out
 }
 
-// paths: mods folders and/or jar files. Returns { exts, provider, abstain, jars, mixins, mod }.
+// HF172: the packet classes a jar's mixins inject into - the owner of every read / write / ctor injection and the tabled owner of every
+// injection outside that law (scanClass names the owner of both). null = they cannot be told: an owner is a runtime name and this game
+// version carries no runtime-name column that says which class it is (with a column such an owner is outside the packet table).
+function touchedClasses (mixins, version) {
+  const table = packetTableFor(version)
+  const rows = mixins.flatMap((m) => [...m.injections, ...(m.otherTargets || [])])
+  if (!runtimeNameColumn(version) && rows.some((r) => !r.resolved)) return null
+  const out = new Set()
+  for (const r of rows) if (r.resolved && (r.side || table[r.owner])) out.add(r.owner)
+  return [...out]
+}
+
+// HF172: one jar's stop is that jar's. A stop holds back the extensions on the classes its jar injects into (every extension when the
+// classes cannot be told); what is left of the derived jar is the result, and every stop rides it as `stops` (the abstain of before
+// plus `touches`). Nothing left = the result of before for the FIRST stop, key for key; `stops` / `heldBack` are added only when they
+// say more than that abstain alone (a second stop, an extension held back).
+function settleScan (derived, stops, empty) {
+  if (!stops.length) return derived || empty
+  const kept = []; const heldBack = []
+  for (const e of derived ? derived.exts : []) {
+    const by = stops.find((s) => s.touches === null || s.touches.includes(e.packetClass))
+    if (by) heldBack.push({ direction: e.direction, packet: e.packet, packetClass: e.packetClass, guard: e.guard || null, by: { jar: by.result.abstain.jar || null, reason: by.result.abstain.reason } })
+    else kept.push(e)
+  }
+  const more = { stops: stops.map((s) => ({ ...s.result.abstain, touches: s.touches })), ...(heldBack.length ? { heldBack } : {}) }
+  if (kept.length) return { ...derived, exts: kept, ...more }
+  return stops.length > 1 || heldBack.length ? { ...stops[0].result, ...more } : stops[0].result
+}
+
+// paths: mods folders and/or jar files. Returns { exts, provider, abstain, jars, mixins, mod } and, when a jar stopped beside something more
+// (another stop, an extension that is installed or held back), { stops, heldBack }.
 function scanPacketBodyWireExtensions (paths, { version } = {}) {
   const jars = listJars(paths)
   const receipts = { jars: jars.length, mixins: [] }
-  let result = { exts: [], provider: null, redirect: null, abstain: null, mod: null }
+  const empty = { exts: [], provider: null, redirect: null, abstain: null, mod: null }
+  let derived = null // the ONE jar whose extensions are derived (a second one is the named stop below)
+  // HF172: every jar is read. A jar that stops is one entry, in the order read: `result` = the scan's whole result when that stop is the
+  // first and nothing is left to install (the object the scan returned when it ended at that jar), `touches` = the packet classes the
+  // jar injects into (null = they cannot be told, and the stop holds back every extension).
+  const stops = []
   for (const jarPath of jars) {
     let units
     try { units = collectUnits(jarPath) } catch (err) { debug(`packet-wire scan: unreadable jar ${jarPath} (${err.message})`); continue }
@@ -910,10 +945,10 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
     // the receipt lists the mixins that inject into a (de)serializer; a class whose only injections are outside the law is named by the abstain it causes, if any
     receipts.mixins.push(...mixins.filter((m) => m.injections.length || m.payloadInjections.length).map((m) => ({ className: m.className, jar: m.jar, nested: m.nested, mod: m.mod, injections: m.injections.length })))
     const spec = deriveSpec(mixins, version, load, units)
-    if (spec.abstain) { result = { ...spec, mod: spec.abstain.mod }; break }
+    if (spec.abstain) { stops.push({ result: { ...spec, mod: spec.abstain.mod }, touches: touchedClasses(mixins, version) }); continue }
     if (!spec.exts.length) continue
     const wraps = mixins.some((m) => (m.payloadInjections || []).length > 0)
-    if (result.exts.length) { result = { exts: [], provider: null, abstain: { reason: 'multiple-packet-wire-mods', detail: `${result.mod?.name || result.jar} and ${path.basename(jarPath)} both extend packet bodies — their order on the wire is not derivable`, packets: extPackets([...result.exts, ...spec.exts]), wraps: wraps || !!result.redirect, mixins: [] }, mod: result.mod }; break }
+    if (derived) { stops.push({ result: { exts: [], provider: null, abstain: { reason: 'multiple-packet-wire-mods', detail: `${derived.mod?.name || derived.jar} and ${path.basename(jarPath)} both extend packet bodies — their order on the wire is not derivable`, packets: extPackets([...derived.exts, ...spec.exts]), wraps: wraps || !!derived.redirect, mixins: [] }, mod: derived.mod }, touches: null }); continue } // two jars that both extend packet bodies: the named stop of before, it holds back everything
     // HF77: a resource-key extension's value is the world key the client stands in — no record, no channel; the
     // int-record provider is derived only where a field is provider-sourced (5.x / 3.x derive byte for byte as before)
     // HF112 (R3): the record provider feeds the bytes this client WRITES - a serverbound extension; a clientbound-only extension is read
@@ -923,12 +958,12 @@ function scanPacketBodyWireExtensions (paths, { version } = {}) {
     const needsProvider = !!serverbound && providerSourced
     const prov = needsProvider ? deriveProvider(serverbound.source, load, units) : { provider: null, abstain: null }
     const mod = mixins.find((m) => m.injections.length && m.mod)?.mod || units[0].mod || null
-    if (prov.abstain) { result = { exts: [], provider: null, abstain: { ...prov.abstain, mixins: mixins.map((m) => `${m.className} in ${m.jar}${m.nested ? ` nested ${m.nested}` : ''}`), mod, jar: path.basename(jarPath), packets: extPackets(spec.exts), wraps }, mod }; break }
+    if (prov.abstain) { stops.push({ result: { exts: [], provider: null, abstain: { ...prov.abstain, mixins: mixins.map((m) => `${m.className} in ${m.jar}${m.nested ? ` nested ${m.nested}` : ''}`), mod, jar: path.basename(jarPath), packets: extPackets(spec.exts), wraps }, mod }, touches: touchedClasses(mixins, version) }); continue }
     const rd = deriveRedirect(mixins, load, prov.provider)
-    if (rd.abstain) { result = { exts: [], provider: null, abstain: { ...rd.abstain, mod, jar: path.basename(jarPath), packets: extPackets(spec.exts), wraps: true }, mod }; break }
-    result = { exts: spec.exts, provider: prov.provider, providerOmitted: !needsProvider && providerSourced ? 'clientbound-only' : null, redirect: rd.redirect, abstain: null, mod, jar: path.basename(jarPath), nested: spec.exts[0].mixin.nested }
+    if (rd.abstain) { stops.push({ result: { exts: [], provider: null, abstain: { ...rd.abstain, mod, jar: path.basename(jarPath), packets: extPackets(spec.exts), wraps: true }, mod }, touches: touchedClasses(mixins, version) }); continue }
+    derived = { exts: spec.exts, provider: prov.provider, providerOmitted: !needsProvider && providerSourced ? 'clientbound-only' : null, redirect: rd.redirect, abstain: null, mod, jar: path.basename(jarPath), nested: spec.exts[0].mixin.nested }
   }
-  return { ...result, ...receipts }
+  return { ...settleScan(derived, stops, empty), ...receipts }
 }
 
 module.exports = { scanPacketBodyWireExtensions, packetTableFor, PACKET_CLASS_TABLE, LOADER_TRANSPORTS, RESOLVED_BY, runtimeNameColumn, buildAliases, collectUnits, splitRef, _internals: { scanClass, classLoader, deriveSpec, deriveProvider, deriveRedirect, deriveGuardArming, payloadIdOf, resourceKeyMemberOf, resourceKeyRegistryVerdict, primsInDeep, modIdentity, abstainPackets, bufMemberLabel, vanillaName, DIMENSION_REGISTRY_KEY } }

@@ -228,7 +228,7 @@ function announcedNames (src) {
 // with a `compoundKey` map of key -> value on one of the derived channels,
 // with the channel's framing) and answers the value for THIS client's key,
 // selected by the derived keySource.
-function createProvider (client, spec, receipt, observer = null) {
+function createProvider (client, spec, receipt, observer = null, early = null) {
   const state = { ids: null, dimension: null, channel: null, framing: null, index: null, rejected: 0, synced: 0 }
   receipt.provider = { kind: spec.kind, compoundKey: spec.compoundKey, valueType: spec.valueType, keySource: KEY_SOURCES[spec.keySource] ? spec.keySource : null, channels: spec.channels.map((c) => c.id), synced: 0, rejected: 0, channel: null, dimension: null, ids: null }
   const observeKey = KEY_SOURCES[spec.keySource] ? KEY_SOURCES[spec.keySource](state, receipt, observer || createWorldKeyObserver(client, receipt)) : null
@@ -248,6 +248,13 @@ function createProvider (client, spec, receipt, observer = null) {
     for (const [k, v] of Object.entries(map)) { const n = typeof v === 'bigint' ? Number(v) : Number(v); if (Number.isFinite(n)) ids[k] = n }
     state.ids = ids; state.channel = chan.id; state.framing = chan.framing; state.index = chan.framing === 'u8-index' ? data[0] : null; state.synced += 1
     Object.assign(receipt.provider, { synced: state.synced, channel: chan.id, framing: chan.framing, index: state.index, ids })
+  }
+  // HF172: what the server synced BEFORE this provider existed (the embedder kept the last payload of each channel) is read first, so
+  // a record that arrived while the scan was still out is not lost; `early` counts the kept payloads that were a record
+  if (early) {
+    let applied = 0
+    for (const p of early) { if (!p || !byId.has(p.channel)) continue; const before = state.synced; parse(byId.get(p.channel), p.data); if (state.synced > before) applied += 1 }
+    receipt.provider.early = applied
   }
   client.on('packet', (data, meta) => {
     if (!meta || (meta.state !== 'play' && meta.state !== 'configuration')) return
@@ -294,8 +301,14 @@ function redirectUnwrapper (redirect, protos, provider, receipt) {
   }
 }
 
+// HF172: how long a spell of held moves may last before the embedder is told (the embedder hands in its own play-entry hold budget)
+const DEFAULT_HOLD_MS = 20000
+
 // Returns the receipt ({ installed, reason }); idempotent per client.
-function installPacketBodyWireExtension (client, spec, { log = debug, announcedChannels = null } = {}) {
+// HF172 options: earlyPayloads = the payloads the embedder kept before this install ([{ channel, data }], the last one per channel);
+// clock / holdMs / onHoldBound = the hold of a move whose armed value is not known: the clock is read when a move is held, and
+// onHoldBound(fact) is called ONCE when a spell reaches holdMs - the moves stay held, the embedder ends the session.
+function installPacketBodyWireExtension (client, spec, { log = debug, announcedChannels = null, earlyPayloads = null, clock = Date.now, holdMs = DEFAULT_HOLD_MS, onHoldBound = null } = {}) {
   if (!client || !spec || !spec.exts || !spec.exts.length) return { installed: false, reason: 'no-extension' }
   if (client.minepalPacketBodyWire) return client.minepalPacketBodyWire
   const receipt = {
@@ -334,8 +347,16 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
     return receipt
   }
   const observer = createWorldKeyObserver(client, receipt)
-  const provider = needsProvider ? createProvider(client, spec.provider, receipt, observer) : null
-  const guarded = spec.exts.filter((e) => e.direction === 'toServer' && e.guard && e.guard.armedBy)
+  const provider = needsProvider ? createProvider(client, spec.provider, receipt, observer, earlyPayloads) : null
+  if (provider && receipt.provider.early) log(`[packet-wire] kept payload applied: the ${spec.provider.compoundKey} record the server synced before this install is read (${Object.keys(provider.state.ids || {}).length} entries on ${provider.state.channel})`)
+  // HF172: a serverbound extension another jar's stop held back (spec.heldBack) is WITHHELD - no body for its packet is derivable. Its
+  // guard arms with the others; once the server has shown the extension, its packet is held like a move with no value, never sent plain.
+  const withheld = new Map((spec.heldBack || []).filter((h) => h && h.direction === 'toServer' && !protos.outgoing.has(h.packet)).map((h) => [h.packet, h]))
+  if (withheld.size) receipt.withheld = [...withheld.keys()]
+  // HF172: the SERVER has shown the extension on the wire (its channel list, the guard's own payload, a packet that carries it). Only
+  // then is a move with no value held; an extension with no guard is armed at install by the jar alone and keeps the lines of before.
+  let shown = false
+  const guarded = [...spec.exts, ...withheld.values()].filter((e) => e.direction === 'toServer' && e.guard && e.guard.armedBy)
   receipt.armed = guarded.length === 0
   const unwrap = spec.redirect && provider ? redirectUnwrapper(spec.redirect, protos, provider, receipt) : null
   const valueWords = () => (usesWorldKey ? `world key the client stands in${observer.state.field ? ` (${observer.state.field})` : ''}${observer.key() != null ? ` = ${observer.key()}` : ''}` : (spec.provider ? `${spec.provider.compoundKey} value` : 'bytes the server writes and this client reads'))
@@ -346,7 +367,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
   const armingChannels = guarded.map((e) => e.guard.armedBy).filter((a) => a && a.channel)
   const registerArm = (names) => { const a = armingChannels.find((x) => names.includes(x.reply) || names.includes(x.channel)); return a ? `register ${names.includes(a.reply) ? a.reply : a.channel}` : null }
   const arm = (by, where) => {
-    receipt.armed = true; receipt.armedBy = by
+    receipt.armed = true; receipt.armedBy = by; shown = true
     log(`[packet-wire] armed: the server's ${by} (${where}) says it runs the mod; ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${valueWords()}`)
   }
   if (armingChannels.length) {
@@ -402,10 +423,32 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
   }
   client.on('state', swap)
   swap()
-  let warnedUnfilled = false; let warnedHeld = false
+  let warnedUnfilled = false; let warnedHeld = false; let warnedNoValue = false; let warnedWithheld = false
+  // HF172: a SPELL = the moves held in a row for one cause while the server has shown the extension. The clock is read when a move is
+  // held (movement repeats every tick: no timer). At holdMs the embedder is told once; the moves stay held after it. A move that
+  // leaves filled ends the spells of the values (a withheld class has no value to wait for: its spell ends with the session).
+  const spells = new Map()
+  const spell = (name, source) => {
+    const now = clock()
+    let s = spells.get(source)
+    if (!s) { s = { since: now, moves: 0 }; spells.set(source, s) }
+    s.moves += 1
+    if (!receipt.holdEnded && now - s.since >= holdMs) {
+      receipt.holdEnded = { source, packet: name, ms: now - s.since, moves: s.moves }
+      log(`[packet-wire] hold bound: ${s.moves} move(s) held for ${now - s.since} ms (${source}); the server reads the wide body, so no plain one is sent`)
+      if (typeof onHoldBound === 'function') { try { onHoldBound(receipt.holdEnded) } catch (err) { log(`[packet-wire] hold bound: the embedder's stop failed (${err && err.message})`) } }
+    }
+    return undefined
+  }
   const write = client.write.bind(client)
   client.write = (name, params) => {
     if (client.state === 'play' && client.serializer && client.serializer.proto !== protos.toServer) swap() // a later swap by another install: re-assert the merged protocol before the bytes go out
+    if (client.state === 'play' && shown && withheld.has(name)) {
+      // HF172: the server reads this packet wide and another jar's stop holds its body back - held, never sent plain
+      receipt.heldMoves += 1
+      if (!warnedWithheld) { warnedWithheld = true; log(`[packet-wire] ${name} held: the server has armed the extension and ${withheld.get(name).by.jar || 'another jar'} (${withheld.get(name).by.reason}) holds back the body of this packet`) }
+      return spell(name, 'held-back')
+    }
     if (client.state === 'play' && protos.outgoing.has(name)) {
       const ext = protos.outgoing.get(name)
       const valueOf = (f) => (f.source === 'world-key' ? observer.key() : (provider ? provider.value() : null))
@@ -416,7 +459,14 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
         // movement is periodic), never sent in a shape the server cannot read, never with a guessed key
         receipt.heldMoves += 1
         if (!warnedHeld) { warnedHeld = true; log(`[packet-wire] ${name} held: the world key is not known yet (no login / respawn carried it at ${worldKeyFieldOf(client.version, 'login')?.join('.') ?? 'a path this protocol names'})`) }
-        return undefined
+        return shown ? spell(name, 'world-key') : undefined
+      }
+      if (missing && shown) {
+        // HF172: the server has shown that it reads the wide body and the provider's value is not known (the record has not come, or
+        // it has no entry for this world) - the move is HELD like one with no world key, never sent plain to that server
+        receipt.heldMoves += 1
+        if (!warnedNoValue) { warnedNoValue = true; log(`[packet-wire] ${name} held: the server reads the wide body and the provider has no ${spec.provider.compoundKey} value for ${provider.state.dimension ?? 'an unknown dimension'} yet (synced ${provider.state.synced}x)`) }
+        return spell(name, 'provider')
       }
       if (missing) {
         receipt.unfilled += 1
@@ -425,6 +475,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
         params = { ...(params || {}) }
         ext.fields.forEach((f, i) => { params[f.name] = values[i] })
         receipt.fills += 1
+        spells.delete('world-key'); spells.delete('provider')
         receipt.lastFill = { packet: name, value: values.length === 1 ? values[0] : values, dimension: provider ? provider.state.dimension : observer.key() }
       }
     }
@@ -439,7 +490,7 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
     receipt.incoming += 1
     receipt.lastIncoming = { packet: meta.name, value: v }
     if (!receipt.armed && guarded.some((e) => e.guard.armedBy.direction === 'toClient' && e.guard.armedBy.packet === meta.name)) {
-      receipt.armed = true
+      receipt.armed = true; shown = true
       log(`[packet-wire] armed: the server's ${meta.name} carried the extension (value ${v}); ${spec.exts.filter((e) => e.direction === 'toServer').map((e) => e.packet).join('/')} now carry the derived ${valueWords()}`)
     }
   })
@@ -459,4 +510,4 @@ function installPacketBodyWireExtension (client, spec, { log = debug, announcedC
 // the guard's arming as a receipt word: a clientbound extension (direction/packet) or a payload channel (+ its reply)
 function armedByLabel (a) { return a ? (a.direction ? `${a.direction}/${a.packet}` : `payload ${a.channel}${a.reply ? ` (reply ${a.reply})` : ''}`) : 'nothing' }
 
-module.exports = { installPacketBodyWireExtension, compileFor, createProvider, createWorldKeyObserver, observeWorldKey, worldKeyFieldOf, tailTypes, redirectUnwrapper, KEY_SOURCES }
+module.exports = { installPacketBodyWireExtension, DEFAULT_HOLD_MS, compileFor, createProvider, createWorldKeyObserver, observeWorldKey, worldKeyFieldOf, tailTypes, redirectUnwrapper, KEY_SOURCES }

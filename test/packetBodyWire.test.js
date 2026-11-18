@@ -260,7 +260,7 @@ describe('HF41 packet-body wire install (fake client, real protodef compile)', f
     })
   }
 
-  it('an unknown dimension never becomes a guessed 0: the record lacks the world → vanilla shape + unfilled count + one log line', function () {
+  it('an unknown dimension never becomes a guessed 0: the record lacks the world → the server has armed the wire, so the move is HELD (HF172: never the vanilla shape to a server that reads the wide one) + held count + one log line', function () {
     const spec = scanPacketBodyWireExtensions([FABRIC], { version: '1.20.1' })
     const c = mkClient(); const logs = []
     const r = installPacketBodyWireExtension(c, spec, { log: (m) => logs.push(m) })
@@ -270,10 +270,12 @@ describe('HF41 packet-body wire install (fake client, real protodef compile)', f
     assert.equal(r.armed, true)
     c.write('position_look', { x: 1, y: 2, z: 3, yaw: 0, pitch: 0, onGround: true })
     c.write('position_look', { x: 1, y: 2, z: 3, yaw: 0, pitch: 0, onGround: true })
-    assert.equal(c.bytes(0).length, 34)
+    assert.equal(c.writes.length, 0, 'HF172: armed by the server and no value for this world - nothing leaves, where the plain 34 bytes left before')
     assert.equal(r.fills, 0)
-    assert.equal(r.unfilled, 2)
-    assert.equal(logs.filter((l) => /vanilla shape/.test(l)).length, 1)
+    assert.equal(r.unfilled, 0)
+    assert.equal(r.heldMoves, 2)
+    assert.equal(logs.filter((l) => /held: the server reads the wide body/.test(l)).length, 1)
+    assert.equal(logs.filter((l) => /vanilla shape/.test(l)).length, 0)
   })
 
   it('a payload on the derived channel that is not the record (another SimpleChannel message) is rejected, not misread', function () {
@@ -833,5 +835,140 @@ describe('HF112 runtime-name resolution (Create for Fabric 6.0.8.1 build 1744, r
     const protos = compileFor('1.20.1', r.exts)
     const ser = protos.incoming.get('map') ? protos : null
     assert.ok(ser, 'the map packet is the extended incoming packet')
+  })
+})
+
+describe('HF172 one jar\'s stop is its own, a payload before the install is kept, an armed move with no value is held', function () {
+  const mc = require('minecraft-protocol')
+  const nbt = require('prismarine-nbt')
+  const { mutateJar } = require('./helpers/jarMutate')
+  const { worldKeyFieldOf } = require('../src/client/packetBodyWireInstall')
+  const WORLD_KEY_JAR = path.join(__dirname, 'fixtures', 'immersive-portals-6.0.6-mc1.21.1-fabric.trimmed.jar')
+  const MAP = 'net/minecraft/network/protocol/game/ClientboundMapItemDataPacket'
+  const POS = 'net/minecraft/network/protocol/game/ServerboundMovePlayerPacket$Pos'
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hf172-'))
+  after(function () { fs.rmSync(tmp, { recursive: true, force: true }) })
+  const bend = (name, rules) => { const p = path.join(tmp, name); if (!fs.existsSync(p)) fs.writeFileSync(p, mutateJar(fs.readFileSync(FORGE), rules).buf); return p }
+  const oneMixin = (p) => p.endsWith('.class') && !/MixinServerboundMovePlayerPacketPos\.class$/.test(p)
+  const offTheLaw = (s) => (/;(write|read)\(/.test(s) ? s.replace(/;(write|read)\(/, ';codec(') : s)
+  const renamed = (p, s) => (/mods\.toml$/.test(p) ? s.replace(/immersive_portals/g, 'other_mod').replace(/Immersive Portals/g, 'Other Mod') : undefined)
+  // a mod the scan cannot read, on a class the widening jar leaves alone: ONE mixin, its injections on the clientbound map packet and outside the read / write law
+  const loneMap = () => bend('zz-lone-map.jar', { drop: oneMixin, text: renamed, rewrite: (f, s) => { const t = offTheLaw(s.replace(/ServerboundMovePlayerPacket\$Pos/g, 'ClientboundMapItemDataPacket')); return t === s ? undefined : t } })
+  // the same lone injection left on ONE serverbound move class the widening jar extends too
+  const lonePos = () => bend('zz-lone-pos.jar', { drop: oneMixin, text: renamed, rewrite: (f, s) => (/ServerboundMovePlayerPacket\$Pos;(write|read)\(/.test(s) ? offTheLaw(s) : undefined) })
+  // a jar that stops AND injects readably into every move class the widening jar extends
+  const everyMove = () => bend('zz-every-move.jar', { rewrite: (f, s) => (/ServerboundMovePlayerPacket\$Pos;(write|read)\(/.test(s) ? offTheLaw(s) : undefined) })
+  const dimSync = () => nbt.writeUncompressed({ type: 'compound', name: '', value: { intids: { type: 'compound', value: { 'minecraft:overworld': { type: 'int', value: 0 }, 'minecraft:the_nether': { type: 'int', value: 1 } } } } }, 'big')
+  const mkClient = (version) => {
+    const c = new EventEmitter()
+    c.version = version; c.state = 'play'
+    c.serializer = mc.createSerializer({ state: 'play', isServer: false, version })
+    c.deserializer = mc.createDeserializer({ state: 'play', isServer: false, version })
+    c.writes = []; c.write = (name, params) => c.writes.push({ name, params })
+    c.bytes = (i) => c.serializer.proto.createPacketBuffer('packet', c.writes[i])
+    return c
+  }
+  const login = (c, key) => { const o = {}; let x = o; const p = worldKeyFieldOf(c.version, 'login') || ['worldName']; p.slice(0, -1).forEach((k) => { x = x[k] = {} }); x[p[p.length - 1]] = key; c.emit('packet', o, { state: 'play', name: 'login' }) }
+  const LOOK = { x: 1, y: 2, z: 3, yaw: 0, pitch: 0, onGround: true }
+  const channelsOf = (spec) => { const a = spec.exts.map((e) => e.guard && e.guard.armedBy).find((g) => g && g.channel); return [a.channel, a.reply].filter(Boolean) }
+  const serverPositionWithTheExtension = (c) => c.emit('packet', { x: 0, y: 64, z: 0, yaw: 0, pitch: 0, flags: 0, teleportId: 1, packetBodyWire0: 0 }, { state: 'play', name: 'position' })
+
+  for (const [label, order] of [['the widening jar read first', (w, o) => [w, o]], ['the other jar read first', (w, o) => [o, w]]]) {
+    it(`a widening jar beside a jar with a lone injection outside the law into a clientbound class (${label}): the five extensions are derived and installed, the other jar's stop is reported in its own words`, function () {
+      const other = loneMap()
+      const alone = scanPacketBodyWireExtensions([other], { version: '1.21.1' })
+      assert.equal(alone.abstain.reason, 'packet-target-not-derivable')
+      assert.equal(alone.stops, undefined, 'one jar, one stop, nothing else to say: the result of before')
+      const wide = scanPacketBodyWireExtensions([WORLD_KEY_JAR], { version: '1.21.1' })
+      const r = scanPacketBodyWireExtensions(order(WORLD_KEY_JAR, other), { version: '1.21.1' })
+      assert.equal(r.exts.length, 5, JSON.stringify(r.abstain))
+      assert.deepEqual(r.exts, wide.exts, 'what the widening jar derives alone')
+      assert.equal(r.abstain, null, 'something is installed: the scan as a whole did not stop')
+      assert.equal(r.jar, path.basename(WORLD_KEY_JAR)); assert.deepEqual(r.mod, wide.mod)
+      assert.equal(r.jars, 2)
+      assert.equal(r.stops.length, 1)
+      const { touches, ...stop } = r.stops[0]
+      assert.deepEqual(stop, alone.abstain, 'the stop is the abstain the jar gives alone, word for word')
+      assert.deepEqual(touches, [MAP])
+      assert.equal(r.heldBack, undefined)
+      const c = mkClient('1.21.1')
+      const rec = installPacketBodyWireExtension(c, r, { announcedChannels: channelsOf(r) })
+      assert.equal(rec.installed, true); assert.equal(rec.armed, true)
+      login(c, 'minecraft:overworld')
+      c.write('position_look', LOOK)
+      const plain = mc.createSerializer({ state: 'play', isServer: false, version: '1.21.1' }).proto.createPacketBuffer('packet', { name: 'position_look', params: LOOK }).length
+      assert.ok(c.bytes(0).length > plain, `the wide body: ${c.bytes(0).length} bytes against the plain ${plain}`)
+      assert.equal(rec.fills, 1)
+    })
+  }
+
+  it('two jars that both derive extensions stay the named stop of before: nothing is installed, the words are the same', function () {
+    const r = scanPacketBodyWireExtensions([FABRIC, FORGE], { version: '1.20.1' })
+    assert.equal(r.exts.length, 0); assert.equal(r.provider, null)
+    assert.equal(r.abstain.reason, 'multiple-packet-wire-mods')
+    assert.match(r.abstain.detail, / and immersive-portals-3\.0\.7-forge\.trimmed\.jar both extend packet bodies — their order on the wire is not derivable$/)
+    assert.equal(r.abstain.packets.length, 10)
+  })
+
+  it('a stopped jar that injects into the classes another jar extends holds those extensions back: every move class touched = nothing installed, the stop of before, and the held-back extensions are counted', function () {
+    const other = everyMove()
+    const alone = scanPacketBodyWireExtensions([other], { version: '1.21.1' })
+    const r = scanPacketBodyWireExtensions([WORLD_KEY_JAR, other], { version: '1.21.1' })
+    assert.equal(r.exts.length, 0)
+    assert.deepEqual(r.abstain, alone.abstain)
+    assert.equal(r.heldBack.length, 5, 'the five extensions of the widening jar, each on a class the stopped jar injects into')
+    assert.ok(r.heldBack.every((h) => h.by.jar === path.basename(other) && h.by.reason === 'packet-target-not-derivable'))
+    assert.equal(installPacketBodyWireExtension(mkClient('1.21.1'), r).installed, false)
+  })
+
+  it('a stopped jar on ONE serverbound class the widening jar extends: the other extensions are installed, that class is withheld, and once the server has armed the wire its packet is held, never sent plain', function () {
+    const other = lonePos()
+    const r = scanPacketBodyWireExtensions([WORLD_KEY_JAR, other], { version: '1.21.1' })
+    assert.deepEqual(r.exts.map((e) => `${e.direction}/${e.packet}`).sort(), ['toClient/position', 'toServer/flying', 'toServer/look', 'toServer/position_look'])
+    assert.deepEqual(r.heldBack.map((h) => `${h.direction}/${h.packet}`), ['toServer/position'])
+    assert.deepEqual(r.stops[0].touches, [POS])
+    const quiet = mkClient('1.21.1'); const q = installPacketBodyWireExtension(quiet, r)
+    login(quiet, 'minecraft:overworld'); quiet.write('position', { x: 1, y: 2, z: 3, onGround: true })
+    assert.equal(q.armed, false); assert.equal(quiet.writes.length, 1, 'a server that shows nothing: the withheld packet leaves plain, as before'); assert.equal(q.heldMoves, 0)
+    const c = mkClient('1.21.1'); const rec = installPacketBodyWireExtension(c, r, { announcedChannels: channelsOf(r) })
+    login(c, 'minecraft:overworld')
+    c.write('position', { x: 1, y: 2, z: 3, onGround: true })
+    assert.equal(c.writes.length, 0, 'armed: the withheld packet is held'); assert.equal(rec.heldMoves, 1)
+    c.write('position_look', LOOK)
+    assert.equal(c.writes.length, 1); assert.equal(rec.fills, 1)
+  })
+
+  it('a record the server synced BEFORE the install is applied at the install: the first move after it carries the value', function () {
+    const spec = scanPacketBodyWireExtensions([FABRIC], { version: '1.20.1' })
+    const c = mkClient('1.20.1')
+    const r = installPacketBodyWireExtension(c, spec, { earlyPayloads: [{ channel: 'some:other', data: Buffer.from([1]) }, { channel: spec.provider.channels.find((x) => x.framing === 'raw').id, data: dimSync() }] })
+    assert.equal(r.provider.synced, 1); assert.equal(r.provider.early, 1)
+    login(c, 'minecraft:overworld')
+    serverPositionWithTheExtension(c)
+    assert.equal(r.armed, true)
+    c.write('position_look', LOOK)
+    assert.equal(c.bytes(0).length, 38)
+    assert.equal(r.fills, 1); assert.equal(r.unfilled, 0); assert.equal(r.heldMoves, 0)
+  })
+
+  it('armed by the server and the record never came: the move is held, never sent plain; at the bound the embedder is told once and the moves stay held; the record arriving ends the spell', function () {
+    const spec = scanPacketBodyWireExtensions([FABRIC], { version: '1.20.1' })
+    let t = 5000; const bound = []
+    const c = mkClient('1.20.1')
+    const r = installPacketBodyWireExtension(c, spec, { clock: () => t, holdMs: 20000, onHoldBound: (f) => bound.push(f) })
+    login(c, 'minecraft:overworld')
+    c.write('position_look', LOOK)
+    assert.equal(c.writes.length, 1, 'not armed: no hold, the plain body as before'); assert.equal(r.unfilled, 1); assert.equal(r.heldMoves, 0)
+    serverPositionWithTheExtension(c)
+    assert.equal(r.armed, true)
+    c.write('position_look', LOOK); t += 19999; c.write('position', { x: 1, y: 2, z: 3, onGround: true })
+    assert.equal(c.writes.length, 1, 'armed with no value: nothing leaves'); assert.equal(r.heldMoves, 2); assert.equal(r.unfilled, 1); assert.deepEqual(bound, [])
+    t += 1; c.write('flying', { onGround: true })
+    assert.equal(bound.length, 1); assert.deepEqual(bound[0], { source: 'provider', packet: 'flying', ms: 20000, moves: 3 }); assert.deepEqual(r.holdEnded, bound[0])
+    t += 5000; c.write('look', { yaw: 1, pitch: 1, onGround: true })
+    assert.equal(bound.length, 1, 'told once'); assert.equal(c.writes.length, 1, 'still nothing plain after the bound'); assert.equal(r.heldMoves, 4)
+    c.emit('packet', { channel: spec.provider.channels.find((x) => x.framing === 'raw').id, data: dimSync() }, { state: 'play', name: 'custom_payload' })
+    c.write('position_look', LOOK)
+    assert.equal(c.writes.length, 2); assert.equal(c.bytes(1).length, 38); assert.equal(r.fills, 1)
   })
 })
