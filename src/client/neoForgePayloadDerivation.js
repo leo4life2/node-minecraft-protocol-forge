@@ -148,6 +148,12 @@ const REGISTRATION_METHODS = {
 // that led there (provenOptional below). An optional() that is not proven is
 // handed over like a required registration: with no derivable version a row of
 // kind 'version', never "safely unclaimed".
+// HF175, THE MARK: a row that this lane hands over and the reading before it did
+// not carries `wordOnly: true` (the key is absent on every other row): the rows
+// of kind 'unseen', the row of an optional() that is not proven, and the row of
+// a registration whose optional() only the wider rule below leaves unproven. Such
+// a row is for the WORD of the reading and its counts. Nothing that steers a dial
+// reads it: the rows without the mark are, row for row, the rows of before.
 function noteUnresolvedSite (diagnostics, says, facts) {
   const reg = facts.reg || null
   const spec = reg && reg.method ? REGISTRATION_METHODS[reg.method] : null
@@ -163,19 +169,41 @@ function noteUnresolvedSite (diagnostics, says, facts) {
     version,
     optional: registrar ? !!registrar.optional : null,
     id: facts.id || null,
-    says
+    says,
+    ...(facts.wordOnly === true ? { wordOnly: true } : {})
   })
 }
 
 // a registration whose registrar is PROVEN optional: its .optional() sits under no
-// condition the walk left undecided
+// condition the walk left undecided. Two flags say undecided: optionalUndecided
+// (HF51: a conditional jump before it in its own method; in the linear walk also in
+// the callers) and optionalUndecidedWider (HF175: the caller's condition at a
+// callee of the deep walk; a switch the walk did not decide)
 function provenOptional (reg) {
+  return !!(reg && reg.registrar && reg.registrar.optional && !reg.registrar.optionalUndecided && !reg.registrar.optionalUndecidedWider)
+}
+
+// HF175: proven by the narrower rule that held before this lane (the first flag
+// alone). A row handed over for such a registration is this lane's own: it is
+// marked wordOnly. One that the narrower rule already left unproven had its row
+// before the lane: no mark.
+function provenNarrowly (reg) {
   return !!(reg && reg.registrar && reg.registrar.optional && !reg.registrar.optionalUndecided)
 }
 
 function giveUp (diagnostics, says, facts) {
   diagnostics.abstains.push(says)
   noteUnresolvedSite(diagnostics, says, facts)
+}
+
+// HF175: THE row of a registration whose id is not provable and whose optional()
+// is not proven (kind 'registration'), for the three places that hand one over.
+// Marked wordOnly exactly when the narrower rule of before this lane called its
+// optional() proven: then the reading before handed over no row there. Returns
+// the row.
+function noteUnprovenRegistration (diagnostics, says, reg, jar = null) {
+  noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg, jar, wordOnly: provenNarrowly(reg) })
+  return diagnostics.unresolvedSites[diagnostics.unresolvedSites.length - 1]
 }
 
 // HF175: can registrations exist behind an entry that reached none? Yes when the
@@ -241,7 +269,7 @@ function collectJarClasses (jarPath, out, diagnostics, jarLabel) {
     buf = fs.readFileSync(jarPath)
   } catch (err) {
     diagnostics.errors.push(`${jarLabel}: unreadable (${err.message})`)
-    noteUnresolvedSite(diagnostics, `${jarLabel}: unreadable`, { kind: 'unseen', jar: jarLabel }) // HF175: nothing of this jar was read
+    noteUnresolvedSite(diagnostics, `${jarLabel}: unreadable`, { kind: 'unseen', jar: jarLabel, wordOnly: true }) // HF175: nothing of this jar was read
     if (out.noteUnit) out.noteUnit({ path: jarPath, label: jarLabel, sha1: null, unreadable: err.message })
     return
   }
@@ -263,7 +291,7 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = nu
     entries = zipCentralEntries(buf)
   } catch (err) {
     diagnostics.errors.push(`${jarLabel}: bad zip (${err.message})`)
-    noteUnresolvedSite(diagnostics, `${jarLabel}: bad zip`, { kind: 'unseen', jar: jarLabel }) // HF175: nothing of this jar was read
+    noteUnresolvedSite(diagnostics, `${jarLabel}: bad zip`, { kind: 'unseen', jar: jarLabel, wordOnly: true }) // HF175: nothing of this jar was read
     return
   }
   let modVersion = null
@@ -325,7 +353,7 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = nu
         collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${nested.get(e.name).relPath}`, depth + 1, unit)
       } catch (err) {
         diagnostics.errors.push(`${jarLabel}!${e.name}: nested jar unreadable (${err.message})`)
-        noteUnresolvedSite(diagnostics, `${jarLabel}!${e.name}: nested jar unreadable`, { kind: 'unseen', jar: `${jarLabel}!${nested.get(e.name).relPath}` }) // HF175
+        noteUnresolvedSite(diagnostics, `${jarLabel}!${e.name}: nested jar unreadable`, { kind: 'unseen', jar: `${jarLabel}!${nested.get(e.name).relPath}`, wordOnly: true }) // HF175
       }
     }
   }
@@ -611,6 +639,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
   // `.optional()` is then unproven, never a false optional)
   opts.walk = opts.walk || {}
   const undecidedOnEntry = !!opts.walk.undecided
+  const widerOnEntry = !!opts.walk.undecidedWider // HF175: the second flag, per method like the first
   // HF130 (r2): the linear walk keeps the JVM's stack discipline across a
   // conditional (the compared operands are popped) and across arms that
   // REJOIN: every forward conditional records the stack depth it leaves; when
@@ -630,6 +659,11 @@ function simulate (index, classInfo, method, state, opts = {}) {
     for (let i = arms.length - 1; i >= 0; i--) if (arms[i].target <= pc) arms.splice(i, 1)
     // HF51: the linear walk decides no branch — an `.optional()` met past a
     // conditional is not a proven optional (see the registrar model)
+    // HF175: nor does it decide a switch (tableswitch, lookupswitch): an
+    // `.optional()` met past one is not proven. The second flag, so that the
+    // first stays what it was before this lane; nothing else of the walk changes
+    // at a switch (no pop, no arm)
+    if (op === 0xaa || op === 0xab) opts.walk.undecidedWider = true
     if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) {
       opts.walk.undecided = true
       pop(op >= 0x9f && op <= 0xa6 ? 2 : 1)
@@ -777,6 +811,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
     }
   })
   opts.walk.undecided = undecidedOnEntry
+  opts.walk.undecidedWider = widerOnEntry
 }
 
 // HF51 — JDK / loader-value semantics shared by BOTH evaluators (the linear
@@ -1110,7 +1145,9 @@ function handleInvoke (index, classInfo, state, opts, call) {
     // HF51: `.optional()` reached under a condition this walk could not decide
     // (`if (isClientOnly(modId)) registrar = registrar.optional()`) is NOT a
     // proven optional — the abstain downstream labels it unresolved-required.
-    if (ref.name === 'optional') { push({ ...recv, optional: true, optionalUndecided: !!(opts.walk && opts.walk.undecided) }); return }
+    // HF175: optionalUndecidedWider is the same for the conditions this lane counts
+    // besides (provenOptional reads both flags; no claim and no path reads either)
+    if (ref.name === 'optional') { push({ ...recv, optional: true, optionalUndecided: !!(opts.walk && opts.walk.undecided), optionalUndecidedWider: !!(opts.walk && opts.walk.undecidedWider) }); return }
     if (ref.name === 'executesOn') { push(recv); return }
     if (REGISTRATION_METHODS[ref.name]) {
       const typeId = resolveTypeValue(index, argVals[0], state) ??
@@ -2225,12 +2262,15 @@ function concatWithConstants (classInfo, bsmIndex, captured) {
 
 function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks = {}) {
   state.aggCache = state.aggCache || new Map()
-  // HF175: a callee inherits its caller's undecided flag (a helper reached past
-  // an undecided conditional is under it: an `.optional()` inside it is not
-  // proven); its own conditionals never leak back - the walk object is the
-  // method's own. The flag feeds provenOptional alone: no path and no claim
-  // of the walk reads it.
-  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags }, walk: { iterAdvances: 0, undecided: !!(opts.walk && opts.walk.undecided) } }
+  // HF175: a callee is under its caller's undecided conditions (a helper reached
+  // past an undecided conditional: an `.optional()` inside it is not proven); its
+  // own conditionals never leak back - the walk object is the method's own. What
+  // the caller left undecided arrives as the SECOND flag (undecidedWider): the
+  // first flag stays what it was before this lane, the method's own conditional
+  // jumps, so that a row which exists only by the wider rule can be told from a
+  // row of before (provenNarrowly). Both flags feed provenOptional alone: no path
+  // and no claim of the walk reads them.
+  opts = { ...opts, methodCtx: { cls: classInfo.className, name: method.method, desc: method.desc, flags: method.flags }, walk: { iterAdvances: 0, undecidedWider: !!(opts.walk && (opts.walk.undecided || opts.walk.undecidedWider)) } }
   const cp = classInfo.cp
   const code = method.code
   const stack = []
@@ -2627,6 +2667,10 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         const def = pc + code.readInt32BE(a)
         const lo = code.readInt32BE(a + 4)
         const hi = code.readInt32BE(a + 8)
+        // HF175: a switch on a value the walk does not know is a condition it did
+        // not decide (it takes the default arm, as before): an `.optional()` met
+        // past here is not proven
+        if (!(v && v.k === 'int') && opts.walk) opts.walk.undecidedWider = true
         if (v && v.k === 'int' && v.v >= lo && v.v <= hi) jump(pc + code.readInt32BE(a + 12 + (v.v - lo) * 4))
         else jump(def)
         break
@@ -2637,6 +2681,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         const def = pc + code.readInt32BE(a)
         const n = code.readInt32BE(a + 4)
         let target = def
+        if (!(v && v.k === 'int') && opts.walk) opts.walk.undecidedWider = true // HF175: as at the tableswitch
         if (v && v.k === 'int') {
           for (let i = 0; i < n; i++) {
             if (code.readInt32BE(a + 8 + i * 8) === v.v) { target = pc + code.readInt32BE(a + 12 + i * 8); break }
@@ -4344,10 +4389,10 @@ function deriveModRootRegistrations (index, state, record) {
     diagnostics.abstains.push(says)
     // HF171: one row a registration; the computed id is not proven and is not handed on as one
     // a registration proven optional writes no row: the server drops it, nothing to refuse for
-    for (const r of d.regs) if (!provenOptional(r)) noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg: r })
+    for (const r of d.regs) if (!provenOptional(r)) noteUnprovenRegistration(diagnostics, says, r)
   }
   const unresolvedSites = new Set()
-  const rowSites = new Set()
+  const rowSites = new Map() // site -> its row when that row is this lane's own (marked), else null
   for (const r of rows) {
     if (!r.unresolved) continue
     const site = `${r.site.split(' (mod-root')[0]}.${r.method} (via ${r.listenerSite})`
@@ -4355,7 +4400,16 @@ function deriveModRootRegistrations (index, state, record) {
     // the sentence once a site, as before; one row a site, of its first registration that is not proven optional
     // (the server drops a proven-optional channel the client lacks: nothing to refuse for)
     if (!unresolvedSites.has(site)) { unresolvedSites.add(site); diagnostics.abstains.push(says) }
-    if (!provenOptional(r) && !rowSites.has(site)) { rowSites.add(site); noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg: r }) }
+    // HF175: the row of before the lane was the site's first registration that the narrower rule left unproven: it is handed
+    // over exactly there, unmarked. A site that has none gets the row of its first unproven registration, marked; that
+    // row gives way when a registration of the site turns up that had its row before (one row a site, as before)
+    if (provenOptional(r)) continue
+    const own = provenNarrowly(r)
+    if (rowSites.has(site) && (own || rowSites.get(site) === null)) continue
+    const marked = rowSites.has(site) ? diagnostics.unresolvedSites.indexOf(rowSites.get(site)) : -1
+    if (marked >= 0) diagnostics.unresolvedSites.splice(marked, 1)
+    const row = noteUnprovenRegistration(diagnostics, says, r)
+    rowSites.set(site, own ? row : null)
   }
   for (const r of kept) {
     record(r)
@@ -4703,11 +4757,13 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     }
     const prevInlineAll = state.aggInlineAll
     state.aggInlineAll = true
+    let deepFailed = null
     try {
       const locals = seedProvenanceLocals(method.desc, (method.flags & 0x0008) !== 0, info.className)
       evaluateMethod(index, info, method, state, { locals, recordPutstatic: false, onRegistration: (r) => record({ ...r, site: `${r.site} (deep walk from ${info.className}.${method.method})` }) }, {})
     } catch (err) {
-      diagnostics.errors.push(`deep walk of ${info.className}.${method.method} failed (${err.message})`)
+      deepFailed = `deep walk of ${info.className}.${method.method} failed (${err.message})`
+      diagnostics.errors.push(deepFailed)
     } finally {
       state.aggInlineAll = prevInlineAll
     }
@@ -4733,6 +4789,11 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       // this unit claimed from the entry's class. An entry that does neither registers nothing: the sentence alone, as before
       if (entryMayRegister(info, method)) unseenEntries.push({ says, cls: info.className, site: `${info.className}.${method.method}` })
     }
+    // HF175: the deep walk of this entry FAILED after it had met a registration (the reader throws nowhere by itself: bytes it
+    // did not expect). What followed was never walked, and when an id was proven before the failure the linear walk's rows of
+    // the entry were dropped above. One row of the entry says so (kind unseen, this lane's own). A walk that failed before it
+    // met any registration is the entry that reaches none: its sentence and its row are written just above, as before
+    if (deepFailed && registrations.length > before) noteUnresolvedSite(diagnostics, deepFailed, { kind: 'unseen', jar: state.unitJar, site: `${info.className}.${method.method}`, wordOnly: true })
   }
 
   const markers = discoverFlowMarkers(index, entryMethods)
@@ -4774,7 +4835,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
         // did not decide is handed over (kind version) - and stays unclaimed and
         // listen-only exactly as before: no claim row is added for it
         if (provenOptional(reg)) diagnostics.abstains.push(`${reg.id}: optional channel with unresolved version — safely unclaimed`)
-        else giveUp(diagnostics, `${reg.id}: channel with unresolved version whose .optional() sits under a condition this walk could not decide — unclaimed, NOT safely unclaimed (a server that requires it names it in its refusal)`, { kind: 'version', id: reg.id, reg })
+        else giveUp(diagnostics, `${reg.id}: channel with unresolved version whose .optional() sits under a condition this walk could not decide — unclaimed, NOT safely unclaimed (a server that requires it names it in its refusal)`, { kind: 'version', id: reg.id, reg, wordOnly: true })
         listenOnlyNamed.push(reg.id)
         continue
       }
@@ -4845,7 +4906,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       if (row.optional) {
         // HF175: as above, for a registration several call sites share
         if (!row.optionalUndecided) diagnostics.abstains.push(`${row.id}: aggregated optional channel with unresolved version — safely unclaimed`)
-        else giveUp(diagnostics, `${row.id}: aggregated channel with unresolved version whose .optional() sits under a condition this walk could not decide — unclaimed, NOT safely unclaimed (a server that requires it names it in its refusal)`, { kind: 'version', id: row.id, flow: row.flow, protocols: row.protocols, jar: (row.jar && row.jar.label) || state.unitJar })
+        else giveUp(diagnostics, `${row.id}: aggregated channel with unresolved version whose .optional() sits under a condition this walk could not decide — unclaimed, NOT safely unclaimed (a server that requires it names it in its refusal)`, { kind: 'version', id: row.id, flow: row.flow, protocols: row.protocols, jar: (row.jar && row.jar.label) || state.unitJar, wordOnly: true })
         listenOnlyNamed.push(row.id)
         continue
       }
@@ -4877,8 +4938,8 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     if (rootResolved(sk)) { (diagnostics.modRootCovered = diagnostics.modRootCovered || []).push(sk); continue }
     if (abstainedSiteKeys.has(`${sk}#${reg.method}`)) continue
     abstainedSiteKeys.add(`${sk}#${reg.method}`)
-    const opt = reg.registrar && reg.registrar.optional && !reg.registrar.optionalUndecided
-    const undecided = reg.registrar && reg.registrar.optional && reg.registrar.optionalUndecided
+    const opt = provenOptional(reg)
+    const undecided = !opt && !!(reg.registrar && reg.registrar.optional)
     const partially = agg.resolvedSites.has(sk) ? ' (partially aggregated — remainder unresolved)' : ''
     const says = opt
       ? `${reg.site}: ${reg.method} optional registration with unresolved payload type id — safely unclaimed${partially}`
@@ -4886,7 +4947,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
         ? `${reg.site}: ${reg.method} with unresolved payload type id — unresolved-required (its .optional() sits under a condition this walk could not decide, so it is NOT safely unclaimed; the server names it in its refusal)${partially}`
         : `${reg.site}: ${reg.method} with unresolved payload type id${partially}`
     if (opt) diagnostics.abstains.push(says) // proven optional: the server drops it, nothing to refuse for
-    else giveUp(diagnostics, says, { kind: 'registration', reg, jar: state.unitJar })
+    else { diagnostics.abstains.push(says); noteUnprovenRegistration(diagnostics, says, reg, state.unitJar) }
   }
   if (state.aggBudgetBlown) {
     giveUp(diagnostics, 'aggregation budget exhausted — remaining aggregated registrations abstained', { kind: 'unread', jar: state.unitJar })
@@ -4957,14 +5018,14 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     const outer = u.cls.split('$')[0]
     const names = (text) => { const at = typeof text === 'string' ? text.indexOf(outer) : -1; return at >= 0 && !/[A-Za-z0-9_/]/.test(text.charAt(at + outer.length)) }
     if (claims.some((c) => names(c.source)) || diagnostics.abstains.some((a) => a !== u.says && names(a)) || (diagnostics.unresolvedSites || []).some((x) => names(x.site))) continue
-    noteUnresolvedSite(diagnostics, u.says, { kind: 'unseen', jar: state.unitJar, site: u.site })
+    noteUnresolvedSite(diagnostics, u.says, { kind: 'unseen', jar: state.unitJar, site: u.site, wordOnly: true })
   }
   const heldNothing = claims.length === 0 && listenOnlyNamed.length === 0 && registrations.length === 0 &&
     (diagnostics.unresolvedSites || []).length === 0 && diagnostics.abstains.every((a) => silentSentences.has(a)) &&
     !(listen && ((listen.factory || []).length > 0 || (listen.fabric || []).length > 0 || (listen.container || []).length > 0))
   if (heldNothing) {
     const asker = eventAskerOf(index, unit)
-    if (asker) giveUp(diagnostics, `${asker}: this jar asks the event for a payload registrar in code no entry of it leads to — nothing of its registrations was read`, { kind: 'unseen', jar: state.unitJar, site: asker })
+    if (asker) giveUp(diagnostics, `${asker}: this jar asks the event for a payload registrar in code no entry of it leads to — nothing of its registrations was read`, { kind: 'unseen', jar: state.unitJar, site: asker, wordOnly: true })
   }
 
   // HF73b r2 the absence facts (the index's law above)

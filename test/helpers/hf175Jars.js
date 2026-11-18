@@ -23,6 +23,20 @@
 //   'decided'     under a condition the walk decides (a constant)
 //   'callee'      inside a helper of the mod that is called under an undecided condition
 //   'calleePlain' inside the same helper, called unconditionally
+//   'switchCase'    in the case arm of a switch on a value the walk does not know
+//   'switchDefault' in the default arm of such a switch
+//   'switchBoth'    in both arms of such a switch (the walk joins no arms)
+//   'switchBefore'  unconditional, BEFORE such a switch (the twin that stays proven)
+//   'lookupCase', 'lookupDefault'  the same two arms under a lookupswitch
+//
+//   beside()      a required registration with a version and an id made at run
+//                 time, and beside it a registration with a constant id, no
+//                 version and optional() under an undecided condition
+//   thrown(bad)   two registrations inside lambdas handed to a deferred-work
+//                 call (only the deep walk follows them); bad: a jump between
+//                 the two lands on a byte the walk reads past the code's end,
+//                 so the deep walk fails after it proved the first id; 'early':
+//                 the jump stands before both, the walk fails with nothing met
 const { buildClass, buildJar } = require('./synthJar')
 
 const EVENT = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
@@ -47,6 +61,27 @@ function openRegistrar (a, opt, version) {
   if (opt === 'undecided' || opt === 'decided' || opt === 'plain') a.aload(1).invokevirtual(REG, 'optional', `()L${REG};`).astore(1)
   if (opt === 'callee') a.invokestatic(GONE, 'flag', '()Z').ifeq(8)
   if (opt === 'callee' || opt === 'calleePlain') a.aload(1).invokestatic(INIT, 'opt', `(L${REG};)L${REG};`).astore(1)
+  if (opt === 'switchBefore') optBlock(a)
+  if (typeof opt === 'string' && (opt.startsWith('switch') || opt.startsWith('lookup'))) tableSwitch(a, opt)
+  return a
+}
+const optBlock = (a) => a.aload(1).invokevirtual(REG, 'optional', `()L${REG};`).astore(1) // 5 bytes
+// switch (Gone.mode()) with ONE case (1) and a default arm; the blocks that follow it:
+//   switchCase     case 1: [optional()]            default: past it
+//   switchDefault  case 1: past it                 default: [optional()]
+//   switchBoth     case 1: [optional()] goto past  default: [optional()]
+//   switchBefore   both arms: the next instruction (nothing stands under the switch)
+function tableSwitch (a, opt) {
+  a.invokestatic(GONE, 'mode', '()I')
+  const pad = (4 - ((a.pc + 1) % 4)) % 4
+  const L = 1 + pad + 16 // the offset of the first byte after the switch
+  const i32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255]
+  const [def, c1] = { switchCase: [L + 5, L], switchDefault: [L, L + 5], switchBoth: [L + 8, L], switchBefore: [L, L], lookupCase: [L + 5, L], lookupDefault: [L, L + 5] }[opt]
+  // tableswitch: default, low 1, high 1, the one offset; lookupswitch: default, one pair, the match 1, its offset - the same bytes after the opcode
+  a.raw([opt.startsWith('lookup') ? 0xab : 0xaa, ...new Array(pad).fill(0), ...i32(def), ...i32(1), ...i32(1), ...i32(c1)])
+  if (opt === 'switchBefore') return a
+  optBlock(a)
+  if (opt === 'switchBoth') optBlock(a.goto_(8))
   return a
 }
 const optHelper = { name: 'opt', desc: `(L${REG};)L${REG};`, flags: 0x0009, code: (a) => a.aload(0).invokevirtual(REG, 'optional', `()L${REG};`).areturnOp() }
@@ -100,6 +135,46 @@ function late (shape) {
   return buildJar(entries)
 }
 
+function beside () {
+  const init = listener((a) => {
+    a.aload(0).ldcStr('7').invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`).astore(1)
+    a.aload(1).invokestatic(GONE, 'type', `()L${TYPE};`).aconstNull().aconstNull().invokevirtual(REG, 'playToClient', REGDESC).pop()
+    a.aload(0).invokestatic(GONE, 'version', '()Ljava/lang/String;').invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`).astore(2)
+    a.invokestatic(GONE, 'flag', '()Z').ifeq(8).aload(2).invokevirtual(REG, 'optional', `()L${REG};`).astore(2)
+    a.aload(2); newType(a, (x) => x.ldcStr('direct'))
+    return a.aconstNull().aconstNull().invokevirtual(REG, 'playToClient', REGDESC).pop().ret()
+  })
+  return buildJar([toml(null), { name: `${INIT}.class`, data: init }])
+}
+
+function thrown (bad) {
+  const lam = (name, id) => ({ name, desc: `(L${REG};)V`, flags: 0x100a, code: (a) => { a.aload(0); newType(a, (x) => x.ldcStr(id)); return a.aconstNull().aconstNull().invokevirtual(REG, 'playToClient', REGDESC).pop().ret() } })
+  const defer = (a, i) => a.aload(1).invokedynamic(i, 'run', `(L${REG};)Ljava/lang/Runnable;`).invokestatic(GONE, 'enqueueWork', '(Ljava/lang/Runnable;)V')
+  const init = buildClass({
+    name: INIT,
+    bootstrapMethods: [{ refKind: 6, owner: INIT, name: 'lambda$onRegister$0', desc: `(L${REG};)V` }, { refKind: 6, owner: INIT, name: 'lambda$onRegister$1', desc: `(L${REG};)V` }],
+    methods: [lam('lambda$onRegister$0', 'one'), lam('lambda$onRegister$1', 'two'), {
+      name: 'onRegister',
+      desc: `(L${EVENT};)V`,
+      flags: 0x0009,
+      code: (a) => {
+        a.aload(0).ldcStr('7').invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`).astore(1)
+        if (bad !== 'early') defer(a, 0)
+        if (!bad) return defer(a, 1).ret()
+        // goto END; the registration(s) that follow; return; END: bipush 0xb6 - the jump lands on the 0xb6 (an invoke whose index lies past the code)
+        const at = a.pc
+        a.goto_(0)
+        if (bad === 'early') defer(a, 0)
+        defer(a, 1).ret()
+        const off = (a.pc + 1) - at
+        a.bytes[at + 1] = (off >> 8) & 255; a.bytes[at + 2] = off & 255
+        return a.raw([0x10, 0xb6])
+      }
+    }]
+  })
+  return buildJar([toml(null), { name: `${INIT}.class`, data: init }])
+}
+
 const garbage = () => Buffer.from('this file is no zip and holds no class\n'.repeat(8))
 
 // a jar whose nested jar entry says it is deflated and holds bytes that are no deflate stream
@@ -113,4 +188,4 @@ function nestedBad () {
   return buf
 }
 
-module.exports = { direct, shared, silent, late, garbage, nestedBad, INIT, HOLD, LATE }
+module.exports = { direct, shared, silent, late, beside, thrown, garbage, nestedBad, INIT, HOLD, LATE }

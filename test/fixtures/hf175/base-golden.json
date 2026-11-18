@@ -243,5 +243,234 @@
   "listenOnly": [],
   "abstains": [],
   "sites": 0
+ },
+ "k-direct-switchcase.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-switchdefault.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-switchboth.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-switchbefore.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-switchcase-versioned.jar": {
+  "components": {
+   "configuration": [],
+   "play": [
+    {
+     "id": "kmod:direct",
+     "version": "7",
+     "flow": "clientbound",
+     "optional": true,
+     "source": "synth/k/Init",
+     "versionSource": "constant",
+     "versionFrom": "registrar-argument"
+    }
+   ]
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-shared-switchcase.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated required channel with no derivable version — join will be refused by the server",
+   "kmod:two: aggregated required channel with no derivable version — join will be refused by the server"
+  ],
+  "sites": 2
+ },
+ "k-shared-switchdefault.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated optional channel with unresolved version — safely unclaimed",
+   "kmod:two: aggregated optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-shared-switchbefore.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated optional channel with unresolved version — safely unclaimed",
+   "kmod:two: aggregated optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-beside.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed",
+   "synth/k/Init: playToClient with unresolved payload type id"
+  ],
+  "sites": 1
+ },
+ "k-thrown.jar": {
+  "components": {
+   "configuration": [],
+   "play": [
+    {
+     "id": "kmod:one",
+     "version": "7",
+     "flow": "clientbound",
+     "optional": false,
+     "source": "synth/k/Init (deep walk from synth/k/Init.onRegister)",
+     "versionSource": "constant",
+     "versionFrom": "registrar-argument"
+    }
+   ]
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-thrown-twin.jar": {
+  "components": {
+   "configuration": [],
+   "play": [
+    {
+     "id": "kmod:one",
+     "version": "7",
+     "flow": "clientbound",
+     "optional": false,
+     "source": "synth/k/Init (deep walk from synth/k/Init.onRegister)",
+     "versionSource": "constant",
+     "versionFrom": "registrar-argument"
+    },
+    {
+     "id": "kmod:two",
+     "version": "7",
+     "flow": "clientbound",
+     "optional": false,
+     "source": "synth/k/Init (deep walk from synth/k/Init.onRegister)",
+     "versionSource": "constant",
+     "versionFrom": "registrar-argument"
+    }
+   ]
+  },
+  "listenOnly": [],
+  "abstains": [],
+  "sites": 0
+ },
+ "k-direct-lookupcase.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-direct-lookupdefault.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:direct"
+  ],
+  "abstains": [
+   "kmod:direct: optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-shared-lookupdefault.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [
+   "kmod:one",
+   "kmod:two"
+  ],
+  "abstains": [
+   "kmod:one: aggregated optional channel with unresolved version — safely unclaimed",
+   "kmod:two: aggregated optional channel with unresolved version — safely unclaimed"
+  ],
+  "sites": 0
+ },
+ "k-thrown-early.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "listenOnly": [],
+  "abstains": [
+   "synth/k/Init.onRegister: the registrar never reaches a registration (deep walk incl. 0 static registries) — no channel claimed from this entry"
+  ],
+  "sites": 0
  }
 }

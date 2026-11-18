@@ -1,0 +1,124 @@
+{
+ "k-direct-undecided.jar": [],
+ "k-direct-plain.jar": [],
+ "k-direct-decided.jar": [],
+ "k-direct-callee.jar": [],
+ "k-direct-calleeplain.jar": [],
+ "k-direct-none.jar": [
+  [
+   "version",
+   "k-direct-none.jar",
+   "synth/k/Init",
+   "playToClient",
+   [
+    "play"
+   ],
+   "clientbound",
+   null,
+   false,
+   "kmod:direct",
+   "kmod:direct: required channel with no derivable version — join will be refused by the server"
+  ]
+ ],
+ "k-direct-claimed.jar": [],
+ "k-shared-undecided.jar": [],
+ "k-shared-plain.jar": [],
+ "k-shared-decided.jar": [],
+ "k-shared-callee.jar": [],
+ "k-shared-calleeplain.jar": [],
+ "k-shared-none.jar": [
+  [
+   "version",
+   "k-shared-none.jar",
+   null,
+   null,
+   [
+    "play"
+   ],
+   "clientbound",
+   null,
+   null,
+   "kmod:one",
+   "kmod:one: aggregated required channel with no derivable version — join will be refused by the server"
+  ],
+  [
+   "version",
+   "k-shared-none.jar",
+   null,
+   null,
+   [
+    "play"
+   ],
+   "clientbound",
+   null,
+   null,
+   "kmod:two",
+   "kmod:two: aggregated required channel with no derivable version — join will be refused by the server"
+  ]
+ ],
+ "k-silent.jar": [],
+ "k-late.jar": [],
+ "k-late-lib.jar": [],
+ "k-late-entry.jar": [],
+ "k-garbage.jar": [],
+ "k-nested-bad.jar": [],
+ "k-direct-switchcase.jar": [],
+ "k-direct-switchdefault.jar": [],
+ "k-direct-switchboth.jar": [],
+ "k-direct-switchbefore.jar": [],
+ "k-direct-switchcase-versioned.jar": [],
+ "k-shared-switchcase.jar": [
+  [
+   "version",
+   "k-shared-switchcase.jar",
+   null,
+   null,
+   [
+    "play"
+   ],
+   "clientbound",
+   null,
+   null,
+   "kmod:one",
+   "kmod:one: aggregated required channel with no derivable version — join will be refused by the server"
+  ],
+  [
+   "version",
+   "k-shared-switchcase.jar",
+   null,
+   null,
+   [
+    "play"
+   ],
+   "clientbound",
+   null,
+   null,
+   "kmod:two",
+   "kmod:two: aggregated required channel with no derivable version — join will be refused by the server"
+  ]
+ ],
+ "k-shared-switchdefault.jar": [],
+ "k-shared-switchbefore.jar": [],
+ "k-direct-lookupcase.jar": [],
+ "k-direct-lookupdefault.jar": [],
+ "k-shared-lookupdefault.jar": [],
+ "k-beside.jar": [
+  [
+   "registration",
+   "k-beside.jar",
+   "synth/k/Init",
+   "playToClient",
+   [
+    "play"
+   ],
+   "clientbound",
+   "7",
+   false,
+   null,
+   "synth/k/Init: playToClient with unresolved payload type id"
+  ]
+ ],
+ "k-thrown.jar": [],
+ "k-thrown-twin.jar": [],
+ "k-thrown-early.jar": []
+}
