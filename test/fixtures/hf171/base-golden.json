@@ -1,0 +1,53 @@
+{
+ "hf171control-3.2.1.jar": {
+  "components": {
+   "configuration": [],
+   "play": [
+    {
+     "id": "hf171control:notice",
+     "version": "7",
+     "flow": "clientbound",
+     "optional": false,
+     "source": "com/nemosai/hf171/control/RigMod (mod-root root:hf171control -> com/nemosai/hf171/control/RigMod.registerPlay)",
+     "versionSource": "constant",
+     "versionFrom": "registrar-argument"
+    }
+   ]
+  },
+  "abstains": []
+ },
+ "hf171a-3.2.1.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "abstains": [
+   "com/nemosai/hf171/a/RigMod.registerPlay: registry-counter ids (hf171a:p1) whose counter AtomicInteger.#atomic is advanced by 2 independent listeners/roots — the registration order is not provable, unclaimed",
+   "com/nemosai/hf171/a/RigMod.reserveNumber: the registrar never reaches a registration (deep walk incl. 1 static registry) — no channel claimed from this entry"
+  ]
+ },
+ "hf171a2-3.2.1.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "abstains": [
+   "com/nemosai/hf171/a2/RigMod.playToClient (via com/nemosai/hf171/a2/RigMod.registerPlay): the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed",
+   "com/nemosai/hf171/a2/RigMod: playToClient with unresolved payload type id"
+  ]
+ },
+ "hf171b-3.2.1.jar": {
+  "components": {
+   "configuration": [],
+   "play": []
+  },
+  "abstains": [
+   "com/nemosai/hf171/b/RigMod.registerPlay: registry-counter ids (hf171b:p1) whose counter AtomicInteger.#atomic is advanced by 2 independent listeners/roots — the registration order is not provable, unclaimed",
+   "com/nemosai/hf171/b/RigMod.configurationToClient (via com/nemosai/hf171/b/RigMod.registerConfiguration): the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed",
+   "com/nemosai/hf171/b/RigMod.configurationToServer (via com/nemosai/hf171/b/RigMod.registerConfiguration): the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed",
+   "com/nemosai/hf171/b/RigMod.reserveNumber: the registrar never reaches a registration (deep walk incl. 1 static registry) — no channel claimed from this entry",
+   "com/nemosai/hf171/b/RigMod: configurationToClient with unresolved payload type id",
+   "com/nemosai/hf171/b/RigMod: configurationToServer with unresolved payload type id"
+  ]
+ }
+}

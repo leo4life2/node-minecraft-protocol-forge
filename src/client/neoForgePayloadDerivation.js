@@ -119,6 +119,45 @@ const REGISTRATION_METHODS = {
   commonBidirectional: { protocols: ['play', 'configuration'], flow: null }
 }
 
+// HF171: a give-up that a server can refuse the pal for hands its FACTS over
+// beside its sentence. The sentence goes into diagnostics.abstains exactly as
+// before; the row in diagnostics.unresolvedSites says what the walk saw there:
+//   kind 'registration'    a registration call was met and its payload id is not
+//                          provable: the method (so the phase and the direction),
+//                          the registrar's version when it folded, the jar
+//   kind 'version'         the id is proven, the version is not (a required row)
+//   kind 'undecided'       the id is proven, its rows disagree or lack a direction
+//   kind 'unread'          the reading stopped (a budget, too many targets, a
+//                          shape it does not follow): registrations exist there
+//                          that were not seen
+// A proven-optional registration ("safely unclaimed"), a presence gate the pack
+// census decides, a note about dropped overrides and an entry whose walk ended
+// without meeting a registration call write a sentence only: no registration
+// was left unresolved there.
+function noteUnresolvedSite (diagnostics, says, facts) {
+  const reg = facts.reg || null
+  const spec = reg && reg.method ? REGISTRATION_METHODS[reg.method] : null
+  const registrar = reg ? reg.registrar : null
+  const version = registrar && registrar.version !== null && registrar.version !== undefined ? String(registrar.version) : null
+  ;(diagnostics.unresolvedSites = diagnostics.unresolvedSites || []).push({
+    kind: facts.kind,
+    jar: (reg && reg.jar && reg.jar.label) || facts.jar || null,
+    site: facts.site || (reg && reg.site) || null,
+    method: spec ? reg.method : null,
+    protocols: spec ? spec.protocols : (facts.protocols || null),
+    flow: spec ? spec.flow : (facts.flow || null),
+    version,
+    optional: registrar ? !!registrar.optional : null,
+    id: facts.id || null,
+    says
+  })
+}
+
+function giveUp (diagnostics, says, facts) {
+  diagnostics.abstains.push(says)
+  noteUnresolvedSite(diagnostics, says, facts)
+}
+
 // ---------- jar walking ----------
 
 // HF73b: every top-level jar read is a UNIT of the index (one per path, in
@@ -1194,7 +1233,7 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
   if (++state.helperFrames > HELPER_FRAME_BUDGET) {
     if (!state.helperBudgetBlown) {
       state.helperBudgetBlown = true
-      state.diagnostics.abstains.push(`registration dispatch budget exhausted at ${key} — remaining registrations abstained`)
+      giveUp(state.diagnostics, `registration dispatch budget exhausted at ${key} — remaining registrations abstained`, { kind: 'unread', jar: state.unitJar })
     }
     return
   }
@@ -1227,7 +1266,7 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
       // channels behind a sibling's successful claim.
       const carrying = targets.filter((t) => overrideCarriesRegistrar(index, t, ref))
       if (carrying.length > 12) {
-        state.diagnostics.abstains.push(`${key}: ${carrying.length} overrides carrying a registrar — too many, abstaining`)
+        giveUp(state.diagnostics, `${key}: ${carrying.length} overrides carrying a registrar — too many, abstaining`, { kind: 'unread', jar: state.unitJar })
         return
       }
       const dropped = targets.length - carrying.length
@@ -1272,7 +1311,7 @@ function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
   if (++state.helperFrames > HELPER_FRAME_BUDGET) {
     if (!state.helperBudgetBlown) {
       state.helperBudgetBlown = true
-      state.diagnostics.abstains.push(`registration dispatch budget exhausted at ${key} — remaining registrations abstained`)
+      giveUp(state.diagnostics, `registration dispatch budget exhausted at ${key} — remaining registrations abstained`, { kind: 'unread', jar: state.unitJar })
     }
     return
   }
@@ -1308,7 +1347,7 @@ function dispatchEventHelper (index, ref, kind, recv, argVals, state, opts) {
   if (++state.helperFrames > HELPER_FRAME_BUDGET) {
     if (!state.helperBudgetBlown) {
       state.helperBudgetBlown = true
-      state.diagnostics.abstains.push(`registration dispatch budget exhausted at ${key} — remaining registrations abstained`)
+      giveUp(state.diagnostics, `registration dispatch budget exhausted at ${key} — remaining registrations abstained`, { kind: 'unread', jar: state.unitJar })
     }
     return
   }
@@ -1325,7 +1364,7 @@ function dispatchEventHelper (index, ref, kind, recv, argVals, state, opts) {
       }
     }
     if (targets.length > 12) {
-      state.diagnostics.abstains.push(`${key}: ${targets.length} overrides carrying the payload-handlers event — too many, abstaining`)
+      giveUp(state.diagnostics, `${key}: ${targets.length} overrides carrying the payload-handlers event — too many, abstaining`, { kind: 'unread', jar: state.unitJar })
       return
     }
   }
@@ -1391,7 +1430,7 @@ function dispatchVirtual (index, ref, argVals, state, opts) {
     }
   }
   if (targets.length > 12) {
-    state.diagnostics.abstains.push(`${key}: ${targets.length} overrides — too many, abstaining`)
+    giveUp(state.diagnostics, `${key}: ${targets.length} overrides — too many, abstaining`, { kind: 'unread', jar: state.unitJar })
     return
   }
   for (const target of targets) {
@@ -1560,7 +1599,7 @@ function deriveEnumRegistries (index, state, markers, read = null) {
       if (registry) break
     }
     if (!registry) {
-      state.diagnostics.abstains.push(`${name}: enum packet registry without (modId, version) construction`)
+      giveUp(state.diagnostics, `${name}: enum packet registry without (modId, version) construction`, { kind: 'unread', jar: state.unitJar })
       continue
     }
     for (const c of constants) {
@@ -1571,7 +1610,7 @@ function deriveEnumRegistries (index, state, markers, read = null) {
       const decided = payloadClass ? decideFlowByRules(index, payloadClass, markers, read) : null
       const id = `${helperNs}:${c.name.toLowerCase()}`
       if (!decided) {
-        state.diagnostics.abstains.push(`${id}: no flow marker on ${payloadClass}${directionRulesTriedNote()}`)
+        giveUp(state.diagnostics, `${id}: no flow marker on ${payloadClass}${directionRulesTriedNote()}`, { kind: 'undecided', id, jar: state.unitJar })
         continue
       }
       out.push({
@@ -3281,7 +3320,7 @@ function populateOwnRegistries (index, state, info, fieldNames, entryMethod) {
     }
     if (capped) break
   }
-  if (capped) state.diagnostics.abstains.push(`${cls}: more than ${AGG_MAX_POPULATION_SITES} population sites for its static registries — the remainder's channels unclaimed`)
+  if (capped) giveUp(state.diagnostics, `${cls}: more than ${AGG_MAX_POPULATION_SITES} population sites for its static registries — the remainder's channels unclaimed`, { kind: 'unread', jar: state.unitJar })
   // Phase 1 — caller contexts of every production site (the climb runs the
   // sites themselves under provenance locals as a side effect, which would
   // queue a packet-less lambda that can only abstain). Phase 2 — the entry
@@ -3433,7 +3472,7 @@ function resolveAggregatedRegistrations (index, state, pending) {
   }
   const clean = rows.filter((r) => !conflicted.has(r.id))
   for (const id of conflicted) {
-    state.diagnostics.abstains.push(`${id}: aggregated candidates disagree on flow/version — unclaimed (a wrong tuple would fail the negotiation)`)
+    giveUp(state.diagnostics, `${id}: aggregated candidates disagree on flow/version — unclaimed (a wrong tuple would fail the negotiation)`, { kind: 'undecided', id, jar: state.unitJar })
   }
   // versionless mandatory rows fall back to their jar's mods.toml version
   // downstream via the same rule as pass 1 (handled by the caller)
@@ -4130,7 +4169,7 @@ function deriveModRootRegistrations (index, state, record) {
     summary.steps += state.aggSteps || 0
     if (!state.aggBudgetBlown) return
     summary.exhaustedUnits.push(what)
-    diagnostics.abstains.push(`mod-root walk: ${what} exhausted its ${MOD_ROOT_UNIT_STEP_BUDGET}-step budget — registrations past that point are not derived here (the entry passes still run)`)
+    giveUp(diagnostics, `mod-root walk: ${what} exhausted its ${MOD_ROOT_UNIT_STEP_BUDGET}-step budget — registrations past that point are not derived here (the entry passes still run)`, { kind: 'unread' })
     state.aggBudgetBlown = false
   }
   let totalSpent = false
@@ -4188,7 +4227,7 @@ function deriveModRootRegistrations (index, state, record) {
     }
     if (totalSpent) {
       summary.budgetExhausted = true
-      diagnostics.abstains.push(`mod-root walk: the total step budget (${MOD_ROOT_TOTAL_STEP_BUDGET}) ran out after ${summary.listenerSites.length} of ${summary.listeners} listener(s) — registrations past that point are not derived here (the entry passes still run)`)
+      giveUp(diagnostics, `mod-root walk: the total step budget (${MOD_ROOT_TOTAL_STEP_BUDGET}) ran out after ${summary.listenerSites.length} of ${summary.listeners} listener(s) — registrations past that point are not derived here (the entry passes still run)`, { kind: 'unread' })
     }
   } finally {
     state.aggBudgetBlown = false
@@ -4211,19 +4250,27 @@ function deriveModRootRegistrations (index, state, record) {
     const h = r.counter
     if (h && h.mutated && h.touches.size > 1) {
       const key = `${r.listenerSite}|${h.cls}.${h.field}`
-      if (!dropped.has(key)) dropped.set(key, { site: r.listenerSite, holder: h, ids: [] })
+      if (!dropped.has(key)) dropped.set(key, { site: r.listenerSite, holder: h, ids: [], regs: [] })
       dropped.get(key).ids.push(r.id)
+      dropped.get(key).regs.push(r)
       summary.droppedUnprovenOrder++
       continue
     }
     kept.push(r)
   }
   for (const d of dropped.values()) {
-    diagnostics.abstains.push(`${d.site}: registry-counter ids (${d.ids.join(', ')}) whose counter ${d.holder.cls.split('/').pop()}.${d.holder.field} is advanced by ${d.holder.touches.size} independent listeners/roots — the registration order is not provable, unclaimed`)
+    const says = `${d.site}: registry-counter ids (${d.ids.join(', ')}) whose counter ${d.holder.cls.split('/').pop()}.${d.holder.field} is advanced by ${d.holder.touches.size} independent listeners/roots — the registration order is not provable, unclaimed`
+    diagnostics.abstains.push(says)
+    // HF171: one row a registration; the computed id is not proven and is not handed on as one
+    for (const r of d.regs) noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg: r })
   }
-  const unresolvedSites = new Set(rows.filter((r) => r.unresolved).map((r) => `${r.site.split(' (mod-root')[0]}.${r.method} (via ${r.listenerSite})`))
-  for (const site of unresolvedSites) {
-    diagnostics.abstains.push(`${site}: the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed`)
+  const unresolvedSites = new Set()
+  for (const r of rows) {
+    if (!r.unresolved) continue
+    const site = `${r.site.split(' (mod-root')[0]}.${r.method} (via ${r.listenerSite})`
+    if (unresolvedSites.has(site)) continue
+    unresolvedSites.add(site)
+    giveUp(diagnostics, `${site}: the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed`, { kind: 'registration', reg: r })
   }
   for (const r of kept) {
     record(r)
@@ -4405,6 +4452,7 @@ function deriveNeoForgeJarUnit (read, unit, { seedRegistrations = [], modRootPas
   const diagnostics = { jars: read.diagnostics.jars, abstains: [], errors: [], registrations: 0, presenceGates: [] }
   const deps = { present: Object.create(null), versions: Object.create(null), gates: Object.create(null), rootResolved: Object.create(null), missed: [], packCensus: null }
   const state = freshDerivationState(read, diagnostics, deps)
+  state.unitJar = unit.pack ? null : (unit.label || null) // HF171: the jar a give-up of this unit belongs to
   const versionByModId = state.versionByModId
   // HF37: a runtime-versioned registrar falls back to the mods.toml version of
   // the mod the registrar NAMESPACE names (its own jar), then the site's jar.
@@ -4499,6 +4547,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     let reached = 0
     let reachedWithId = 0
     const abstainStart = diagnostics.abstains.length
+    const siteStart = (diagnostics.unresolvedSites || []).length // HF171: the rows move with their sentences
     const regStart = registrations.length
     simulate(index, info, method, state, { onRegistration: (r) => { reached++; if (r.id) reachedWithId++; record(r) }, recordPutstatic: false, locals })
     // HF16-R2: the linear walk's abstains for an entry the deep pass takes
@@ -4509,9 +4558,9 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // collection is walked deep as well (the collection's populated
     // elements are the truth the guess lacked).
     if (reached === 0) {
-      silentEntries.push({ info, method, linearAbstains: diagnostics.abstains.splice(abstainStart) })
+      silentEntries.push({ info, method, linearAbstains: diagnostics.abstains.splice(abstainStart), linearSites: (diagnostics.unresolvedSites || []).splice(siteStart) })
     } else if (reachedWithId === 0 && entryRegistries(index, info, method).any) {
-      silentEntries.push({ info, method, soft: true, linearAbstains: diagnostics.abstains.splice(abstainStart), linearRegs: registrations.slice(regStart) })
+      silentEntries.push({ info, method, soft: true, linearAbstains: diagnostics.abstains.splice(abstainStart), linearSites: (diagnostics.unresolvedSites || []).splice(siteStart), linearRegs: registrations.slice(regStart) })
     }
   }
   // HF37 SILENT-ENTRY deep pass (mechanism, javap-verified on framework
@@ -4548,6 +4597,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // sending its unguarded optional payload to the unclaimed client).
     if (method.method.startsWith('lambda$') && entryMethods.some((e) => e.info === info && !e.method.method.startsWith('lambda$'))) {
       diagnostics.abstains.push(...entry.linearAbstains)
+      if (entry.linearSites.length) diagnostics.unresolvedSites.push(...entry.linearSites)
       continue
     }
     const before = registrations.length
@@ -4583,7 +4633,10 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
         if (at >= 0 && !r.id) registrations.splice(at, 1)
       }
     }
-    if (!resolvedDeep) diagnostics.abstains.push(...entry.linearAbstains)
+    if (!resolvedDeep) {
+      diagnostics.abstains.push(...entry.linearAbstains)
+      if (entry.linearSites.length) diagnostics.unresolvedSites.push(...entry.linearSites)
+    }
     if (registrations.length === before && !entry.soft) {
       diagnostics.abstains.push(`${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size + own.size} static registr${registries.size + own.size === 1 ? 'y' : 'ies'}) — no channel claimed from this entry`)
     }
@@ -4635,7 +4688,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       // heuristic for the registrar(modVersion) runtime idiom only, and
       // substituting the mod version here claims a wrong tuple.
       if (reg.registrar && reg.registrar.versionFromParam) {
-        diagnostics.abstains.push(`${reg.id}: version rides a caller parameter — claimed only where a call site binds a constant; mods.toml fallback forbidden (riding listen-only)`)
+        giveUp(diagnostics, `${reg.id}: version rides a caller parameter — claimed only where a call site binds a constant; mods.toml fallback forbidden (riding listen-only)`, { kind: 'version', id: reg.id, reg })
         listenOnlyNamed.push(reg.id)
         continue
       }
@@ -4644,7 +4697,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
         versionSource = 'mods.toml'
         versionFrom = fallbackReceiptOf(reg.registrar)
       } else {
-        diagnostics.abstains.push(`${reg.id}: required channel with no derivable version — join will be refused by the server`)
+        giveUp(diagnostics, `${reg.id}: required channel with no derivable version — join will be refused by the server`, { kind: 'version', id: reg.id, reg })
         listenOnlyNamed.push(reg.id)
         continue
       }
@@ -4679,7 +4732,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     diagnostics.errors.push(`platform-helper derivation failed (${err.message})`)
   }
   for (const r of platformHelper.rows) add(r.id, r.version, r.flow, r.optional, r.protocols, r.source, 'platform-helper')
-  diagnostics.abstains.push(...platformHelper.abstains)
+  for (const a of platformHelper.abstains) giveUp(diagnostics, a, { kind: 'unread', jar: state.unitJar })
 
   // HF11 AGGREGATOR pass: resolve id-less registrations from their jar-wide
   // population contexts (see the shape header above); leftovers abstain with
@@ -4699,7 +4752,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       }
       // HF16 PARAM-PROVENANCE VERSION LAW (same rule as the direct rows).
       if (row.versionFromParam) {
-        diagnostics.abstains.push(`${row.id}: aggregated version rides a caller parameter — claimed only where a call site binds a constant; mods.toml fallback forbidden (riding listen-only)`)
+        giveUp(diagnostics, `${row.id}: aggregated version rides a caller parameter — claimed only where a call site binds a constant; mods.toml fallback forbidden (riding listen-only)`, { kind: 'version', id: row.id, flow: row.flow, protocols: row.protocols, jar: (row.jar && row.jar.label) || state.unitJar })
         listenOnlyNamed.push(row.id)
         continue
       }
@@ -4708,7 +4761,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
         versionSource = 'mods.toml'
         versionFrom = fallbackReceiptOf(row)
       } else {
-        diagnostics.abstains.push(`${row.id}: aggregated required channel with no derivable version — join will be refused by the server`)
+        giveUp(diagnostics, `${row.id}: aggregated required channel with no derivable version — join will be refused by the server`, { kind: 'version', id: row.id, flow: row.flow, protocols: row.protocols, jar: (row.jar && row.jar.label) || state.unitJar })
         listenOnlyNamed.push(row.id)
         continue
       }
@@ -4728,14 +4781,16 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     const opt = reg.registrar && reg.registrar.optional && !reg.registrar.optionalUndecided
     const undecided = reg.registrar && reg.registrar.optional && reg.registrar.optionalUndecided
     const partially = agg.resolvedSites.has(sk) ? ' (partially aggregated — remainder unresolved)' : ''
-    diagnostics.abstains.push(opt
+    const says = opt
       ? `${reg.site}: ${reg.method} optional registration with unresolved payload type id — safely unclaimed${partially}`
       : undecided
         ? `${reg.site}: ${reg.method} with unresolved payload type id — unresolved-required (its .optional() sits under a condition this walk could not decide, so it is NOT safely unclaimed; the server names it in its refusal)${partially}`
-        : `${reg.site}: ${reg.method} with unresolved payload type id${partially}`)
+        : `${reg.site}: ${reg.method} with unresolved payload type id${partially}`
+    if (opt) diagnostics.abstains.push(says) // proven optional: the server drops it, nothing to refuse for
+    else giveUp(diagnostics, says, { kind: 'registration', reg, jar: state.unitJar })
   }
   if (state.aggBudgetBlown) {
-    diagnostics.abstains.push('aggregation budget exhausted — remaining aggregated registrations abstained')
+    giveUp(diagnostics, 'aggregation budget exhausted — remaining aggregated registrations abstained', { kind: 'unread', jar: state.unitJar })
   }
 
   // HF11: blocking-task ack contracts (see deriveAckContracts header) — the
@@ -4826,7 +4881,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
  * concatenated in unit order. The result shape is deriveNeoForgeComponents'.
  */
 function assembleNeoForgeComponents (read, perJar) {
-  const diagnostics = { ...read.diagnostics, abstains: [...read.diagnostics.abstains], errors: [...read.diagnostics.errors], registrations: 0, presenceGates: [] }
+  const diagnostics = { ...read.diagnostics, abstains: [...read.diagnostics.abstains], unresolvedSites: [...(read.diagnostics.unresolvedSites || [])], errors: [...read.diagnostics.errors], registrations: 0, presenceGates: [] }
   const byProtocol = { configuration: new Map(), play: new Map() }
   // HF16 ASSEMBLE CONFLICT GUARD: version sources that are BYTECODE-PROVEN
   // (a compile-time constant read at/through the registration site) outrank
@@ -4855,7 +4910,7 @@ function assembleNeoForgeComponents (read, perJar) {
       if (newConst && prevConst && (prev.version !== version || prev.flow !== flow || prev.optional !== optional)) {
         byProtocol[proto].delete(id)
         droppedConflicts.add(`${proto}:${id}`)
-        diagnostics.abstains.push(`${id}: constant-proven registrations disagree on version/flow/optionality — unclaimed (a wrong tuple would fail the negotiation)`)
+        giveUp(diagnostics, `${id}: constant-proven registrations disagree on version/flow/optionality — unclaimed (a wrong tuple would fail the negotiation)`, { kind: 'undecided', id })
       }
       // otherwise the standing claim holds (identical or equally-provenanced)
     }
@@ -4901,12 +4956,15 @@ function assembleNeoForgeComponents (read, perJar) {
     // (a site line cut at the abstain length cap keeps its '(via <entry>' head and loses its kind words: the site prefix alone names it)
     const unresolvedKind = (a) => /unresolved payload type id/.test(a) || /never reaches a registration/.test(a) || /\(via /.test(a)
     diagnostics.abstains = diagnostics.abstains.filter((a) => !(resolvedSite(a) && unresolvedKind(a)))
+    diagnostics.unresolvedSites = diagnostics.unresolvedSites.filter((s) => !(resolvedSite(s.says) && unresolvedKind(s.says))) // HF171: a row leaves with its sentence
   }
   const components = {
     configuration: [...byProtocol.configuration.values()],
     play: [...byProtocol.play.values()]
   }
   const claimedIds = new Set(['configuration', 'play'].flatMap((p) => components[p].map((c) => c.id)))
+  // HF171: an id whose version one site could not read and another site's claim carries is resolved
+  diagnostics.unresolvedSites = diagnostics.unresolvedSites.filter((s) => !(s.kind === 'version' && s.id && claimedIds.has(s.id)))
   const listenOnly = assembleListenOnly({ ...listen, claimedIds, diagnostics })
   return { components, diagnostics, ackContracts, ackUnprovable, syncContracts, listenOnly }
 }
