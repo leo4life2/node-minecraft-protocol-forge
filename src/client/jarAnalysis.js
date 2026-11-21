@@ -329,7 +329,14 @@ function decodeInstructions (code, cp) {
         row.cls = cpClassName(cp, code.readUInt16BE(pc + 1)); break
       case 0xba: { // invokedynamic
         const c = cp[code.readUInt16BE(pc + 1)]
-        if (c && c.bsmIndex !== undefined) { row.bsmIndex = c.bsmIndex; const nat = cp[c.natIndex]; if (nat) row.samName = cpUtf8(cp, nat.nameIndex) }
+        if (c && c.bsmIndex !== undefined) {
+          row.bsmIndex = c.bsmIndex
+          const nat = cp[c.natIndex]
+          if (nat) {
+            row.samName = cpUtf8(cp, nat.nameIndex)
+            row.samDesc = cpUtf8(cp, nat.descIndex)
+          }
+        }
         break
       }
       case 0x99: case 0x9a: case 0x9b: case 0x9c: case 0x9d: case 0x9e: case 0x9f:

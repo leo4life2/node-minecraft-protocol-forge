@@ -5,6 +5,7 @@
 // Forge 1.20.1 + Farmer's Delight server (132/132 blocks, 0 false-nonsolid,
 // 0 false-solid — see the modded-block-shapes lane).
 const assert = require('assert')
+const { createHash } = require('crypto')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
@@ -27,6 +28,139 @@ function writeJar (name, buf) {
   fs.writeFileSync(p, buf)
   return p
 }
+
+const NEO_DR = 'net/neoforged/neoforge/registries/DeferredRegister'
+const NEO_HOLDER = 'net/neoforged/neoforge/registries/DeferredHolder'
+const RESOURCE_KEY = 'net/minecraft/resources/ResourceKey'
+const REGISTRIES = 'net/minecraft/core/registries/Registries'
+const SUPPLIER = 'Ljava/util/function/Supplier;'
+
+// A block register, an unrelated registry, and calls with inputs that cannot be
+// traced. Only the loader-specific owner and holder change in the Forge twin.
+function deferredBlockJar (forge = false, opaqueDefinition = false, propertyOwner = 'fixture/Lamp') {
+  const owner = 'fixture/Registration'
+  const cls = 'fixture/Lamp'
+  const dr = forge ? DR : NEO_DR
+  const holder = forge ? RO : NEO_HOLDER
+  const drType = `L${dr};`
+  const desc = `(Ljava/lang/String;${SUPPLIER})L${holder};`
+  const property = 'net/minecraft/world/level/block/state/properties/BooleanProperty'
+  const propBase = 'net/minecraft/world/level/block/state/properties/Property'
+  const ctor = `(L${PROPS};)V`
+  const factory = `()L${cls};`
+  const setup = (a, kind) => a.getstatic(REGISTRIES, kind, `L${RESOURCE_KEY};`).ldcStr('lamps')
+    .invokestatic(dr, 'create', `(L${RESOURCE_KEY};Ljava/lang/String;)${drType}`).putstatic(owner, kind, drType)
+  const supplier = (a) => a.invokedynamic(0, 'get', '()' + SUPPLIER)
+  const reg = (a, target = dr, sig = desc) => supplier(a).invokevirtual(target, 'register', sig).pop()
+  const entries = {
+    [owner + '.class']: buildClass({
+      name: owner,
+      fields: ['BLOCK', 'ITEM'].map(name => ({ name, desc: drType })),
+      bootstrapMethods: [{ owner, name: 'make', desc: factory, supplierType: factory }],
+      methods: [
+        {
+          name: '<clinit>',
+          desc: '()V',
+          flags: 8,
+          code: a => {
+            setup(a, 'BLOCK')
+            setup(a, 'ITEM')
+            reg(a.getstatic(owner, 'BLOCK', drType).ldcStr('lamp'))
+            if (!forge) {
+              reg(a.getstatic(owner, 'ITEM', drType).ldcStr('other_registry'))
+              reg(a.getstatic(owner, 'BLOCK', drType).ldcStr('computed').invokestatic('fixture/Names', 'compute', '(Ljava/lang/String;)Ljava/lang/String;'))
+              reg(a.ldcCls(owner).ldcStr('BLOCK').invokevirtual('java/lang/Class', 'getField', '(Ljava/lang/String;)Ljava/lang/reflect/Field;')
+                .aconstNull().invokevirtual('java/lang/reflect/Field', 'get', '(Ljava/lang/Object;)Ljava/lang/Object;').checkcast(dr).ldcStr('opaque_register'))
+              reg(a.getstatic(owner, 'BLOCK', drType).ldcStr('wrong_owner'), 'fixture/Lookalike')
+              reg(a.getstatic(owner, 'BLOCK', drType).ldcStr('wrong_descriptor'), dr, `(Ljava/lang/String;${SUPPLIER})Ljava/lang/Object;`)
+            }
+            a.ret()
+          }
+        },
+        {
+          name: 'make',
+          desc: factory,
+          code: a => a.new_(cls).dup().invokestatic(PROPS, 'of', `()L${PROPS};`)
+            .invokespecial(cls, '<init>', ctor).areturn()
+        }
+      ]
+    }),
+    [cls + '.class']: buildClass({
+      name: cls,
+      superName: BLOCK,
+      fields: [{ name: 'ON', desc: `L${property};` }],
+      methods: [
+        { name: '<init>', desc: ctor, flags: 1, code: a => a.aload(0).aload(1).invokespecial(BLOCK, '<init>', ctor).ret() },
+        { name: '<clinit>', desc: '()V', flags: 8, code: a => a.ldcStr('on').invokestatic(property, 'create', `(Ljava/lang/String;)L${property};`).putstatic(cls, 'ON', `L${property};`).ret() },
+        {
+          name: forge ? 'm_7926_' : 'createBlockStateDefinition',
+          desc: `(L${BUILDER};)V`,
+          flags: 4,
+          code: a => {
+            if (opaqueDefinition) return a.aload(1).invokestatic('fixture/Options', 'addProperties', `(L${BUILDER};)V`).ret()
+            a.aload(1).iconst(1).anewarray(propBase).dup().iconst(0).getstatic(propertyOwner, 'ON', `L${property};`).aastore()
+            a.invokevirtual(BUILDER, 'add', `([L${propBase};)L${BUILDER};`).pop().ret()
+          }
+        }
+      ]
+    })
+  }
+  return buildJar(Object.entries(entries).map(([name, data]) => ({ name, data })))
+}
+
+describe('blockShapeDerivation (NeoForge)', function () {
+  const read = () => deriveBlockShapes([writeJar('blocks.jar', deferredBlockJar())]).blocks
+  it('counts the properties of a block registered through a NeoForge deferred holder', function () {
+    assert.strictEqual(read().get('lamps:lamp')?.stateCount, 2)
+  })
+  it('requires the block register, literal operands and exact registration signature', function () {
+    assert.deepStrictEqual([...read().keys()], ['lamps:lamp'])
+  })
+  it('leaves the width unknown when a helper builds the named state definition', function () {
+    const { blocks } = deriveBlockShapes([writeJar('opaque.jar', deferredBlockJar(false, true))])
+    assert.strictEqual(blocks.get('lamps:lamp')?.stateCount, null)
+  })
+  it('resolves a state property by its field descriptor when a subclass hides its name', function () {
+    const owner = 'fixture/OtherLamp'
+    const integer = 'net/minecraft/world/level/block/state/properties/IntegerProperty'
+    const child = buildClass({
+      name: owner,
+      superName: 'fixture/Lamp',
+      fields: [{ name: 'ON', desc: `L${integer};` }],
+      methods: [{
+        name: '<clinit>',
+        desc: '()V',
+        flags: 8,
+        code: a => a.ldcStr('level').iconst(0).iconst(4)
+          .invokestatic(integer, 'create', `(Ljava/lang/String;II)L${integer};`)
+          .putstatic(owner, 'ON', `L${integer};`).ret()
+      }]
+    })
+    const jars = [writeJar('blocks.jar', deferredBlockJar(false, false, owner)),
+      writeJar('properties.jar', buildJar([{ name: owner + '.class', data: child }]))]
+    assert.strictEqual(deriveBlockShapes(jars).blocks.get('lamps:lamp')?.stateCount, 2)
+  })
+  it('abstains when two jars supply different definitions of the block class', function () {
+    const name = 'fixture/Lamp'
+    const alternative = buildClass({ name, superName: BLOCK, methods: [] })
+    const jars = [writeJar('blocks.jar', deferredBlockJar()),
+      writeJar('other.jar', buildJar([{ name: name + '.class', data: alternative }]))]
+    for (const order of [jars, [...jars].reverse()]) {
+      assert.strictEqual(deriveBlockShapes(order).blocks.has('lamps:lamp'), false)
+    }
+  })
+  it('preserves the complete Forge and empty registry results', function () {
+    const fixtures = [
+      [deferredBlockJar(true), '19bea095f7cdc7f2eca533834f41d79d968ab680879b148b6f122c8db0085534'],
+      [buildJar([]), '27be3ca194b7c745e4a76c1225cbbf35bf4903b500d00bc8f3762fb530de5cf2']
+    ]
+    for (const [jar, expected] of fixtures) {
+      const { blocks, stats } = deriveBlockShapes([writeJar('fixture.jar', jar)])
+      const json = JSON.stringify({ blocks: [...blocks], stats: { ...stats, ms: 0 } })
+      assert.strictEqual(createHash('sha256').update(json).digest('hex'), expected)
+    }
+  })
+})
 
 describe('blockShapeDerivation (Forge/srg era)', function () {
   function forgeJar () {

@@ -33,12 +33,11 @@
 // Namespaces ('eras'):
 //   srg          - Forge 1.17-1.20.1 jars (mojmap class names, SRG members)
 //   intermediary - Fabric jars (any version; intermediary ids are stable)
-// NeoForge 1.20.5+ jars (full mojmap member names) are not yet in the tables:
-// those jars derive nothing and every block abstains (honest degradation).
+//   mojmap       - NeoForge deferred block holders (named classes and members)
 
 const fs = require('fs')
 const {
-  zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions, resolveLambdaImpl
+  zipCentralEntries, zipEntryData, parseClassFile, decodeInstructions, resolveLambdaImpl, cpRef
 } = require('./jarAnalysis')
 const debug = require('debug')('minecraft-protocol-forge')
 
@@ -75,10 +74,17 @@ function eraVocab (era) {
 }
 const VOCABS = { srg: eraVocab('srg'), intermediary: eraVocab('intermediary') }
 
+VOCABS.mojmap = { ...VOCABS.srg, era: 'mojmap', cbsdNames: new Set(['createBlockStateDefinition']) }
+
 // ---------------------------------------------------------------------------
 // class universe across all jars (top-level + nested), lazy parse
 function buildUniverse (jarPaths) {
   const units = [] // {source, buf, entries: Map<clsName, entry>}
+  const otherDefinitions = new Map()
+  function recordDuplicate (cls, buf, entry) {
+    if (!otherDefinitions.has(cls)) otherDefinitions.set(cls, [])
+    otherDefinitions.get(cls).push({ buf, entry })
+  }
   const addUnit = (buf, source, depth) => {
     let entries
     try { entries = zipCentralEntries(buf) } catch { return }
@@ -89,7 +95,8 @@ function buildUniverse (jarPaths) {
     for (const e of entries) {
       if (e.name.endsWith('.class')) {
         const cls = e.name.slice(0, -6)
-        if (!classes.has(cls)) classes.set(cls, e)
+        if (classes.has(cls)) recordDuplicate(cls, buf, e)
+        else classes.set(cls, e)
       }
     }
     units.push({ source, buf, classes })
@@ -99,12 +106,25 @@ function buildUniverse (jarPaths) {
   }
   const where = new Map() // clsName -> {unit, entry}
   for (const u of units) {
-    for (const [cls, e] of u.classes) if (!where.has(cls)) where.set(cls, { unit: u, entry: e })
+    for (const [cls, entry] of u.classes) {
+      if (where.has(cls)) recordDuplicate(cls, u.buf, entry)
+      else where.set(cls, { unit: u, entry })
+    }
   }
   const parsed = new Map()
   return {
     units,
     has: (cls) => where.has(cls),
+    // Jar order alone cannot establish which version the loader selected.
+    hasUniqueDefinition (cls) {
+      const others = otherDefinitions.get(cls)
+      if (!others) return true
+      const { unit, entry } = where.get(cls)
+      try {
+        const bytes = zipEntryData(unit.buf, entry)
+        return others.every(other => bytes.equals(zipEntryData(other.buf, other.entry)))
+      } catch { return false }
+    },
     get (cls) {
       if (parsed.has(cls)) return parsed.get(cls)
       const loc = where.get(cls)
@@ -177,6 +197,18 @@ function statements (rows) {
 // classify `putstatic <property field>` statements in a MOD class clinit.
 // Returns {card} | {aliasTo: 'owner#field'} | null (unknown => abstain).
 function classifyModPropertyStatement (stmt, vocab, universe) {
+  if (vocab.era === 'mojmap') {
+    const create = stmt.at(-2)
+    if (create?.op !== 0xb8 || create.ref?.name !== 'create' || stmt[0].str === undefined) return null
+    const { owner, desc } = create.ref
+    if (owner === vocab.cn.propBoolean && desc === `(Ljava/lang/String;)L${owner};` && stmt.length === 3) return { card: 2 }
+    if (owner === vocab.cn.propInteger && desc === `(Ljava/lang/String;II)L${owner};` && stmt.length === 5) {
+      const lo = stmt[1].int
+      const hi = stmt[2].int
+      if (Number.isInteger(lo) && Number.isInteger(hi) && hi >= lo) return { card: hi - lo + 1 }
+    }
+    return null
+  }
   if (stmt.some((r) => r.target !== undefined)) return null // branches: not a straight-line definition
   const creates = stmt.filter((r) => (r.op === 0xb8 || r.op === 0xb6) && r.ref &&
     vocab.propDescs.has(retDesc(r.ref.desc)))
@@ -228,15 +260,32 @@ function enumConstCount (cls, universe, vocab) {
 function propCardOf (propKey, universe, vocab, seen = new Set()) {
   if (seen.has(propKey)) return null
   seen.add(propKey)
-  const direct = vanillaPropCard(propKey, vocab)
+  const direct = vocab.era === 'mojmap' ? null : vanillaPropCard(propKey, vocab)
   if (direct != null) return direct
-  const [owner, field] = propKey.split('#')
+  const [owner, field, descriptor] = propKey.split('#')
   if (universe.has(owner)) {
     const p = universe.get(owner)
     if (!p) return null
     const clinit = p.codes.find((m) => m.method === '<clinit>')
+    if (vocab.era === 'mojmap') {
+      // JVM field resolution includes the descriptor. A subclass can hide a
+      // superclass field of another type under the same name.
+      const declared = p.fields.find(f => f.name === field && f.desc === descriptor)
+      if (!declared) {
+        if (p.interfaces.length || !p.superName) return null
+        return propCardOf(`${p.superName}#${field}#${descriptor}`, universe, vocab, seen)
+      }
+      if ((declared.flags & 0x18) !== 0x18 || !clinit) return null
+      const writes = statements(decodeInstructions(clinit.code, p.cp)).filter(stmt => {
+        const ref = stmt.at(-1).ref
+        return ref?.owner === owner && ref.name === field && ref.desc === descriptor
+      })
+      if (writes.length !== 1) return null
+      return classifyModPropertyStatement(writes[0], vocab, universe)?.card ?? null
+    }
     if (clinit) {
-      for (const stmt of statements(decodeInstructions(clinit.code, p.cp))) {
+      const initializers = statements(decodeInstructions(clinit.code, p.cp))
+      for (const stmt of initializers) {
         const put = stmt[stmt.length - 1]
         if (!put.ref || put.ref.name !== field || !vocab.propDescs.has(put.ref.desc)) continue
         const c = classifyModPropertyStatement(stmt, vocab, universe)
@@ -276,10 +325,47 @@ function vanillaPropCard (propKey, vocab) {
 // state count: effective createBlockStateDefinition contributions over the
 // chain (mod bodies parsed with abstain-on-any-branch discipline; vanilla
 // classes from the generated table, including its dynamic/abstain flags)
+// Named mappings have no property-field table. Accept the javac form of
+// builder.add(PROP, ...), including an optional super call. A helper which
+// receives the builder could add any number of states.
+function namedStateDefinition (rows, parsed, vocab) {
+  const props = []
+  let callsSuper = false
+  let i = 0
+  while (i < rows.length - 1) {
+    if (rows[i]?.aload === 0 && rows[i + 1]?.aload === 1 && rows[i + 2]?.op === 0xb7) {
+      const ref = rows[i + 2].ref
+      if (callsSuper || ref?.owner !== parsed.superName || !vocab.cbsdNames.has(ref.name) || ref.desc !== vocab.builderDesc) return { dynamic: true }
+      callsSuper = true
+      i += 3
+      continue
+    }
+    const count = rows[i + 1]?.int
+    if (rows[i]?.aload !== 1 || !Number.isInteger(count) || count < 1 || rows[i + 2]?.op !== 0xbd ||
+        rows[i + 2].cls !== vocab.cn.propBase) return { dynamic: true }
+    i += 3
+    for (let index = 0; index < count; index++, i += 4) {
+      const field = rows[i + 2]
+      if (rows[i]?.op !== 0x59 || rows[i + 1]?.int !== index || field?.op !== 0xb2 ||
+          !vocab.propDescs.has(field.ref?.desc) || rows[i + 3]?.op !== 0x53) return { dynamic: true }
+      props.push(`${field.ref.owner}#${field.ref.name}#${field.ref.desc}`)
+    }
+    const add = rows[i]
+    if (add?.op !== 0xb6 || add.ref?.owner !== vocab.cn.builder || add.ref.name !== 'add' ||
+        add.ref.desc !== `([L${vocab.cn.propBase};)L${vocab.cn.builder};` || rows[i + 1]?.op !== 0x57) return { dynamic: true }
+    i += 2
+  }
+  return { props, callsSuper, dynamic: rows[i]?.op !== 0xb1 }
+}
+
 function modCbsdContrib (parsed, vocab) {
   const m = parsed.codes.find((c) => vocab.cbsdNames.has(c.method) && c.desc === vocab.builderDesc)
-  if (!m) return null // does not define it
+  if (!m) {
+    if (vocab.era === 'mojmap' && parsed.methods.some(m => vocab.cbsdNames.has(m.name) && m.desc === vocab.builderDesc)) return { dynamic: true }
+    return null // no override
+  }
   const rows = decodeInstructions(m.code, parsed.cp)
+  if (vocab.era === 'mojmap') return namedStateDefinition(rows, parsed, vocab)
   const props = []
   let dynamic = false
   let callsSuper = false
@@ -318,6 +404,9 @@ function stateCountOf (cls, universe, vocab) {
       c = p.superName
       continue
     }
+    // The inherited SRG table describes a different game version. For named
+    // mappings only the plain vanilla block bases have a known empty body.
+    if (vocab.era === 'mojmap' && c !== vocab.cn.block && c !== 'net/minecraft/world/level/block/BaseEntityBlock') return null
     const v = vocab.ns.classContrib[c]
     if (v) {
       if (v.dynamic) return null
@@ -538,6 +627,80 @@ function forgeRegistrations (parsed, universe, vocab, out) {
       if (!modid) continue
       out.push({ name: `${modid}:${lastStr}`, cls, supplierRows, era: vocab.era, ctorDesc })
     }
+  }
+}
+
+// NeoForge's holder also registers items, entities and other values. Bind the
+// actual receiver to Registries.BLOCK, then read the adjacent name and supplier.
+// A previous string, lambda or register field is never a default operand.
+const NEO_DR = 'net/neoforged/neoforge/registries/DeferredRegister'
+const NEO_DR_TYPE = `L${NEO_DR};`
+const RESOURCE_KEY = 'Lnet/minecraft/resources/ResourceKey;'
+const NEO_CREATE = `(${RESOURCE_KEY}Ljava/lang/String;)${NEO_DR_TYPE}`
+const NEO_REGISTER = '(Ljava/lang/String;Ljava/util/function/Supplier;)Lnet/neoforged/neoforge/registries/DeferredHolder;'
+
+function neoBlockSupplier (parsed, indy, universe, vocab) {
+  if (indy?.op !== 0xba || indy.samName !== 'get' || indy.samDesc !== '()Ljava/util/function/Supplier;') return null
+  const bsm = parsed.bootstrapMethods?.[indy.bsmIndex]
+  const handle = bsm && parsed.cp[bsm.ref]
+  const bootstrap = handle?.tag === 15 && cpRef(parsed.cp, handle.refIndex)
+  if (bootstrap?.owner !== 'java/lang/invoke/LambdaMetafactory' || bootstrap.name !== 'metafactory') return null
+  const impl = resolveLambdaImpl(parsed, indy.bsmIndex)
+  if (!impl) return null
+  if (impl.refKind === 8 && impl.name === '<init>' && impl.desc === '()V') {
+    return chainReachesBlock(impl.owner, universe, vocab) ? impl.owner : null
+  }
+  if (impl.refKind !== 6 || !impl.desc.startsWith('()')) return null
+  const method = universeMethod(universe, impl.owner, impl.name, impl.desc)
+  if (!method) return null
+  const rows = method.rows
+  // Prove the returned value is the object constructed here. An allocation
+  // anywhere in a branching factory is insufficient evidence of its result.
+  const cls = rows[0]?.cls
+  const ctor = rows.at(-2)
+  if (rows[0]?.op !== 0xbb || rows[1]?.op !== 0x59 || rows.at(-1)?.op !== 0xb0 ||
+      ctor?.op !== 0xb7 || ctor.ref?.owner !== cls || ctor.ref.name !== '<init>') return null
+  const args = rows.slice(2, -2)
+  if (args.length === 0) {
+    if (ctor.ref.desc !== '()V') return null
+  } else {
+    const props = `L${vocab.cn.properties};`
+    if (ctor.ref.desc !== `(${props})V` || args.length !== 1 || args[0].op !== 0xb8 ||
+        args[0].ref?.desc !== `()${props}`) return null
+  }
+  return chainReachesBlock(cls, universe, vocab) ? cls : null
+}
+
+function neoForgeRegistrations (parsed, universe, out) {
+  const clinit = parsed.codes.find(m => m.method === '<clinit>')
+  if (!clinit) return
+  const rows = decodeInstructions(clinit.code, parsed.cp)
+  if (rows.some(r => r.target !== undefined || r.op === 0xaa || r.op === 0xab)) return
+  const registers = new Map()
+  for (let i = 0; i < rows.length; i++) {
+    const { op, ref } = rows[i]
+    if (op === 0xb3 && ref?.owner === parsed.className && ref.desc === NEO_DR_TYPE) {
+      registers.delete(ref.name)
+      const key = rows[i - 3]
+      const ns = rows[i - 2]?.str
+      const create = rows[i - 1]
+      if (key?.op === 0xb2 && key.ref?.owner === 'net/minecraft/core/registries/Registries' &&
+          key.ref.name === 'BLOCK' && key.ref.desc === RESOURCE_KEY && typeof ns === 'string' &&
+          create.op === 0xb8 && create.ref?.owner === NEO_DR && create.ref.name === 'create' && create.ref.desc === NEO_CREATE &&
+          parsed.fields.some(f => f.name === ref.name && f.desc === ref.desc && (f.flags & 0x18) === 0x18)) {
+        registers.set(ref.name, ns)
+      }
+    }
+    if (op !== 0xb6 || ref?.name !== 'register' || ref.owner !== NEO_DR || ref.desc !== NEO_REGISTER) continue
+    const receiver = rows[i - 3]
+    if (receiver?.op !== 0xb2 || receiver.ref?.owner !== parsed.className || receiver.ref.desc !== NEO_DR_TYPE) continue
+    const namespace = registers.get(receiver.ref.name)
+    const path = rows[i - 2]?.str
+    if (namespace === undefined || path === undefined) continue
+    const name = namespace + ':' + path
+    if (!REGISTRY_NAME_RE.test(name)) continue
+    const cls = neoBlockSupplier(parsed, rows[i - 1], universe, VOCABS.mojmap)
+    if (cls) out.push({ name, cls, era: 'mojmap' })
   }
 }
 
@@ -1094,6 +1257,10 @@ function consumerHelperCallSites (parsed, helper, universe, vocab, out) {
 function deriveBlockShapes (jarPaths) {
   const t0 = Date.now()
   const universe = buildUniverse(jarPaths)
+  const namedUniverse = {
+    has: universe.has,
+    get: cls => universe.hasUniqueDefinition(cls) ? universe.get(cls) : null
+  }
   const regs = []
   const stats = { jars: jarPaths.length, units: universe.units.length, regClasses: 0, registrations: 0, nonsolid: 0, solid: 0, abstain: 0, counted: 0 }
   const interRegistry = VOCABS.intermediary.cn.registry
@@ -1101,6 +1268,8 @@ function deriveBlockShapes (jarPaths) {
   const consumerHelpers = new Map() // 'owner#name#desc' -> {helper, vocab}
   const rgCtx = { fieldModids: new Map(), typeModids: new Map() }
   const rgClasses = [] // registrate registration candidates (second sweep so modid creation bindings exist first)
+  const neoBytes = Buffer.from(NEO_DR)
+  const blockKeyBytes = Buffer.from('net/minecraft/core/registries/Registries')
   const rgBytes = Buffer.from(RG_PKG)
   const rgBbBytes = Buffer.from(RG_BB)
   const funcBytes = Buffer.from('java/util/function/')
@@ -1111,17 +1280,19 @@ function deriveBlockShapes (jarPaths) {
       let raw
       try { raw = zipEntryData(unit.buf, entry) } catch { continue }
       const isForgeReg = raw.includes(DR_CLS)
+      const isNeoReg = raw.includes(neoBytes) && raw.includes(blockKeyBytes)
       const isFabricReg = interRegistry && raw.includes(interRegistry)
       const isRegistrate = raw.includes(rgBytes)
       const isConsumerCand = raw.includes(funcBytes) && rlBytes.some((b) => raw.includes(b))
-      if (!isForgeReg && !isFabricReg && !isRegistrate && !isConsumerCand) continue
+      if (!isNeoReg && !isForgeReg && !isFabricReg && !isRegistrate && !isConsumerCand) continue
       let parsed
       try { parsed = parseClassFile(raw) } catch { continue }
       if (!parsed) continue
       const era = eraOfClass(parsed) ?? (isFabricReg ? 'intermediary' : 'srg')
       const vocab = VOCABS[era]
-      if (isForgeReg || isFabricReg || isRegistrate) stats.regClasses++
+      if (isNeoReg || isForgeReg || isFabricReg || isRegistrate) stats.regClasses++
       try {
+        if (isNeoReg && universe.hasUniqueDefinition(cls)) neoForgeRegistrations(parsed, namedUniverse, regs)
         if (isForgeReg) forgeRegistrations(parsed, universe, vocab, regs)
         if (isFabricReg) {
           fabricDirectRegistrations(parsed, universe, vocab, regs)
@@ -1196,11 +1367,14 @@ function deriveBlockShapes (jarPaths) {
     const vocab = VOCABS[reg.era]
     let entry
     try {
-      const sol = reg.registrate
-        ? registrateSolidity(reg, universe, vocab)
-        : solidityOf(reg.cls, reg.supplierRows, universe, vocab, reg.ctorDesc)
-      const stateCount = stateCountOf(reg.cls, universe, vocab)
+      const sol = reg.era === 'mojmap'
+        ? { shape: 'abstain', why: 'no collision proof for named mappings' }
+        : reg.registrate
+          ? registrateSolidity(reg, universe, vocab)
+          : solidityOf(reg.cls, reg.supplierRows, universe, vocab, reg.ctorDesc)
+      const stateCount = stateCountOf(reg.cls, reg.era === 'mojmap' ? namedUniverse : universe, vocab)
       entry = { shape: sol.shape, stateCount, cls: reg.cls, why: sol.why }
+      if (reg.era === 'mojmap') entry.registration = 'neoforge'
     } catch (err) {
       entry = { shape: 'abstain', stateCount: null, cls: reg.cls, why: `derivation error: ${err.message}` }
     }

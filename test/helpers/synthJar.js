@@ -109,6 +109,11 @@ class ConstantPool {
     return this._add(`h:${refKind}:${owner}:${name}:${desc}`, out)
   }
 
+  methodType (desc) {
+    const idx = this.utf8(desc)
+    return this._add(`mt:${desc}`, Buffer.concat([Buffer.from([16]), u16(idx)]))
+  }
+
   invokeDynamic (bsmIndex, name, desc) {
     const nt = this.nat(name, desc)
     const out = Buffer.from([18, 0, 0, 0, 0])
@@ -178,6 +183,8 @@ class Asm {
   aaload () { this.bytes.push(0x32); return this }
   iaload () { this.bytes.push(0x2e); return this }
   iastore () { this.bytes.push(0x4f); return this }
+  anewarray (name) { this.bytes.push(0xbd); this._u16(this.cp.cls(name)); return this }
+  aastore () { this.bytes.push(0x53); return this }
   newarrayInt () { this.bytes.push(0xbc, 10); return this }
   arraylength () { this.bytes.push(0xbe); return this }
   checkcast (name) { this.bytes.push(0xc0); this._u16(this.cp.cls(name)); return this }
@@ -235,10 +242,15 @@ function buildClass (spec) {
   // resolveLambdaImpl (scans args for the implementation MethodHandle) AND
   // HF15's concatRecipeOf (scans args for the String recipe constant of a
   // makeConcatWithConstants call site — pass strArgs: ['s']).
-  const bsmHandles = (spec.bootstrapMethods || []).map((b) => ({
-    handle: cp.methodHandle(b.refKind != null ? b.refKind : 6, b.owner, b.name, b.desc),
-    strArgs: (b.strArgs || []).map((s) => cp.str(s))
-  }))
+  const bsmHandles = (spec.bootstrapMethods || []).map((b) => {
+    const impl = cp.methodHandle(b.refKind != null ? b.refKind : 6, b.owner, b.name, b.desc)
+    if (b.supplierType) {
+      const bootstrap = cp.methodHandle(6, 'java/lang/invoke/LambdaMetafactory', 'metafactory',
+        '(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;')
+      return { bootstrap, args: [cp.methodType('()Ljava/lang/Object;'), impl, cp.methodType(b.supplierType)] }
+    }
+    return { bootstrap: impl, args: [impl, ...(b.strArgs || []).map((s) => cp.str(s))] }
+  })
   const bsmAttrName = bsmHandles.length ? cp.utf8('BootstrapMethods') : null
   // class-level RuntimeVisibleAnnotations (JVMS 4.7.16): enum-array elements
   // only — exactly the shape the annotation-registry census reads.
@@ -335,10 +347,7 @@ function buildClass (spec) {
     const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16BE(v, 0); return b }
     chunks.push(u16(bsmHandles.length))
     for (const h of bsmHandles) {
-      chunks.push(u16(h.handle)) // bootstrap_method_ref
-      chunks.push(u16(1 + h.strArgs.length)) // num args
-      chunks.push(u16(h.handle)) // arg 0: the impl handle
-      for (const s of h.strArgs) chunks.push(u16(s)) // recipe/extra String constants
+      chunks.push(u16(h.bootstrap), u16(h.args.length), ...h.args.map(u16))
     }
     classAttrs.push({ nameIdx: bsmAttrName, body: Buffer.concat(chunks) })
   }
