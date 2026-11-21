@@ -74,8 +74,8 @@ const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
 const debug = require('../../debug')
-const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl } = require('./jarAnalysis')
-const { nestedJarEntriesOf } = require('./nestedJars') // HF53 rider: the one nested-jar rule
+const { zipCentralEntries, zipEntryData, parseClassFile, cpUtf8, cpClassName, cpRef, resolveLambdaImpl, JVM_OP_LEN } = require('./jarAnalysis')
+const { nestedJarEntriesOf, nestedRelPath, readNestedManifest } = require('./nestedJars') // HF53 rider: the one nested-jar rule
 const { deriveAnnotationRegistries } = require('./annotationRegistryDerivation')
 const { installClassFacts, unitViewOf, queryDepsHold } = require('./classFacts') // HF145: a class's facts once per read; a kept result records the facts it read
 const { deriveWrapperFactoryListenChannels, deriveFabricListenChannels, deriveContainerCarriedListenChannels, assembleListenOnly } = require('./listenOnlyDerivation')
@@ -88,7 +88,6 @@ const { derivePlatformHelperRegistrations } = require('./platformHelperDerivatio
 
 const EVENT_TYPE = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
 const REGISTRAR_TYPE = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
-const REGISTRAR_SIMPLE = REGISTRAR_TYPE.split('/').pop()
 // HF43: the id class is a SET, not one name — Minecraft 26.1 renamed
 // net.minecraft.resources.ResourceLocation to net.minecraft.resources.Identifier
 // (same static factories: fromNamespaceAndPath / parse / tryParse / tryBuild /
@@ -163,6 +162,7 @@ function noteUnresolvedSite (diagnostics, says, facts) {
     kind: facts.kind,
     jar: (reg && reg.jar && reg.jar.label) || facts.jar || null,
     site: facts.site || (reg && reg.site) || null,
+    ...(facts.kind === 'registration' && reg?.instruction ? { instruction: reg.instruction } : {}),
     method: spec ? reg.method : null,
     protocols: spec ? spec.protocols : (facts.protocols || null),
     flow: spec ? spec.flow : (facts.flow || null),
@@ -170,6 +170,7 @@ function noteUnresolvedSite (diagnostics, says, facts) {
     optional: registrar ? !!registrar.optional : null,
     id: facts.id || null,
     says,
+    ...(facts.reason && { reason: facts.reason }),
     ...(facts.wordOnly === true ? { wordOnly: true } : {})
   })
 }
@@ -202,7 +203,12 @@ function giveUp (diagnostics, says, facts) {
 // optional() proven: then the reading before handed over no row there. Returns
 // the row.
 function noteUnprovenRegistration (diagnostics, says, reg, jar = null) {
-  noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg, jar, wordOnly: provenNarrowly(reg) })
+  // Direct-entry sites are also keys on existing dial receipts. Keep that key
+  // and carry the instruction separately. A forwarded registrar needs the
+  // callee's site: the listener named in the entry receipt did not register it.
+  const ctx = reg.methodCtx
+  const inOrigin = ctx && reg.registrar?.origin?.startsWith(`${ctx.cls}.${ctx.name}${ctx.desc}@`)
+  noteUnresolvedSite(diagnostics, says, { kind: 'registration', reg, jar, site: inOrigin ? reg.site : reg.instruction, wordOnly: provenNarrowly(reg) })
   return diagnostics.unresolvedSites[diagnostics.unresolvedSites.length - 1]
 }
 
@@ -236,23 +242,141 @@ function entryMayRegister (info, method) {
   return may
 }
 
-// HF175: the first class of a unit (by name) whose constant pool holds a call of
-// the event's registrar() (a method reference whose owner is the event); null
-// when no class of the unit asks the event for a registrar
-function eventAskerOf (index, unit) {
-  for (const name of [...(unit.classNames || [])].sort()) {
-    const bytes = index.rawBytes(name)
-    if (!bytes || !bytes.includes(EVENT_TYPE)) continue
-    const info = index.get(name)
-    if (!info || !info.cp) continue
-    for (let i = 1; i < info.cp.length; i++) {
-      const c = info.cp[i]
-      if (!c || !c.classIndex || !c.natIndex) continue
-      const ref = cpRef(info.cp, i)
-      if (ref && ref.owner === EVENT_TYPE && ref.name === 'registrar') return name
+// Membership in the constant pool says nothing about which instruction used a
+// reference. Two asks can share the same pool entry, even in the same method.
+function registrarCallsOf (info) {
+  const refs = new Set()
+  for (let i = 1; i < info.cp.length; i++) {
+    const c = info.cp[i]
+    if (!c || !c.classIndex || !c.natIndex) continue
+    const ref = cpRef(info.cp, i)
+    if (ref && ref.owner === EVENT_TYPE && ref.name === 'registrar') refs.add(i)
+  }
+  const calls = []
+  if (refs.size) {
+    for (const m of info.codes) {
+      const start = calls.length
+      walkLinear(m.code, info.cp, (op, pc) => {
+        if (op >= 0xb6 && op <= 0xb9 && refs.has(m.code.readUInt16BE(pc + 1))) {
+          const entry = `${info.className}.${m.method}`
+          calls.push({ method: entry + m.desc, site: `${entry}${m.desc}@${pc}`, jar: info.jar.label })
+        }
+      })
+      // Structural readers identify their registration method. That singles
+      // out an instruction only when that method actually has just one ask.
+      if (calls.length === start + 1) calls[start].unique = true
     }
   }
-  return null
+  return calls
+}
+
+// The linear walk and the whole-pack evaluator can see the same hand-off.
+// A stronger walk may follow the exact edge the other could not dispatch.
+function registrarOrigins (values) {
+  const origins = new Set()
+  const seen = new Set()
+  function visit (v) {
+    if (!v || seen.has(v)) return
+    if (v.k === 'registrar' && v.origin) origins.add(v.origin)
+    else if (v.k === 'varr' || v.k === 'lambda' || v.k === 'obj') {
+      seen.add(v)
+      if (v.items) v.items.forEach(visit)
+      if (v.captured) v.captured.forEach(visit)
+      if (v.ctorArgs) v.ctorArgs.forEach(visit)
+      if (v.fields) Object.values(v.fields).forEach(visit)
+    }
+  }
+  values.forEach(visit)
+  return origins
+}
+
+function noteRegistrarHandoff (state, opts, pc, values, followed, evaluated = false) {
+  if (!state.hasRegistrar || !opts.onRegistration || !opts.methodCtx || pc < 0) return false
+  const { cls, name, desc } = opts.methodCtx
+  const origins = registrarOrigins(values)
+  for (const origin of origins) {
+    const edge = `${origin} -> ${cls}.${name}${desc}@${pc}`
+    if (followed) state.followedHandoffs.add(edge)
+    else {
+      if (evaluated && state.modRootPass) state.unreadRegistrarCalls.add(origin)
+      if (!state.missedHandoffs.has(origin)) state.missedHandoffs.set(origin, new Set())
+      state.missedHandoffs.get(origin).add(edge)
+    }
+  }
+  return origins.size > 0
+}
+
+// A helper can offer an unused, entirely optional registration method. Read
+// its receiver chain even in the absence of any callers. Restrict the proof
+// to straight-line wrappers without stores, captures or a returned registrar.
+function recordOptionalWrapper (index, read, info, method, output) {
+  let simple = true
+  walkLinear(method.code, info.cp, (op, pc) => {
+    if (op === 0xba) {
+      const indy = info.cp[method.code.readUInt16BE(pc + 1)]
+      const nat = indy && info.cp[indy.natIndex]
+      if (!nat || !cpUtf8(info.cp, nat.descIndex)?.startsWith('()')) simple = false
+    }
+    if (op === 0xb1 && pc !== method.code.length - 1) simple = false
+    if ((op >= 0x36 && op <= 0x56) || (op >= 0x99 && op <= 0xab) ||
+        [0xb0, 0xb3, 0xb5, 0xbf, 0xc4, 0xc6, 0xc7, 0xc8, 0xc9].includes(op)) simple = false
+  })
+  if (!simple) return
+  const regs = []
+  const state = freshDerivationState(read, { abstains: [], errors: [], jars: read.diagnostics.jars })
+  simulate(index, info, method, state, {
+    onInvoke: ({ recv, ref, argVals }) => {
+      if (argVals.some(v => v?.k === 'registrar') ||
+          (recv?.k === 'registrar' && !(REGISTRATION_METHODS[ref.name] || ['optional', 'versioned', 'executesOn'].includes(ref.name)))) simple = false
+    },
+    onRegistration: r => regs.push(r)
+  })
+  if (simple && regs.length && regs.every(provenOptional)) {
+    for (const r of regs) if (r.registrar.origin) output.add(r.registrar.origin)
+  }
+}
+
+// Save evidence, rather than a pack-dependent absence, in each jar's slot.
+function registrarCoverageOf (state, registrations) {
+  const recorded = new Set(state.accountedRegistrarCalls)
+  for (const reg of registrations) {
+    if (reg.registrar?.origin && (reg.id || provenOptional(reg))) recorded.add(reg.registrar.origin)
+  }
+  return {
+    recorded: [...recorded],
+    unread: [...state.unreadRegistrarCalls],
+    branchSigns: [...(state.branchSigns || [])],
+    signs: [...(state.registrationSigns || [])],
+    methods: [...state.registrarMethods],
+    followed: [...state.followedHandoffs],
+    missed: [...state.missedHandoffs].map(([origin, edges]) => [origin, [...edges]])
+  }
+}
+
+function reportUnreadRegistrars (diagnostics, read, units) {
+  const proofs = [read.rootRegistrarCoverage, ...units.map(u => u.registrarCoverage)].filter(Boolean)
+  const recorded = new Set(proofs.flatMap(p => p.recorded))
+  const methods = new Set(proofs.flatMap(p => p.methods))
+  const followed = new Set(proofs.flatMap(p => p.followed))
+  const lost = new Set(proofs.flatMap(p => p.unread))
+  const branches = new Map(proofs.flatMap(p => p.branchSigns || []))
+  const signs = new Map(proofs.flatMap(p => p.signs || []))
+  for (const sign of signs.values()) {
+    noteUnresolvedSite(diagnostics, `${sign.site}: ${sign.reason}`, { kind: 'unseen', ...sign, wordOnly: true })
+  }
+  for (const proof of proofs) {
+    for (const [origin, edges] of proof.missed) {
+      if (edges.some(edge => !followed.has(edge))) lost.add(origin)
+    }
+  }
+  for (const proof of proofs) {
+    for (const { site, jar, method, unique } of proof.calls || []) {
+      if (!lost.has(site) && (recorded.has(site) || (unique && methods.has(method)))) continue
+      const branch = branches.get(site)
+      const reason = branch ? `${branch.reason} at ${branch.site}` : lost.has(site) ? 'a registrar hand-off could not be followed' : 'no registration was read for this registrar call'
+      giveUp(diagnostics, `${site}: ${reason}`, { kind: 'unseen', jar, site, ...(branch && { reason }), wordOnly: true })
+    }
+  }
 }
 
 // ---------- jar walking ----------
@@ -263,21 +387,33 @@ function eventAskerOf (index, unit) {
 // the names of the classes it holds (nested jar-in-jar classes included).
 // The per-jar derivation (deriveNeoForgeJarUnit) walks one unit's classes
 // and records which OTHER units its resolution consulted (the trail).
+function unreadArchive (diagnostics, jar, reason, error, site = null) {
+  const says = `${jar}: ${reason}${site ? ` (${site})` : ''}`
+  if (error) diagnostics.errors.push(`${says} (${error.message})`)
+  noteUnresolvedSite(diagnostics, says, { kind: 'unseen', jar, site, reason, wordOnly: true })
+  return false
+}
+
 function collectJarClasses (jarPath, out, diagnostics, jarLabel) {
   let buf
   try {
     buf = fs.readFileSync(jarPath)
   } catch (err) {
-    diagnostics.errors.push(`${jarLabel}: unreadable (${err.message})`)
-    noteUnresolvedSite(diagnostics, `${jarLabel}: unreadable`, { kind: 'unseen', jar: jarLabel, wordOnly: true }) // HF175: nothing of this jar was read
+    unreadArchive(diagnostics, jarLabel, 'unreadable', err)
     if (out.noteUnit) out.noteUnit({ path: jarPath, label: jarLabel, sha1: null, unreadable: err.message })
     return
   }
   const unit = out.noteUnit ? out.noteUnit({ path: jarPath, label: jarLabel, sha1: crypto.createHash('sha1').update(buf).digest('hex') }) : null
-  collectBufferClasses(buf, out, diagnostics, jarLabel, 0, unit)
+  let read = collectBufferClasses(buf, out, diagnostics, jarLabel, 0, unit)
   // HF145: the read keeps ONE inflated copy of each class this jar provides and lets the jar's own buffer go here
   // (it kept every jar whole for the whole read); a class is still inflated once
-  if (unit && out.bytesOf) for (const name of unit.classNames) out.bytesOf(out.raw.get(name))
+  if (unit && out.bytesOf) {
+    for (const name of unit.classNames) {
+      const entry = out.raw.get(name)
+      if (out.bytesOf(entry) === null) read = unreadArchive(diagnostics, entry.jar.label, 'unreadable class entry', null, name + '.class')
+    }
+  }
+  return read
 }
 
 // HF53 rider: nested jars through the one shared rule; the nesting bound
@@ -290,13 +426,16 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = nu
   try {
     entries = zipCentralEntries(buf)
   } catch (err) {
-    diagnostics.errors.push(`${jarLabel}: bad zip (${err.message})`)
-    noteUnresolvedSite(diagnostics, `${jarLabel}: bad zip`, { kind: 'unseen', jar: jarLabel, wordOnly: true }) // HF175: nothing of this jar was read
-    return
+    return unreadArchive(diagnostics, jarLabel, 'bad zip', err)
   }
+  let read = true
   let modVersion = null
   const modIds = [] // HF37: the jar's declared mod ids (a version lookup key — ModList.getModContainerById("id") / event.registrar("id"))
-  const nested = new Map(nestedJarEntriesOf(buf, entries).map((n) => [n.entry.name, n]))
+  const manifest = readNestedManifest(buf, entries)
+  const nested = new Map(nestedJarEntriesOf(buf, entries, manifest).map(n => [n.entry.name, n]))
+  for (const name of manifest.keys()) {
+    if (/\.jar$/i.test(name) && !nested.has(name)) read = unreadArchive(diagnostics, `${jarLabel}!${nestedRelPath(name)}`, 'declared nested jar missing')
+  }
   for (const e of entries) {
     if (e.name === 'META-INF/neoforge.mods.toml' || e.name === 'META-INF/mods.toml') {
       try {
@@ -337,8 +476,8 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = nu
       // HF11: ServiceLoader ground truth — veil's platform Factory (and the
       // wider @ExpectPlatform service idiom) binds its implementation here,
       // not in bytecode. Names are dotted; store internal-form.
+      const iface = e.name.slice('META-INF/services/'.length).replace(/\./g, '/')
       try {
-        const iface = e.name.slice('META-INF/services/'.length).replace(/\./g, '/')
         const impls = zipEntryData(buf, e).toString('utf8')
           .split('\n').map((l) => l.replace(/#.*$/, '').trim()).filter(Boolean)
           .map((l) => l.replace(/\./g, '/'))
@@ -346,20 +485,27 @@ function collectBufferClasses (buf, out, diagnostics, jarLabel, depth, unit = nu
           const list = out.services.get(iface) || []
           out.services.set(iface, list.concat(impls))
         }
-      } catch { /* tolerated: services are an optional resolution aid */ }
+      } catch {
+        // A readable descriptor for the same service cannot vouch for this one.
+        out.services.set(iface, [...(out.services.get(iface) || []), null])
+      }
     } else if (nested.has(e.name)) {
-      if (depth >= NESTED_JAR_DEPTH_BOUND) continue
+      const label = `${jarLabel}!${nested.get(e.name).relPath}`
+      if (depth >= NESTED_JAR_DEPTH_BOUND) {
+        read = unreadArchive(diagnostics, label, 'nested jar below depth limit')
+        continue
+      }
       try {
-        collectBufferClasses(zipEntryData(buf, e), out, diagnostics, `${jarLabel}!${nested.get(e.name).relPath}`, depth + 1, unit)
+        if (!collectBufferClasses(zipEntryData(buf, e), out, diagnostics, label, depth + 1, unit)) read = false
       } catch (err) {
-        diagnostics.errors.push(`${jarLabel}!${e.name}: nested jar unreadable (${err.message})`)
-        noteUnresolvedSite(diagnostics, `${jarLabel}!${e.name}: nested jar unreadable`, { kind: 'unseen', jar: `${jarLabel}!${nested.get(e.name).relPath}`, wordOnly: true }) // HF175
+        read = unreadArchive(diagnostics, label, 'nested jar unreadable', err)
       }
     }
   }
+  return read
 }
 
-function makeClassIndex () {
+function makeClassIndex (diagnostics) {
   const raw = new Map() // internalName -> {buf, entry, jar}
   const services = new Map() // interface internalName -> [impl internalName]
   const parsed = new Map()
@@ -400,18 +546,27 @@ function makeClassIndex () {
     jarOf (name) { const r = raw.get(name); index.consult(r, name); return r ? r.jar : null },
     seedNames () { return index.focus ? index.focus.classNames : [...raw.keys()] },
     allNames () { if (index.focus) index.packScanned = true; return [...raw.keys()] },
+    parseEntry (name, entry) {
+      try {
+        return parseClassFile(index.bytesOf(entry))
+      } catch (error) {
+        if (error.code === 'INVALID_CLASS_UTF8' && !entry.badText) {
+          entry.badText = true
+          const site = `${name}@${error.offset}`
+          noteUnresolvedSite(diagnostics, `${site}: ${error.message}`, {
+            kind: 'unseen', jar: entry.jar.label, site, reason: 'invalid modified UTF-8', wordOnly: true
+          })
+        }
+        return null
+      }
+    },
     get (name) {
       if (!name) return null
       index.consult(raw.get(name), name)
       if (parsed.has(name)) return parsed.get(name)
       const r = raw.get(name)
-      let info = null
-      if (r) {
-        try {
-          info = parseClassFile(index.bytesOf(r)) // HF145: the one inflated copy of this class, shared with rawBytes
-          if (info) info.jar = r.jar
-        } catch { info = null }
-      }
+      const info = r ? index.parseEntry(name, r) : null
+      if (info) info.jar = r.jar
       parsed.set(name, info)
       return info
     },
@@ -473,6 +628,16 @@ function asStr (val) { return val && val.k === 'str' ? val.v : null }
 
 // ---------- helper resolution: (String)->ResourceLocation namespace helpers ----------
 
+function hasValueBranch (method) {
+  if (method.hasValueBranch === undefined) {
+    method.hasValueBranch = false
+    walkLinear(method.code, null, op => {
+      if ((op >= 0x99 && op <= 0xa6) || op === 0xaa || op === 0xab || op === 0xc6 || op === 0xc7) method.hasValueBranch = true
+    })
+  }
+  return method.hasValueBranch
+}
+
 function resolveNamespaceHelper (index, owner, name, desc, cache) {
   const key = `${owner}.${name}${desc}`
   if (cache.has(key)) return cache.get(key)
@@ -480,7 +645,7 @@ function resolveNamespaceHelper (index, owner, name, desc, cache) {
   const info = index.get(owner)
   if (info) {
     const m = info.codes.find((c) => c.method === name && c.desc === desc)
-    if (m) {
+    if (m && !m.handlers?.length && !hasValueBranch(m)) {
       // linear scan: a single LDC string + fromNamespaceAndPath/parse-with-prefix
       const strings = []
       let sawFrom = false
@@ -511,13 +676,12 @@ function resolveNamespaceHelper (index, owner, name, desc, cache) {
 
 function walkLinear (code, cp, visit) {
   // linear opcode walk sharing jarAnalysis length rules
-  const { JVM_OP_LEN } = require('./jarAnalysis')
   let pc = 0
   while (pc < code.length) {
     const op = code[pc]
     let len = JVM_OP_LEN[op]
     if (op === 0xaa) { const p = (pc + 4) & ~3; len = (p - pc) + 12 + (code.readInt32BE(p + 8) - code.readInt32BE(p + 4) + 1) * 4 } else if (op === 0xab) { const p = (pc + 4) & ~3; len = (p - pc) + 8 + code.readInt32BE(p + 4) * 8 } else if (op === 0xc4) { len = code[pc + 1] === 0x84 ? 6 : 4 }
-    visit(op, pc, cp, code)
+    visit(op, pc, cp, code, len)
     pc += len
   }
 }
@@ -619,7 +783,277 @@ function resolveReslocValue (index, val, state) {
   return null
 }
 
+function returnsOptionalRegistrar (index, ref, op) {
+  if (!ref) return false
+  if (op === 0xb6) return ref.owner === REGISTRAR_TYPE && ref.name === 'optional' && ref.desc === `()L${REGISTRAR_TYPE};`
+  if (op !== 0xb8 || ref.desc !== `(L${REGISTRAR_TYPE};)L${REGISTRAR_TYPE};`) return false
+  const target = staticBody(index, ref)
+  const b = target?.m.code
+  return b?.length === 5 && b[0] === 0x2a && b[1] === 0xb6 && b[4] === 0xb0 &&
+    returnsOptionalRegistrar(index, cpRef(target.info.cp, b.readUInt16BE(2)), 0xb6)
+}
+
+// Find the common continuation of straight-line arms. A null plan means
+// the existing walker can proceed. An empty plan means the join is unknown.
+function forwardFork (code, pc) {
+  const op = code[pc]
+  const table = op === 0xaa
+  const targets = []
+  if (table || op === 0xab) {
+    const a = (pc + 4) & ~3
+    targets.push(pc + code.readInt32BE(a))
+    const count = table ? code.readInt32BE(a + 8) - code.readInt32BE(a + 4) + 1 : code.readInt32BE(a + 4)
+    if (count > AGG_MAX_ITEMS) return {}
+    for (let i = 0; i < count; i++) targets.push(pc + code.readInt32BE(a + 12 + i * (table ? 4 : 8)))
+  } else targets.push(pc + 3, pc + code.readInt16BE(pc + 1))
+  const starts = [...new Set(targets)].sort((a, b) => a - b)
+  if (starts.length < 2) return null
+  if (starts[0] <= pc) return null // loop backedge: the iterator walk controls repetition
+  if (starts[starts.length - 1] > code.length) return {}
+
+  // Fixed-length straight-line arms have a single lexical join. An arm
+  // ending in a forward goto can extend it past the last switch target.
+  let join = starts[starts.length - 1]
+  for (let at = starts[0]; at < join;) {
+    const ins = code[at]
+    if (ins === 0xa7 || ins === 0xc8) {
+      const to = at + (ins === 0xa7 ? code.readInt16BE(at + 1) : code.readInt32BE(at + 1))
+      if (to <= at) return null // loop header and body are handled by the iteration readers
+      if (to > code.length) return {}
+      join = Math.max(join, to)
+    }
+    if (!JVM_OP_LEN[ins] || [0xaa, 0xab, 0xc4].includes(ins)) return {}
+    at += JVM_OP_LEN[ins]
+  }
+  if (starts.length * (join - starts[0]) > AGG_MAX_STEPS_PER_EVAL) return {}
+  return { starts, join }
+}
+
+// Run only stack and local transfers. Calls do not execute in an undecided
+// arm. Remember the values they would consume and discard their results.
+function summarizeArm (index, info, code, start, join, stack, locals, valueSign, asks) {
+  const touched = []
+  let adjustedOptional = false
+  let otherCalls = false
+  for (let at = start; at < join;) {
+    const ins = code[at]
+    if (ins === 0xa7 || ins === 0xc8) {
+      const next = at + (ins === 0xa7 ? code.readInt16BE(at + 1) : code.readInt32BE(at + 1))
+      if (next <= at || next > join) return null
+      at = next
+      continue
+    }
+    if (ins >= 0x2a && ins <= 0x2d) stack.push(locals[ins - 0x2a])
+    else if (ins === 0x19) stack.push(locals[code[at + 1]])
+    else if (ins >= 0x4b && ins <= 0x4e) locals[ins - 0x4b] = stack.pop()
+    else if (ins === 0x3a) locals[code[at + 1]] = stack.pop()
+    else if (ins === 0x59) stack.push(stack[stack.length - 1])
+    else if (ins === 0x57) stack.pop()
+    else if (ins === 0xc0 || ins === 0x00) { /* same stack */ }
+    else if (ins === 0xb2 || ins === 0xbb || (ins >= 0x01 && ins <= 0x14)) stack.push(valueSign ? { k: 'unread', sign: valueSign } : UNKNOWN)
+    else if (ins === 0xb4) { stack.pop(); stack.push(UNKNOWN) }
+    else if (ins >= 0xb6 && ins <= 0xba) {
+      const n = code.readUInt16BE(at + 1)
+      const indy = ins === 0xba
+      const ref = indy ? null : cpRef(info.cp, n)
+      if (ref?.owner === EVENT_TYPE && ref.name === 'registrar') asks.add(at)
+      const nat = indy && info.cp[info.cp[n]?.natIndex]
+      const desc = indy ? (nat && cpUtf8(info.cp, nat.descIndex)) : ref?.desc
+      if (!desc) return null
+      const args = stack.splice(Math.max(0, stack.length - argSlots(desc).length))
+      const recv = ins !== 0xb8 && !indy ? stack.pop() : null
+      const option = returnsOptionalRegistrar(index, ref, ins)
+      if (option) adjustedOptional = true
+      else { otherCalls = true; touched.push(recv, ...args) }
+      if (!returnsVoid(desc)) stack.push(option ? (recv || args[0]) : UNKNOWN)
+    } else return null
+    at += JVM_OP_LEN[ins]
+  }
+  return { stack, locals, touched, optionalOnly: adjustedOptional && !otherCalls }
+}
+
+function registrarFork (index, info, method, pc, stack, locals, state, opts, known, evaluated) {
+  if (!opts.readingValue && (!opts.onRegistration || (!state.hasRegistrar && !method.desc.includes(EVENT_TYPE)))) return null
+  if (known) {
+    noteRegistrarHandoff(state, opts, pc, [...locals, ...stack], true)
+    return null
+  }
+  const plan = forwardFork(method.code, pc)
+  if (!plan) return null
+  const sign = { site: `${info.className}.${method.method}${method.desc}@${pc}`, jar: info.jar?.label,
+    reason: method.code[pc] === 0xaa || method.code[pc] === 0xab ? 'undecided switch' : 'undecided branch' }
+  const valueSign = opts.readingValue && sign
+  const asks = new Set()
+  const arms = []
+  for (const start of plan.starts || []) {
+    const arm = summarizeArm(index, info, method.code, start, plan.join, stack.slice(), locals.slice(), valueSign, asks)
+    if (!arm || (arms.length && arm.stack.length !== arms[0].stack.length)) { arms.length = 0; break }
+    arms.push(arm)
+  }
+  if (asks.size) {
+    if (!state.branchSigns) state.branchSigns = new Map()
+    for (const at of asks) state.branchSigns.set(`${info.className}.${method.method}${method.desc}@${at}`, sign)
+    if (!evaluated) state.deferredBranches++
+  }
+  // Keep the optionality walk's evidence when the only operation is an
+  // in-place optional() transform. Empty arms have the original state.
+  if (arms.some(arm => arm.optionalOnly) && arms.every(arm => !arm.touched.length &&
+      arm.stack.length === stack.length && arm.stack.every((v, i) => v === stack[i]) &&
+      arm.locals.length === locals.length && arm.locals.every((v, i) => v === locals[i]))) return null
+
+  const touched = arms.length ? arms.flatMap(arm => arm.touched) : [...locals, ...stack]
+  if (noteRegistrarHandoff(state, opts, pc, touched, false, evaluated)) {
+    if (!state.branchSigns) state.branchSigns = new Map()
+    for (const origin of registrarOrigins(touched)) state.branchSigns.set(origin, sign)
+    state.branchMethods.set(`${info.className}.${method.method}${method.desc}`, opts.methodCtx)
+    if (!evaluated) state.deferredBranches++
+  }
+  if (!arms.length) {
+    if (valueSign) opts.onReturn?.({ k: 'unread', sign })
+    return method.code.length
+  }
+  // Only values identical on every path survive. An unresolved receiver
+  // stays unresolved when execution resumes at the join.
+  function merge (key, values) {
+    values.length = Math.max(...arms.map(arm => arm[key].length))
+    for (let i = 0; i < values.length; i++) {
+      const first = arms[0][key][i]
+      values[i] = arms.every(arm => arm[key][i] === first) ? first : (valueSign ? { k: 'unread', sign } : UNKNOWN)
+    }
+  }
+  merge('stack', stack)
+  merge('locals', locals)
+  return plan.join
+}
+
 // ---------- the linear abstract interpreter ----------
+
+// The normal successors and the handler target describe the two ways out of a
+// protected range. After they rejoin, ordinary code is unconditional again.
+// Values produced on either arm still carry the start of the protected range.
+const exceptionRegions = new WeakMap()
+function exceptionRegionOf (info, method) {
+  if (!method.handlers?.length) return null
+  if (exceptionRegions.has(method)) return exceptionRegions.get(method)
+  const code = method.code
+  const edges = new Map()
+  let registers = false
+  walkLinear(code, info.cp, (op, pc, cp, code, len) => {
+    if (op >= 0xb6 && op <= 0xb9 && registrationEffect(cpRef(cp, code.readUInt16BE(pc + 1)))) registers = true
+    let next = [pc + len]
+    if (op === 0xaa || op === 0xab) {
+      const a = (pc + 4) & ~3
+      next = [pc + code.readInt32BE(a)]
+      const table = op === 0xaa
+      for (let i = a + 12; i < pc + len; i += table ? 4 : 8) next.push(pc + code.readInt32BE(i))
+    } else if (op === 0xa7 || op === 0xc8) next = [pc + (op === 0xa7 ? code.readInt16BE(pc + 1) : code.readInt32BE(pc + 1))]
+    else if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) next.push(pc + code.readInt16BE(pc + 1))
+    else if ((op >= 0xac && op <= 0xb1) || op === 0xbf) next = []
+    edges.set(pc, next)
+  })
+  function reachable (start) {
+    const found = new Set()
+    const pending = [start]
+    while (pending.length) {
+      const pc = pending.pop()
+      if (found.has(pc) || !edges.has(pc)) continue
+      found.add(pc)
+      for (const next of edges.get(pc)) pending.push(next)
+    }
+    return found
+  }
+  const offsets = new Map()
+  const guardedCalls = new Set()
+  const joinedLocals = new Map()
+  for (const h of method.handlers) {
+    const ordinary = reachable(h.start)
+    const caught = reachable(h.target)
+    const sign = { site: `${info.className}.${method.method}${method.desc}@${h.start}`, jar: info.jar?.label, reason: 'exception handler' }
+    // A straight-line catch which only wraps and throws cannot install an
+    // alternative registration on a server that finishes loading the mod.
+    const rethrows = [...caught].every(pc => {
+      const op = code[pc]
+      if (method.handlers.some(other => other.start <= pc && pc < other.end)) return false
+      if (op === 0xb7) {
+        const ctor = cpRef(info.cp, code.readUInt16BE(pc + 1))
+        return ctor?.name === '<init>' && ctor.desc === '(Ljava/lang/Throwable;)V' &&
+          /^java\/lang\/(?:\w*Exception|\w*Error)$/.test(ctor.owner)
+      }
+      return op === 0xbb || op === 0x59 || op === 0xbf || op === 0x19 || op === 0x3a ||
+        (op >= 0x2a && op <= 0x2d) || (op >= 0x4b && op <= 0x4e)
+    }) && [...caught].some(pc => code[pc] === 0xbf)
+    const affected = []
+    for (const pc of edges.keys()) {
+      if (!(h.start <= pc && pc < h.end) && (rethrows || ordinary.has(pc) === caught.has(pc))) continue
+      affected.push(pc)
+      if (code[pc] < 0xb6 || code[pc] > 0xb9) continue
+      const ref = cpRef(info.cp, code.readUInt16BE(pc + 1))
+      if (registrationEffect(ref)) guardedCalls.add(sign)
+    }
+    if (!rethrows || !guardedCalls.has(sign)) {
+      const stores = new Set()
+      const joins = new Set()
+      for (const pc of affected) {
+        if (!offsets.has(pc)) offsets.set(pc, sign)
+        const op = code[pc]
+        if (op >= 0x36 && op <= 0x3a) stores.add(code[pc + 1])
+        if (op >= 0x3b && op <= 0x4e) stores.add((op - 0x3b) % 4)
+        for (const next of edges.get(pc)) {
+          if (ordinary.has(next) && caught.has(next)) joins.add(next)
+        }
+      }
+      for (const join of joins) {
+        if (!joinedLocals.has(join)) joinedLocals.set(join, new Map())
+        for (const slot of stores) joinedLocals.get(join).set(slot, sign)
+      }
+    }
+  }
+  const result = { offsets, guardedCalls, joinedLocals, registers }
+  exceptionRegions.set(method, result)
+  return result
+}
+
+function registrationEffect (ref) {
+  if (!ref) return false
+  if (ref.owner === REGISTRAR_TYPE) return !!REGISTRATION_METHODS[ref.name]
+  return argSlots(ref.desc).some(t => t === `L${REGISTRAR_TYPE};` || t === `L${EVENT_TYPE};`)
+}
+
+function enterExceptionOffset (region, pc, locals) {
+  if (!region) return null
+  const joined = region.joinedLocals.get(pc)
+  if (joined) {
+    for (const [slot, sign] of joined) locals[slot] = { k: 'unread', sign }
+  }
+  return region.offsets.get(pc)
+}
+
+// Optional payloads and metadata-version fallbacks keep their existing wire
+// receipts. The read can still carry an unresolved input for its outcome.
+function recordInputSign (diagnostics, sign) {
+  if (!sign) return
+  const signs = diagnostics.inputSigns || (diagnostics.inputSigns = [])
+  if (!signs.some(existing => existing.site === sign.site && existing.jar === sign.jar)) signs.push(sign)
+}
+
+function reportRegistrationSign (state, sign) {
+  const signs = state.registrationSigns || (state.registrationSigns = new Map())
+  signs.set(JSON.stringify([sign.jar, sign.site, sign.reason]), sign)
+}
+
+function beginExceptionFrame (info, method, state, opts) {
+  if (!method.handlers?.length) return null
+  // Startup, config and the handler callback itself are not registrations.
+  // An input-producing helper can contribute uncertainty only via its return.
+  const readsInput = opts.onReturn && (method.desc.endsWith(')Ljava/lang/String;') ||
+    returnsResloc(method.desc) || method.desc.endsWith(`)L${REGISTRAR_TYPE};`) || method.desc.endsWith(`)L${PAYLOAD_TYPE_CLASS};`))
+  const region = exceptionRegionOf(info, method)
+  if (!readsInput && (!opts.onRegistration || (!region.registers && !method.desc.includes(REGISTRAR_TYPE) && !method.desc.includes(EVENT_TYPE)))) return null
+  if (region && opts.onRegistration) {
+    for (const sign of region.guardedCalls) reportRegistrationSign(state, sign)
+  }
+  return region
+}
 
 function simulate (index, classInfo, method, state, opts = {}) {
   // HF11: every registration carries its true site-method identity so the
@@ -630,7 +1064,9 @@ function simulate (index, classInfo, method, state, opts = {}) {
   const stack = []
   const locals = opts.locals ? opts.locals.slice() : []
   const pop = (n = 1) => { for (let i = 0; i < n; i++) stack.pop() }
-  const push = (v) => stack.push(v)
+  const region = beginExceptionFrame(classInfo, method, state, opts)
+  let protectedValue
+  const push = (v) => stack.push(protectedValue || v)
 
   // HF51-rider: the undecided flag is PER METHOD — a callee inherits its
   // caller's (a helper reached past a conditional is under it) but its own
@@ -654,8 +1090,13 @@ function simulate (index, classInfo, method, state, opts = {}) {
   // under the HF51 undecided flag); only the operand stack is reconciled. The
   // arm paired with a goto is the NEAREST open conditional target the goto
   // jumps over (nested value-selects pair inner with inner).
-  const arms = [] // { target, depth }: forward conditional targets not yet passed, the stack depth at the branch
+  let skipUntil = 0
+  const arms = [] // forward conditional targets and stack depths
   walkLinear(code, cp, (op, pc) => {
+    if (pc < skipUntil) return
+    const protectedSign = enterExceptionOffset(region, pc, locals)
+    protectedValue = protectedSign ? { k: 'unread', sign: protectedSign } : null
+    opts.protectedSign = protectedSign
     for (let i = arms.length - 1; i >= 0; i--) if (arms[i].target <= pc) arms.splice(i, 1)
     // HF51: the linear walk decides no branch — an `.optional()` met past a
     // conditional is not a proven optional (see the registrar model)
@@ -663,10 +1104,17 @@ function simulate (index, classInfo, method, state, opts = {}) {
     // `.optional()` met past one is not proven. The second flag, so that the
     // first stays what it was before this lane; nothing else of the walk changes
     // at a switch (no pop, no arm)
-    if (op === 0xaa || op === 0xab) opts.walk.undecidedWider = true
+    if (op === 0xaa || op === 0xab) {
+      opts.walk.undecidedWider = true
+      const rest = stack.slice(0, -1)
+      const join = registrarFork(index, classInfo, method, pc, rest, locals, state, opts, false, false)
+      if (join !== null) { stack.splice(0, stack.length, ...rest); skipUntil = join; return }
+    }
     if ((op >= 0x99 && op <= 0xa6) || op === 0xc6 || op === 0xc7) {
       opts.walk.undecided = true
       pop(op >= 0x9f && op <= 0xa6 ? 2 : 1)
+      const join = registrarFork(index, classInfo, method, pc, stack, locals, state, opts, false, false)
+      if (join !== null) { skipUntil = join; return }
       const target = pc + code.readInt16BE(pc + 1)
       if (target > pc) arms.push({ target, depth: stack.length })
     }
@@ -773,7 +1221,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
         const argVals = []
         for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
         const recv = stack.pop()
-        handleInvoke(index, classInfo, state, opts, { kind: 'instance', ref, recv, argVals, push, pc })
+        handleInvoke(index, classInfo, state, opts, { kind: op === 0xb7 ? 'special' : 'instance', ref, recv, argVals, push, pc })
         break
       }
       case 0xb8: { // invokestatic
@@ -782,7 +1230,7 @@ function simulate (index, classInfo, method, state, opts = {}) {
         const args = argSlots(ref.desc)
         const argVals = []
         for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
-        handleInvoke(index, classInfo, state, opts, { kind: 'static', ref, recv: null, argVals, push, pc })
+        handleInvoke(index, classInfo, state, opts, { kind: 'static', ref, recv: null, argVals, push, pc, code })
         break
       }
       case 0xba: { // invokedynamic
@@ -996,6 +1444,16 @@ function constructReflected (index, state, cls, args, argTypes) {
 }
 function jdkModelInvoke (index, state, opts, ref, recv, argVals, push, kind) {
   if (recv && recv.k === 'type' && ref.name === 'id' && ref.desc.startsWith('()L') && typeof recv.v === 'string') { push(vResloc(recv.v)); return true }
+  if (recv?.k === 'containerField') {
+    if (recv.desc === `L${PAYLOAD_TYPE_CLASS};` && ref.owner === PAYLOAD_TYPE_CLASS && ref.name === 'id' && returnsResloc(ref.desc)) {
+      push({ k: 'containerField', desc: ref.desc.slice(2) })
+      return true
+    }
+    if (isReslocDesc(recv.desc) && isReslocOwner(ref.owner) && ['getNamespace', 'getPath'].includes(ref.name) && ref.desc === '()Ljava/lang/String;') {
+      push({ k: 'containerField', desc: 'Ljava/lang/String;' })
+      return true
+    }
+  }
   if (recv && recv.k === 'resloc' && ref.desc === '()Ljava/lang/String;') {
     const [ns, ...rest] = String(recv.v).split(':')
     if (ref.name === 'getNamespace') { push(vStr(ns)); return true }
@@ -1049,15 +1507,66 @@ function jdkModelInvoke (index, state, opts, ref, recv, argVals, push, kind) {
   return false
 }
 
+// Preserve a factory's declared upper bound only on the operand that will
+// actually be used as a hand-off receiver. Other consumers (particularly
+// heap and collection initialization) still receive an unknown value.
+function factoryHandoff (cp, code, pc) {
+  if (!code) return false
+  let pushed = 0
+  for (let at = pc + 3; at < code.length;) {
+    const op = code[at]
+    if (op === 0xb6 || op === 0xb9) {
+      const ref = cpRef(cp, code.readUInt16BE(at + 1))
+      if (!ref) return false
+      const args = argSlots(ref.desc)
+      return args.length === pushed && args.some(t => t === `L${EVENT_TYPE};` || t === `L${REGISTRAR_TYPE};`)
+    }
+    // Constants, single local loads and getstatic each push one argument.
+    if (!(op >= 0x01 && op <= 0x2d) && op !== 0xb2) return false
+    pushed++
+    at += JVM_OP_LEN[op]
+  }
+  return false
+}
+
 function handleInvoke (index, classInfo, state, opts, call) {
-  const { ref, recv, argVals, push } = call
+  const { ref, recv, argVals } = call
   const retVoid = returnsVoid(ref.desc)
+  const unreadResult = () => {
+    if (!opts.onRegistration && !opts.onReturn && !opts.readingValue) return UNKNOWN
+    const sign = { kind: 'call', site: `${classInfo.className}.${opts.methodCtx?.name}${opts.methodCtx?.desc}@${call.pc}`,
+      jar: classInfo.jar?.label, reason: `unresolved result of ${ref.owner}.${ref.name}${ref.desc}` }
+    return { k: 'unread', sign }
+  }
+  const inputSign = recv?.sign || argVals.find(v => v?.sign)?.sign
+  const push = v => call.push(v ?? (inputSign ? { k: 'unread', sign: inputSign } : UNKNOWN))
+  // Only the registrar, id or version can invalidate a registration. An
+  // unresolved codec, handler or a discarded result is immaterial here.
+  const registers = ref.owner === REGISTRAR_TYPE && REGISTRATION_METHODS[ref.name]
+  const sign = opts.protectedSign && registrationEffect(ref) ? opts.protectedSign : registers && (recv?.sign || argVals[0]?.sign)
+  if (sign && (opts.protectedSign || recv?.k !== 'registrar' || sign.kind !== 'call')) {
+    if (opts.onRegistration) {
+      if (sign.kind === 'call') recordInputSign(state.diagnostics, sign)
+      else reportRegistrationSign(state, sign)
+    }
+    if (!retVoid) call.push(recv)
+    return
+  }
+  if (ref.name === '<init>' && recv && (recv.cls === PAYLOAD_TYPE_CLASS || isReslocOwner(recv.cls)) && inputSign) recv.sign = inputSign
+  if (call.evaluated && evaluatorPreInvoke(index, state, opts, ref, recv, argVals, push, call.hooks, call.kind)) {
+    noteRegistrarHandoff(state, opts, call.pc, recv ? [recv, ...argVals] : argVals, true)
+    return
+  }
   if (opts.onInvoke) opts.onInvoke(call, classInfo)
   if (jdkModelInvoke(index, state, opts, ref, recv, argVals, push, call.kind)) return
   if (storeInvoke(index, state, opts, ref, recv, argVals, push, {})) return
 
   // <init>: bind constructor args onto the aliased 'new' object
   if (ref.name === '<init>') {
+    if (call.kind !== 'special') {
+      noteRegistrarHandoff(state, opts, call.pc, [recv, ...argVals], false, call.evaluated)
+      return
+    }
     if (recv && recv.k === 'new') {
       recv.k = 'obj'
       recv.ctorArgs = argVals
@@ -1087,7 +1596,8 @@ function handleInvoke (index, classInfo, state, opts, call) {
     // the interpreter) and their registrations still resolve through the
     // wrapper-method analysis on later calls.
     if (argVals.some((a) => a && a.k === 'registrar')) {
-      dispatchCtorBody(index, ref, recv, argVals, state, opts)
+      const followed = dispatchCtorBody(index, ref, recv, argVals, state, opts)
+      noteRegistrarHandoff(state, opts, call.pc, argVals, followed, call.evaluated)
     }
     return
   }
@@ -1111,7 +1621,10 @@ function handleInvoke (index, classInfo, state, opts, call) {
     // HF51-rider: the registrar(x) ARGUMENT is its version — an argument the
     // walk cannot fold is an unresolved version, never an "unversioned"
     // registrar (the receipt names which argument went unresolved)
-    push({ k: 'registrar', version, namespace: version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'registrar-argument', versioned: true })
+    const ctx = opts.methodCtx
+    const origin = ref.owner === EVENT_TYPE && ctx && call.pc >= 0 ? `${ctx.cls}.${ctx.name}${ctx.desc}@${call.pc}` : null
+    state.hasRegistrar = true
+    push({ k: 'registrar', ...(argVals[0]?.sign && { sign: argVals[0].sign }), origin, version, namespace: version, optional: false, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'registrar-argument', versioned: true })
     return
   }
   // HF37: the FML mod-list version idiom, resolved from the jar index —
@@ -1139,7 +1652,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
     if (ref.name === 'versioned') {
       const version = asStr(argVals[0]) ?? resolveStringValue(index, argVals[0], state)
       const fromParam = version === null && !!argVals[0] && argVals[0].k === 'param'
-      push({ ...recv, version, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'versioned-argument', versioned: true })
+      push({ ...recv, sign: argVals[0]?.sign, version, versionSource: version !== null ? 'constant' : 'unresolved', versionFromParam: fromParam, versionFrom: 'versioned-argument', versioned: true })
       return
     }
     // HF51: `.optional()` reached under a condition this walk could not decide
@@ -1158,6 +1671,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
         idVal: argVals[0],
         counter: argVals[0] && argVals[0].counter ? argVals[0].counter : null,
         methodCtx: opts.methodCtx,
+        instruction: opts.methodCtx && call.pc >= 0 ? `${classInfo.className}.${opts.methodCtx.name}${opts.methodCtx.desc}@${call.pc}` : null,
         registrar: recv,
         jar: classInfo.jar,
         site: `${classInfo.className}`
@@ -1175,13 +1689,15 @@ function handleInvoke (index, classInfo, state, opts, call) {
     const registrar = recv.ctorArgs.find((a) => a && a.k === 'registrar')
     const boolArg = recv.ctorArgs.find((a) => a && a.k === 'int')
     const mapping = analyzeWrapperMethod(index, recv.cls, ref.name, ref.desc, state)
+    let followed = false
     if (mapping) {
       const regMethod = mapping.branches
-        ? (boolArg && boolArg.v ? mapping.branches.true : mapping.branches.false)
+        ? (boolArg ? (boolArg.v ? mapping.branches.true : mapping.branches.false) : null)
         : mapping.single
       if (regMethod && REGISTRATION_METHODS[regMethod]) {
         let typeId = resolveTypeValue(index, argVals[0], state)
         if (!typeId && argVals[0] && argVals[0].k === 'resloc') typeId = argVals[0].v
+        followed = true
         opts.onRegistration?.({
           method: regMethod,
           id: typeId,
@@ -1193,24 +1709,17 @@ function handleInvoke (index, classInfo, state, opts, call) {
         })
       }
     }
+    noteRegistrarHandoff(state, opts, call.pc, [recv, ...argVals], followed, call.evaluated)
     if (!retVoid) push(recv)
     return
   }
 
   // virtual dispatch of a wrapper-carrying call into scanned subclasses
   // (BasePacketHandler.registerClientToServer(new PacketRegistrar(reg, true)))
-  if (call.kind === 'instance' && argVals.some((a) => a && a.k === 'obj' && a.ctorArgs && a.ctorArgs.some((x) => x && x.k === 'registrar'))) {
-    dispatchVirtual(index, ref, argVals, state, opts)
-    if (!retVoid) push(UNKNOWN)
-    return
-  }
-
-  // HELPER shape: the registrar itself rides as an argument into a helper
-  // method whose body performs the real registration (AE2's InitNetwork).
-  // Simulate the callee with this call's abstract arguments as its locals —
-  // once per CALL SITE, because each call carries a different payload TYPE.
-  if (argVals.some((a) => a && a.k === 'registrar')) {
-    dispatchRegistrarHelper(index, ref, call.kind, recv, argVals, state, opts)
+  const carriesWrapper = call.kind !== 'static' && argVals.some(a => a?.k === 'obj' && a.ctorArgs?.some(x => x?.k === 'registrar'))
+  if (carriesWrapper || argVals.some(a => a?.k === 'registrar')) {
+    const followed = dispatchRegistrarHelper(index, ref, call.kind, recv, argVals, state, opts)
+    noteRegistrarHandoff(state, opts, call.pc, argVals, followed, call.evaluated)
     if (!retVoid) push(UNKNOWN)
     return
   }
@@ -1227,7 +1736,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // fallback silently claims the MOD version as the CHANNEL version — the
   // server refuses the join ("Incompatible client").
   if (argSlots(ref.desc).some((t) => t === `L${EVENT_TYPE};`)) {
-    dispatchEventHelper(index, ref, call.kind, recv, argVals, state, opts)
+    dispatchRegistrarHelper(index, ref, call.kind, recv, argVals, state, opts)
     if (!retVoid) push(UNKNOWN)
     return
   }
@@ -1240,7 +1749,18 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // abstains loudly downstream.
   if (ref.desc.endsWith(`)L${PAYLOAD_TYPE_CLASS};`)) {
     const returned = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts)
-    push(returned ?? UNKNOWN)
+    // A record-style accessor returns its field even before the container
+    // population pass has bound the receiver. Its value stays symbolic.
+    let projection = null
+    if (returned == null && !recv?.sign && call.kind === 'instance' && ref.desc.startsWith('()')) {
+      const target = instanceBody(index, ref, { k: 'declared', cls: ref.owner }, call.kind)
+      const code = target?.m.code
+      if (code?.length === 5 && !target.m.handlers?.length && code[0] === 0x2a && code[1] === 0xb4 && code[4] === 0xb0) {
+        const field = cpRef(target.info.cp, code.readUInt16BE(2))
+        if (field?.desc === `L${PAYLOAD_TYPE_CLASS};`) projection = { k: 'containerField', desc: field.desc }
+      }
+    }
+    push(returned ?? projection ?? unreadResult())
     return
   }
 
@@ -1262,7 +1782,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
     // any depth of straight-line delegation under the shared frame budget,
     // or returns null and the registration abstains exactly as before.
     const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'resloc')
-    push(chained && chained.k === 'resloc' ? chained : UNKNOWN)
+    push(chained?.sign || chained?.k === 'resloc' ? chained : unreadResult())
     return
   }
   if (call.kind === 'static' && isReslocOwner(ref.owner) && isStrStrToReslocDesc(ref.desc)) {
@@ -1275,7 +1795,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // body — same bounds, honest UNKNOWN on miss.
   if (call.kind === 'static' && !isReslocOwner(ref.owner) && returnsResloc(ref.desc) && index.get(ref.owner)) {
     const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'resloc')
-    push(chained && chained.k === 'resloc' ? chained : UNKNOWN)
+    push(chained?.sign || chained?.k === 'resloc' ? chained : unreadResult())
     return
   }
   // HF43: an in-index static STRING helper feeding an id factory
@@ -1289,7 +1809,7 @@ function handleInvoke (index, classInfo, state, opts, call) {
   // simulated, so `.versioned(getVersion())` fell to the mods.toml version.
   if (call.kind === 'static' && ref.desc.endsWith(')Ljava/lang/String;') && argVals.every((a) => a && (a.k === 'str' || a.k === 'int')) && index.get(ref.owner)) {
     const chained = simulateForReturn(index, ref, call.kind, recv, argVals, state, opts, 'str')
-    push(chained && chained.k === 'str' ? chained : UNKNOWN)
+    push(chained?.sign || chained?.k === 'str' ? chained : unreadResult())
     return
   }
   if (call.kind === 'static' && ref.owner === 'java/lang/String' && ref.name === 'valueOf' && argVals[0] && argVals[0].k === 'int') {
@@ -1297,41 +1817,59 @@ function handleInvoke (index, classInfo, state, opts, call) {
     return
   }
 
-  if (!retVoid) push(UNKNOWN)
+  noteRegistrarHandoff(state, opts, call.pc, recv ? [recv, ...argVals] : argVals, false, call.evaluated)
+  if (!retVoid) {
+    const result = ref.desc.slice(ref.desc.indexOf(')') + 1)
+    push(call.kind === 'static' && result.startsWith('L') && factoryHandoff(classInfo.cp, call.code, call.pc)
+      ? { k: 'declared', cls: result.slice(1, -1), sign: unreadResult()?.sign } : unreadResult())
+  }
 }
 
-// HELPER shape dispatch: simulate the called method with the caller's
-// abstract argument values as locals so a registrar passed BY ARGUMENT keeps
-// flowing (static helpers seed locals from the args directly; instance
-// helpers seed slot 0 with the receiver). Bounds: a per-path re-entrancy
-// guard kills recursive helper cycles, a global frame budget turns
-// pathological fan-out into a loud abstain (never a wedge), and unresolvable
-// instance declarations fall back to the same scanned-subclass search (and
-// the same >12-override abstain) the wrapper dispatch uses.
 const HELPER_FRAME_BUDGET = 20000
 
-// Does override `cls`'s implementation of `ref` carry the registrar? Its own
-// bytes name the registrar type (checkcast / typed parameter), OR — one hop —
-// its body passes an Object-typed argument into a method declared on ANOTHER
-// scanned class whose bytes name the registrar (Kotlin `invoke(Object)`
-// bridges forwarding straight into `Helper.register(Object)`). Bounded to
-// one hop by construction: the callee's bytes are inspected, never walked.
-function overrideCarriesRegistrar (index, cls, ref) {
-  const own = index.rawBytes(cls)
-  if (!own) return false
-  if (own.includes(REGISTRAR_SIMPLE)) return true
+function staticBody (index, ref) {
+  const info = index.get(ref.owner)
+  const m = info && info.codes.find(m => m.method === ref.name && m.desc === ref.desc && (m.flags & 0x0008))
+  return m ? { info, m } : null
+}
+
+// A field or "this" can supply a declared type without an allocated object.
+// Count concrete receiver classes, including subclasses that inherit the
+// body. Counting only classes that declare an override misses those cases.
+function receiverClass (index, recv) {
+  if (recv?.k === 'obj') return recv.cls
+  let type
+  if (recv?.k === 'this' || recv?.k === 'declared') type = recv.cls
+  else if ((recv?.k === 'field' || recv?.k === 'instfield') && recv.desc?.startsWith('L')) type = recv.desc.slice(1, -1)
+  if (!type || !index.get(type)) return null
+  const providers = index.servicesOf(type) || []
+  if (providers.length && !serviceReceiver(index, type)) return null
+  let only = null
+  for (const cls of [type, ...index.descendantsOf(type)]) {
+    const info = index.get(cls)
+    if (!info || (info.flags & 0x0600) || (cls !== type && isSubclassOf(index, cls, type) !== true)) continue
+    if (only !== null) return null
+    only = cls
+  }
+  return only
+}
+
+function instanceBody (index, ref, recv, kind) {
+  const cls = receiverClass(index, recv)
+  if (!cls || (cls !== ref.owner && isSubclassOf(index, cls, ref.owner) !== true)) return null
+  const target = findVirtualMethod(index, kind === 'special' ? ref.owner : cls, ref.name, ref.desc)
+  return target && !(target.m.flags & 0x0008) ? target : null
+}
+
+// A service configuration is a list of obligations. Discarding absent
+// classes before testing uniqueness makes a broken configuration look valid.
+function serviceReceiver (index, iface) {
+  const providers = [...new Set(index.servicesOf(iface) || [])]
+  if (providers.length !== 1 || !providers[0]) return null
+  const cls = providers[0]
   const info = index.get(cls)
-  const m = info && info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
-  if (!m) return false
-  let carries = false
-  walkLinear(m.code, info.cp, (op, pc, cp, code) => {
-    if (carries || op < 0xb6 || op > 0xb9) return // invokevirtual/special/static/interface
-    const callee = cpRef(cp, code.readUInt16BE(pc + 1))
-    if (!callee || callee.owner === cls || !callee.desc.includes('Ljava/lang/Object;')) return
-    const callBytes = index.rawBytes(callee.owner)
-    if (callBytes && callBytes.includes(REGISTRAR_SIMPLE)) carries = true
-  })
-  return carries
+  if (!info || (info.flags & 0x0600) || isSubclassOf(index, cls, iface) !== true) return null
+  return { k: 'obj', cls, fields: {}, fieldsBound: true }
 }
 
 function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) {
@@ -1346,62 +1884,16 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
     }
     return
   }
-  const targets = []
-  const ownerInfo = index.get(ref.owner)
-  const hasOwn = ownerInfo && ownerInfo.codes.some((c) => c.method === ref.name && c.desc === ref.desc)
-  if (hasOwn) {
-    targets.push(ref.owner)
-  } else if (kind === 'instance') {
-    for (const name of index.descendantsOf(ref.owner)) { // HF145: only a descendant passes the subclass test below
-      if (name === ref.owner) continue
-      if (isSubclassOf(index, name, ref.owner)) {
-        const info = index.get(name)
-        if (info && info.codes.some((c) => c.method === ref.name && c.desc === ref.desc)) targets.push(name)
-      }
-    }
-    if (targets.length > 12) {
-      // HF16-R2: a generic functional interface (kotlin Function1.invoke,
-      // Consumer.accept) has hundreds of scanned implementors, almost none of
-      // which can CARRY the registrar — an override that does names the
-      // registrar type (its checkcast / typed parameter). Count only those
-      // before the bound; the rest are provably not registration bodies.
-      //
-      // HF16-R2 rider: "names the registrar" is widened ONE hop — an override
-      // that forwards its Object argument into a method of another class
-      // that names the registrar (the checkcast lives in the helper) is a
-      // registration body too. Whatever is still dropped while siblings are
-      // walked is abstained WITH the count and the site, never a silent
-      // debug line: a forwarded override beyond the hop must not lose its
-      // channels behind a sibling's successful claim.
-      const carrying = targets.filter((t) => overrideCarriesRegistrar(index, t, ref))
-      if (carrying.length > 12) {
-        giveUp(state.diagnostics, `${key}: ${carrying.length} overrides carrying a registrar — too many, abstaining`, { kind: 'unread', jar: state.unitJar })
-        return
-      }
-      const dropped = targets.length - carrying.length
-      if (dropped > 0 && carrying.length > 0) {
-        state.diagnostics.abstains.push(`${key}: ${dropped} of ${targets.length} overrides carry no registrar (own bytes or one forwarding hop) — dropped unfollowed, ${carrying.length} walked (${carrying.join(', ')})`)
-      } else {
-        debug(`${key}: ${dropped} of ${targets.length} overrides carry no registrar — dropped, ${carrying.length} walked`)
-      }
-      targets.length = 0
-      targets.push(...carrying)
-    }
-  }
-  if (targets.length === 0) return
+  const target = kind === 'static' ? staticBody(index, ref) : instanceBody(index, ref, recv, kind)
+  if (!target) return
   state.helperStack.add(key)
   try {
-    for (const target of targets) {
-      const info = index.get(target)
-      const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
-      const locals = kind === 'static' ? seedArgLocals(ref.desc, argVals) : seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
-      // onReturn stripped: a nested registration helper's return value must
-      // never leak into an enclosing TYPE-factory resolution.
-      simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
-    }
+    const locals = kind === 'static' ? seedArgLocals(ref.desc, argVals) : seedArgLocals(ref.desc, argVals, recv)
+    simulate(index, target.info, target.m, state, { ...opts, locals, onReturn: undefined })
   } finally {
     state.helperStack.delete(key)
   }
+  return true
 }
 
 // CTOR-BODY shape dispatch: simulate a constructor body that received a
@@ -1413,10 +1905,13 @@ function dispatchRegistrarHelper (index, ref, kind, recv, argVals, state, opts) 
 // registrar-helper cycle guard (self-recursive ctors terminate) and the
 // global frame budget (pathological fan-out abstains loudly).
 function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
-  state.helperStack = state.helperStack || new Set()
+  state.activeCtors = state.activeCtors || new Map()
   state.helperFrames = state.helperFrames || 0
   const key = `${ref.owner}.${ref.name}${ref.desc}`
-  if (state.helperStack.has(key)) return // self-recursive ctor: cycle guard
+  // The active frame is already walking this recursive hand-off only when
+  // the constructor received the very same symbolic arguments.
+  const active = state.activeCtors.get(key)
+  if (active) return active.every((v, i) => v === argVals[i])
   if (++state.helperFrames > HELPER_FRAME_BUDGET) {
     if (!state.helperBudgetBlown) {
       state.helperBudgetBlown = true
@@ -1425,92 +1920,39 @@ function dispatchCtorBody (index, ref, recv, argVals, state, opts) {
     return
   }
   const info = index.get(ref.owner)
-  const m = info && info.codes.find((c) => c.method === '<init>' && c.desc === ref.desc)
+  const m = info && info.codes.find((c) => c.method === '<init>' && c.desc === ref.desc && !(c.flags & 0x0008))
   if (!m) return
-  state.helperStack.add(key)
+  state.activeCtors.set(key, argVals)
   try {
     const locals = seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
     // onReturn stripped for the same reason as the helper dispatch: a ctor
     // body's stray areturn must never leak into a TYPE-factory resolution.
     simulate(index, info, m, state, { ...opts, locals, onReturn: undefined })
   } finally {
-    state.helperStack.delete(key)
+    state.activeCtors.delete(key)
   }
+  return true
 }
 
-// EVENT-HELPER shape dispatch (HF16): simulate a method that receives the
-// RegisterPayloadHandlersEvent as an ARGUMENT, binding every call-site value
-// (version constants included) as its locals. Resolution is
-// invokevirtual-faithful: the ref owner may be a SUBCLASS of the class that
-// declares the body (create_connected: the invokevirtual ref names CCommon
-// while registerAsSyncRoot lives in SyncConfigBase), so the lookup walks the
-// owner's superclass chain (findVirtualMethod — bounded, in-index only);
-// instance calls additionally fan out to scanned subclass OVERRIDES with the
-// same >12 loud-abstain bound the wrapper dispatch uses. Shares the
-// registrar-helper cycle guard + global frame budget.
-function dispatchEventHelper (index, ref, kind, recv, argVals, state, opts) {
-  state.helperStack = state.helperStack || new Set()
-  state.helperFrames = state.helperFrames || 0
-  const key = `${ref.owner}.${ref.name}${ref.desc}`
-  if (state.helperStack.has(key)) return // recursive helper: cycle guard
-  if (++state.helperFrames > HELPER_FRAME_BUDGET) {
-    if (!state.helperBudgetBlown) {
-      state.helperBudgetBlown = true
-      giveUp(state.diagnostics, `registration dispatch budget exhausted at ${key} — remaining registrations abstained`, { kind: 'unread', jar: state.unitJar })
-    }
-    return
-  }
-  const targets = [] // {info, m}
-  const resolved = findVirtualMethod(index, ref.owner, ref.name, ref.desc)
-  if (resolved) targets.push(resolved)
-  if (kind === 'instance') {
-    for (const name of index.descendantsOf(ref.owner)) { // HF145: only a descendant passes the subclass test below
-      if (name === ref.owner) continue
-      if (isSubclassOf(index, name, ref.owner)) {
-        const info = index.get(name)
-        const m = info && info.codes.find((c) => c.method === ref.name && c.desc === ref.desc && c.code && c.code.length > 0)
-        if (m) targets.push({ info, m })
-      }
-    }
-    if (targets.length > 12) {
-      giveUp(state.diagnostics, `${key}: ${targets.length} overrides carrying the payload-handlers event — too many, abstaining`, { kind: 'unread', jar: state.unitJar })
-      return
-    }
-  }
-  if (targets.length === 0) return
-  state.helperStack.add(key)
-  try {
-    for (const t of targets) {
-      const locals = kind === 'static' ? seedArgLocals(ref.desc, argVals) : seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
-      // onReturn stripped: same leak law as the registrar-helper dispatch.
-      simulate(index, t.info, t.m, state, { ...opts, locals, onReturn: undefined })
-    }
-  } finally {
-    state.helperStack.delete(key)
-  }
-}
-
-// Simulate a method body to learn its RETURN value (TYPE-factory helpers;
-// HF11: ResourceLocation-returning helper chains via want='resloc').
-// Shares the registrar-helper bounds (cycle guard + frame budget); returns
-// the last want-shaped value the body returned, else the last returned value.
 function simulateForReturn (index, ref, kind, recv, argVals, state, opts, want = 'type') {
   state.helperStack = state.helperStack || new Set()
   state.helperFrames = state.helperFrames || 0
   const key = `${ref.owner}.${ref.name}${ref.desc}`
   if (state.helperStack.has(key)) return null
   if (++state.helperFrames > HELPER_FRAME_BUDGET) return null
-  const info = index.get(ref.owner)
-  const m = info && info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
-  if (!m) return null
+  const target = kind === 'static' ? staticBody(index, ref) : instanceBody(index, ref, recv, kind)
+  if (!target) return null
+  const { info, m } = target
   let best = null
   let last = null
   state.helperStack.add(key)
   try {
     const locals = kind === 'static' ? seedArgLocals(ref.desc, argVals) : seedArgLocals(ref.desc, argVals, recv ?? UNKNOWN)
-    simulate(index, info, m, state, {
+    const readValue = hasValueBranch(m) ? evaluateMethod : simulate
+    readValue(index, info, m, state, {
       ...opts,
       locals,
+      readingValue: true,
       onReturn: (v) => {
         last = v
         if (v && v.k === want) best = v
@@ -1519,40 +1961,9 @@ function simulateForReturn (index, ref, kind, recv, argVals, state, opts, want =
   } finally {
     state.helperStack.delete(key)
   }
-  return best ?? last
+  return last?.sign ? last : best ?? last
 }
 
-// virtual call carrying a registrar-wrapper: simulate the declared method on
-// the static owner AND on every scanned subclass that overrides it.
-function dispatchVirtual (index, ref, argVals, state, opts) {
-  const key = `${ref.owner}.${ref.name}${ref.desc}`
-  if (state.dispatched.has(key)) return
-  state.dispatched.add(key)
-  const targets = []
-  const ownerInfo = index.get(ref.owner)
-  if (ownerInfo && ownerInfo.codes.some((c) => c.method === ref.name && c.desc === ref.desc)) targets.push(ref.owner)
-  for (const name of index.descendantsOf(ref.owner)) { // HF145: only a descendant passes the subclass test below
-    if (name === ref.owner) continue
-    if (isSubclassOf(index, name, ref.owner)) {
-      const info = index.get(name)
-      if (info && info.codes.some((c) => c.method === ref.name && c.desc === ref.desc)) targets.push(name)
-    }
-  }
-  if (targets.length > 12) {
-    giveUp(state.diagnostics, `${key}: ${targets.length} overrides — too many, abstaining`, { kind: 'unread', jar: state.unitJar })
-    return
-  }
-  for (const target of targets) {
-    const info = index.get(target)
-    const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
-    const locals = seedArgLocals(ref.desc, argVals, UNKNOWN)
-    simulate(index, info, m, state, { ...opts, locals })
-  }
-}
-
-// HF51-rider: the mods.toml fallback receipt names WHICH version argument
-// the walk could not fold — `.versioned(x)` or `registrar(x)` — and says
-// "unversioned" only for a registrar that carries no version argument at all
 function fallbackReceiptOf (registrar) {
   if (!registrar || !registrar.versioned) return 'mods.toml-fallback (registrar unversioned)'
   return registrar.versionFrom === 'registrar-argument' ? 'mods.toml-fallback (registrar argument unresolved)' : 'mods.toml-fallback (versioned argument unresolved)'
@@ -1973,19 +2384,39 @@ function isConcreteish (v) {
 // Method lookup through the hierarchy (superclasses, then interfaces — the
 // interface walk is what resolves default methods like glitchcore
 // CustomPacket.getPhase()'s PLAY default).
-function findVirtualMethod (index, cls, name, desc, depth = 0) {
-  if (!cls || depth > 8) return null
-  const info = index.get(cls)
-  if (!info) return null
-  const m = info.codes.find((c) => c.method === name && c.desc === desc && c.code && c.code.length > 0)
-  if (m) return { info, m }
-  const viaSuper = findVirtualMethod(index, info.superName, name, desc, depth + 1)
-  if (viaSuper) return viaSuper
-  for (const i of info.interfaces || []) {
-    const viaIface = findVirtualMethod(index, i, name, desc, depth + 1)
-    if (viaIface) return viaIface
+function findVirtualMethod (index, cls, name, desc) {
+  const interfaces = []
+  const seen = new Set()
+  const declares = info => info.methods.some(m => m.name === name && m.desc === desc)
+  const body = info => {
+    const m = info.codes.find(m => m.method === name && m.desc === desc && !(m.flags & 0x0008))
+    return m ? { info, m } : null
   }
-  return null
+  // A class declaration takes precedence over every interface default.
+  while (cls && cls !== 'java/lang/Object') {
+    if (seen.has(cls)) return null
+    seen.add(cls)
+    const info = index.get(cls)
+    if (!info) return null
+    if (declares(info)) return body(info)
+    interfaces.push(...info.interfaces)
+    cls = info.superName
+  }
+  // Declaration order has no bearing on default dispatch. A more specific
+  // declaration can override a default, including by making it abstract.
+  const candidates = []
+  while (interfaces.length) {
+    const iface = interfaces.pop()
+    if (seen.has(iface)) continue
+    seen.add(iface)
+    const info = index.get(iface)
+    if (!info) return null
+    if (declares(info)) candidates.push(info)
+    else interfaces.push(...info.interfaces)
+  }
+  const mostSpecific = candidates.filter(info => !candidates.some(other => other !== info &&
+    isSubclassOf(index, other.className, info.className) === true))
+  return mostSpecific.length === 1 ? body(mostSpecific[0]) : null
 }
 
 // A throw-only stub: the platform/mixin graft idiom — body constructs one
@@ -2106,7 +2537,6 @@ function armLeavesAtOnce (code, startPc) {
 function armThrowsImmediately (code, startPc, cp) {
   let pc = startPc
   let steps = 0
-  const { JVM_OP_LEN } = require('./jarAnalysis')
   while (pc < code.length && steps < 16) {
     const op = code[pc]
     if (op === 0xbf) return true // athrow
@@ -2183,22 +2613,23 @@ function invokeLambda (index, state, opts, lam, args, push, hooks = {}) {
   const retVoid = returnsVoid(impl.desc)
   if (impl.name === '<init>') {
     const obj = { k: 'obj', cls: impl.owner, ctorArgs: all, ctorDesc: impl.desc, fields: {} }
+    if (state.hasRegistrar && registrarOrigins(all).size && !dispatchCtorBody(index, impl, obj, all, state, opts)) return false
     push(obj)
     return true
   }
   const recvVal = isStatic ? null : all[0]
   const callArgs = isStatic ? all : all.slice(1)
-  const dispatchCls = (!isStatic && recvVal && recvVal.k === 'obj' && index.get(recvVal.cls)) ? recvVal.cls : impl.owner
+  const kind = isStatic ? 'static' : impl.refKind === 7 ? 'special' : 'instance'
   // HF43-r: the loader's registrar / event are MODELED values (handleInvoke),
   // never run from their own bytecode — with the loader universal jar in the
   // census a `PayloadRegistrar::playToClient` method reference would
   // otherwise inline the loader's body and the registration would vanish.
-  const platform = PLATFORM_MODELED_TYPES.has(dispatchCls) || (recvVal && recvVal.k === 'registrar')
-  const target = (!platform && index.get(dispatchCls)) ? findVirtualMethod(index, dispatchCls, impl.name, impl.desc) : null
+  const platform = PLATFORM_MODELED_TYPES.has(impl.owner) || (recvVal && recvVal.k === 'registrar')
+  const target = platform ? null : isStatic ? staticBody(index, impl) : instanceBody(index, impl, recvVal, kind)
   if (target) {
     state.aggInlineStack = state.aggInlineStack || new Set()
     const key = `l:${target.info.className}.${impl.name}${impl.desc}`
-    if (state.aggInlineStack.has(key) || state.aggInlineStack.size > 24) { if (!retVoid) push(UNKNOWN); return true }
+    if (state.aggInlineStack.has(key) || state.aggInlineStack.size > 24) return false
     state.aggInlineStack.add(key)
     let returned
     try {
@@ -2216,9 +2647,9 @@ function invokeLambda (index, state, opts, lam, args, push, hooks = {}) {
     return true
   }
   const ref = { owner: impl.owner, name: impl.name, desc: impl.desc }
-  const kind = isStatic ? 'static' : 'instance'
   if (hooks.onCall) hooks.onCall(ref, kind, recvVal, callArgs)
   if (evaluatorPreInvoke(index, state, opts, ref, recvVal, callArgs, push, hooks, kind)) return true
+  if (!platform && state.hasRegistrar && registrarOrigins(all).size) return false
   const classInfo = state.evalClassInfo || { className: impl.owner, jar: null }
   handleInvoke(index, classInfo, state, opts, { kind, ref, recv: recvVal, argVals: callArgs, push, pc: -1 })
   return true
@@ -2245,6 +2676,7 @@ function concatWithConstants (classInfo, bsmIndex, captured) {
   for (const ch of recipe) {
     if (ch === '\u0001') {
       const v = captured[di++]
+      if (v?.sign) return { k: 'unread', sign: v.sign }
       if (v && v.k === 'str') out += v.v
       else if (v && v.k === 'int') out += String(v.v)
       else if (v && v.k === 'resloc') out += v.v
@@ -2276,9 +2708,10 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
   const stack = []
   const locals = opts.locals ? opts.locals.slice() : []
   const pop = (n = 1) => { for (let i = 0; i < n; i++) stack.pop() }
-  const push = (v) => stack.push(v)
+  const region = beginExceptionFrame(classInfo, method, state, opts)
+  let protectedValue
+  const push = (v) => stack.push(protectedValue || v)
   const visits = new Map()
-  const { JVM_OP_LEN } = require('./jarAnalysis')
   state.aggSteps = state.aggSteps || 0
   let steps = 0
   let pc = 0
@@ -2301,6 +2734,9 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
     // loop bound: 64 per pc for an undecided loop; a decided iterator walk adds one visit per element it consumed (bounded by the element cap)
     if (seen > AGG_MAX_LOOP_VISITS + Math.min(opts.walk.iterAdvances, AGG_MAX_ITEMS)) return
     const op = code[pc]
+    const protectedSign = enterExceptionOffset(region, pc, locals)
+    protectedValue = protectedSign ? { k: 'unread', sign: protectedSign } : null
+    opts.protectedSign = protectedSign
     const next = pc + instrLen(pc)
     if (state.jvmGateScopes && state.jvmGateScopes.length > 0) { // HF106: a gate scope closes where its arm ends
       const sc = state.jvmGateScopes
@@ -2308,7 +2744,14 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
     }
     let jumped = false
     const jump = (target) => { pc = target; jumped = true }
+    const mergeFork = known => {
+      const end = registrarFork(index, classInfo, method, pc, stack, locals, state, opts, known, true)
+      if (end === null) return false
+      jump(end)
+      return true
+    }
     const condBranch = (target, known, takeJump, flag = null) => {
+      if (mergeFork(known)) return
       if (known) {
         if (takeJump) jump(target)
         return
@@ -2549,8 +2992,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
         const recv = stack.pop()
         if (hooks.onCall) hooks.onCall(ref, 'instance', recv, argVals)
-        if (evaluatorPreInvoke(index, state, opts, ref, recv, argVals, push, hooks)) break
-        handleInvoke(index, classInfo, state, opts, { kind: 'instance', ref, recv, argVals, push, pc })
+        handleInvoke(index, classInfo, state, opts, { kind: op === 0xb7 ? 'special' : 'instance', ref, recv, argVals, push, pc, evaluated: true, hooks })
         // focus-pass hook: an aggregator instance just finished constructing
         if (ref.name === '<init>' && recv && recv.k === 'obj' && state.aggFocus &&
             recv.cls === state.aggFocus && state.aggConstructed && !state.aggConstructed.includes(recv)) {
@@ -2571,8 +3013,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
         for (let i = args.length - 1; i >= 0; i--) argVals[i] = stack.pop()
         if (state.lazyClinit) lazyClassInit(index, state, ref.owner) // JVMS §5.5: invokestatic initializes the class
         if (hooks.onCall) hooks.onCall(ref, 'static', null, argVals)
-        if (evaluatorPreInvoke(index, state, opts, ref, null, argVals, push, hooks, 'static')) break
-        handleInvoke(index, classInfo, state, opts, { kind: 'static', ref, recv: null, argVals, push, pc })
+        handleInvoke(index, classInfo, state, opts, { kind: 'static', ref, recv: null, argVals, push, pc, code, evaluated: true, hooks })
         break
       }
       case 0xba: { // invokedynamic — capture values surface to the harvest
@@ -2664,6 +3105,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       case 0xaa: { // tableswitch
         const v = stack.pop()
         const a = (pc + 4) & ~3
+        if (mergeFork(v?.k === 'int')) break
         const def = pc + code.readInt32BE(a)
         const lo = code.readInt32BE(a + 4)
         const hi = code.readInt32BE(a + 8)
@@ -2678,6 +3120,7 @@ function evaluateMethodInner (index, classInfo, method, state, opts = {}, hooks 
       case 0xab: { // lookupswitch
         const v = stack.pop()
         const a = (pc + 4) & ~3
+        if (mergeFork(v?.k === 'int')) break
         const def = pc + code.readInt32BE(a)
         const n = code.readInt32BE(a + 4)
         let target = def
@@ -2714,7 +3157,7 @@ function materializeElement (recv, v, first) {
   if (first) recv.items.unshift(v); else recv.items.push(v)
 }
 
-function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks = {}, callKind = recv ? 'instance' : 'unknown') {
+function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks, callKind) {
   // HF37 LAMBDA invocation: the functional-interface call on a lambda value
   // runs its implementation with captured + call arguments (a method
   // reference onto a loader API such as PayloadRegistrar::playToClient
@@ -2738,24 +3181,28 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
     // to a Consumer, so the registrar read a message record where its payload
     // type belonged and abstained "unresolved payload type id".
     if (ref.desc === '(Ljava/util/function/BiConsumer;)V' && Array.isArray(recv.entries)) {
-      for (const e of recv.entries.slice(0, AGG_MAX_ITEMS)) invokeLambda(index, state, opts, argVals[0], [e.key, e.value], () => {}, hooks)
+      for (const e of recv.entries.slice(0, AGG_MAX_ITEMS)) {
+        if (!invokeLambda(index, state, opts, argVals[0], [e.key, e.value], () => {}, hooks)) return false
+      }
       return true
     }
-    for (const item of (recv.items || []).slice(0, AGG_MAX_ITEMS)) invokeLambda(index, state, opts, argVals[0], [item], () => {}, hooks)
+    for (const item of (recv.items || []).slice(0, AGG_MAX_ITEMS)) {
+      if (!invokeLambda(index, state, opts, argVals[0], [item], () => {}, hooks)) return false
+    }
     return true
   }
   // HF43-r FML deferred work: event.enqueueWork(runnable|supplier) runs on the
   // sync executor before the next lifecycle phase — run it now.
   if (ref.name === 'enqueueWork' && !index.get(ref.owner) && argVals.length === 1 && argVals[0] && argVals[0].k === 'lambda') {
-    invokeLambda(index, state, opts, argVals[0], [], () => {}, hooks)
+    if (!invokeLambda(index, state, opts, argVals[0], [], () => {}, hooks)) return false
     if (!returnsVoid(ref.desc)) push(UNKNOWN)
     return true
   }
-  if (!recv && ref.owner === 'java/util/Objects' && ref.name === 'requireNonNull' && argVals.length >= 1) {
+  if (callKind === 'static' && ref.owner === 'java/util/Objects' && ref.name === 'requireNonNull' && argVals.length >= 1) {
     push(argVals[0]) // identity pass-through (javac's null-check idiom around method references)
     return true
   }
-  if (!recv && ref.owner === 'java/lang/Integer' && ref.name === 'toString' && ref.desc === '(I)Ljava/lang/String;') {
+  if (callKind === 'static' && ref.owner === 'java/lang/Integer' && ref.name === 'toString' && ref.desc === '(I)Ljava/lang/String;') {
     push(argVals[0] && argVals[0].k === 'int' ? vStr(String(argVals[0].v)) : UNKNOWN)
     return true
   }
@@ -2897,8 +3344,8 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
     const empty = decided && recv.v && recv.v.k === 'null'
     const held = decided && !empty ? (recv.v ?? UNKNOWN) : UNKNOWN
     if ((ref.name === 'ifPresent' || ref.name === 'ifPresentOrElse') && argVals[0] && argVals[0].k === 'lambda') {
-      if (!empty) invokeLambda(index, state, opts, argVals[0], [held], () => {}, hooks)
-      else if (ref.name === 'ifPresentOrElse' && argVals[1] && argVals[1].k === 'lambda') invokeLambda(index, state, opts, argVals[1], [], () => {}, hooks)
+      if (!empty) return invokeLambda(index, state, opts, argVals[0], [held], () => {}, hooks)
+      if (ref.name === 'ifPresentOrElse' && argVals[1]?.k === 'lambda') return invokeLambda(index, state, opts, argVals[1], [], () => {}, hooks)
       return true
     }
     if (decided) {
@@ -2908,7 +3355,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
       if ((ref.name === 'map' || ref.name === 'flatMap') && argVals[0] && argVals[0].k === 'lambda') {
         if (empty) { push(recv); return true }
         let returned = UNKNOWN
-        invokeLambda(index, state, opts, argVals[0], [held], (v) => { returned = v }, hooks)
+        if (!invokeLambda(index, state, opts, argVals[0], [held], (v) => { returned = v }, hooks)) return false
         push(ref.name === 'map' ? { k: 'optional', v: returned ?? UNKNOWN } : (returned && returned.k === 'optional' ? returned : { k: 'optional', v: UNKNOWN }))
         return true
       }
@@ -2927,9 +3374,9 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
     return true
   }
   // chained constructor delegation on an object under construction
-  if (ref.name === '<init>' && recv && recv.k === 'obj' && index.get(ref.owner)) {
+  if (callKind === 'special' && ref.name === '<init>' && recv?.k === 'obj' && index.get(ref.owner)) {
     const info = index.get(ref.owner)
-    const m = info.codes.find((c) => c.method === '<init>' && c.desc === ref.desc)
+    const m = info.codes.find((c) => c.method === '<init>' && c.desc === ref.desc && !(c.flags & 0x0008))
     if (m && !state.aggCtorStack?.has(`${ref.owner}${ref.desc}`)) {
       state.aggCtorStack = state.aggCtorStack || new Set()
       const key = `${ref.owner}${ref.desc}`
@@ -2946,7 +3393,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // enum values(): materialize the constant array by evaluating the enum's
   // own <clinit> once — each constant is a construction-bound object whose
   // fields (payload class, codec, the Type built from name()) are readable.
-  if (!recv && ref.name === 'values' && ref.desc === `()[L${ref.owner};`) {
+  if (callKind === 'static' && ref.name === 'values' && ref.desc === `()[L${ref.owner};`) {
     const info = index.get(ref.owner)
     if (info && info.superName === 'java/lang/Enum') {
       const cacheKey = `enumvals:${ref.owner}`
@@ -2975,34 +3422,27 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // JDK collection view wrappers are identity for our purposes: the wrapped
   // collection's captured elements ARE the view's elements (catnip's
   // packetsView = Collections.unmodifiableSet(packets)).
-  if (!recv && ref.owner === 'java/util/Collections' &&
+  if (callKind === 'static' && ref.owner === 'java/util/Collections' &&
       (ref.name.startsWith('unmodifiable') || ref.name.startsWith('synchronized')) && argVals.length === 1) {
     push(argVals[0])
     return true
   }
-  // ServiceLoader idiom: a call written against an interface whose unique
-  // implementation is named by a META-INF/services file dispatches into that
-  // implementation (veil's platform Factory.create). The services file is
-  // primary-source truth, never a guess; ambiguity (several impls) abstains.
-  // HF16-R2 rider: an invokestatic against the interface (a static interface
-  // method, geckolib GeckoLibNetworking.registerPacket) has NO receiver to
-  // dispatch on — seeding the impl as slot 0 shifted every argument by one
-  // (the Type became the service object). Static calls take the static
-  // inline rule below; the services rule is for receiver-less INSTANCE calls.
-  if (callKind !== 'static' && (!recv || recv.k === 'field' || recv.k === 'instfield' || recv === UNKNOWN) && index.services) {
-    // HF43-r: a receiver read from a field DECLARED as the service interface
-    // (puzzles `ProxyImpl.INSTANCE`, called through a super-interface method)
-    // names the service by its declared type; the call's owner is the second
-    // key. Either way the services file is the truth and ambiguity abstains.
-    const candidates = []
-    if (recv && (recv.k === 'field' || recv.k === 'instfield') && typeof recv.desc === 'string' && recv.desc.startsWith('L') && recv.desc.endsWith(';')) candidates.push(recv.desc.slice(1, -1))
-    candidates.push(ref.owner)
-    for (const iface of candidates) {
-      const impls = index.servicesOf(iface) // HF145: the list read is a recorded dependency
-      if (impls && new Set(impls).size === 1 && index.get(impls[0]) && findVirtualMethod(index, impls[0], ref.name, ref.desc)) {
-        const implRecv = { k: 'obj', cls: impls[0], fields: {}, fieldsBound: true, serviceImpl: true }
-        return inlineDispatch(index, state, opts, implRecv, ref, argVals, push, hooks)
-      }
+  // Model the value produced by the loader. An unrelated value of the same
+  // interface type does not become the configured provider.
+  if (callKind === 'static' && ref.owner === 'java/util/ServiceLoader' && ref.name === 'load' &&
+      ref.desc === '(Ljava/lang/Class;)Ljava/util/ServiceLoader;' && argVals[0]?.k === 'cls') {
+    push({ k: 'serviceLoader', iface: argVals[0].v })
+    return true
+  }
+  if (recv?.k === 'serviceLoader' && ref.owner === 'java/util/ServiceLoader') {
+    const provider = serviceReceiver(index, recv.iface)
+    if (ref.name === 'findFirst' && ref.desc === '()Ljava/util/Optional;') {
+      push(provider ? { k: 'optional', v: provider } : UNKNOWN)
+      return true
+    }
+    if (ref.name === 'iterator' && ref.desc === '()Ljava/util/Iterator;') {
+      push(provider ? { k: 'iter', items: [provider], i: 0 } : UNKNOWN)
+      return true
     }
   }
   // in-index virtual call on an abstract object: run the REAL body
@@ -3010,17 +3450,18 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
   // packet.getPhase() / factory.type() into concrete values and lets an
   // aggregator's registerX(...) population methods execute for real against
   // the exact instance being resolved.
-  if (recv && recv.k === 'obj' && ref.name !== '<init>') {
-    return inlineDispatch(index, state, opts, recv, ref, argVals, push, hooks)
+  if (callKind !== 'static' && recv && ref.name !== '<init>' &&
+      (recv.k === 'obj' || ((recv.k === 'field' || recv.k === 'instfield') && index.servicesOf(ref.owner)?.length))) {
+    return inlineDispatch(index, state, opts, recv, ref, argVals, push, hooks, callKind)
   }
   // in-index STATIC call within the aggregation focus scope (the aggregator
   // class and its ancestors): factory chains like PacketChannel.create /
   // VeilPacketManager.create evaluate for real, yielding the constructed
   // aggregator object.
-  if (!recv && ((state.aggStaticScope && state.aggStaticScope.has(ref.owner)) || state.aggInlineAll) && index.get(ref.owner) && !PLATFORM_MODELED_TYPES.has(ref.owner)) {
-    const info = index.get(ref.owner)
-    const m = info.codes.find((c) => c.method === ref.name && c.desc === ref.desc)
-    if (m) {
+  if (callKind === 'static' && ((state.aggStaticScope && state.aggStaticScope.has(ref.owner)) || state.aggInlineAll) && index.get(ref.owner) && !PLATFORM_MODELED_TYPES.has(ref.owner)) {
+    const target = staticBody(index, ref)
+    if (target) {
+      const { info, m } = target
       state.aggInlineStack = state.aggInlineStack || new Set()
       const key = `s:${ref.owner}.${ref.name}${ref.desc}`
       if (state.aggInlineStack.has(key) || state.aggInlineStack.size > 24) return false
@@ -3030,6 +3471,7 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
         evaluateMethod(index, info, m, state, {
           locals: seedArgLocals(ref.desc, argVals),
           recordPutstatic: false,
+          readingValue: !!opts.onRegistration && (ref.desc.endsWith(')Ljava/lang/String;') || returnsResloc(ref.desc) || ref.desc.endsWith(`)L${PAYLOAD_TYPE_CLASS};`)),
           onReturn: (v) => { returned = v },
           walk: opts.walk, // HF175: the callee inherits the caller's undecided flag
           onRegistration: opts.onRegistration
@@ -3047,11 +3489,11 @@ function evaluatorPreInvoke (index, state, opts, ref, recv, argVals, push, hooks
 // Inline a virtual/interface call against a concrete receiver's real method
 // body; adopts the return value. Cycle-guarded and depth-bounded — a miss
 // falls back to handleInvoke's abstract handling (returns false).
-function inlineDispatch (index, state, opts, recv, ref, argVals, push, hooks = {}) {
-  const target = findVirtualMethod(index, recv.cls, ref.name, ref.desc)
+function inlineDispatch (index, state, opts, recv, ref, argVals, push, hooks, callKind) {
+  const target = instanceBody(index, ref, recv, callKind)
   if (!target) return false
   state.aggInlineStack = state.aggInlineStack || new Set()
-  const key = `${recv.cls}.${ref.name}${ref.desc}`
+  const key = `${target.info.className}.${ref.name}${ref.desc}`
   if (state.aggInlineStack.has(key) || state.aggInlineStack.size > 24) return false
   state.aggInlineStack.add(key)
   let returned
@@ -3554,12 +3996,14 @@ function resolveAggregatedRegistrations (index, state, pending) {
           const spec = REGISTRATION_METHODS[r.method]
           if (!spec) return
           produced++
+          if (r.registrar?.origin) state.accountedRegistrarCalls.add(r.registrar.origin)
           rows.push({
             id: r.id,
             version: r.registrar ? r.registrar.version : null,
             versionSource: 'aggregated',
             versionFrom: r.registrar ? (r.registrar.versionFrom || null) : null,
             versioned: r.registrar ? !!r.registrar.versioned : false,
+            inputSign: r.registrar?.sign,
             versionFromParam: r.registrar ? !!r.registrar.versionFromParam : false,
             namespace: r.registrar ? r.registrar.namespace : null,
             optional: r.registrar ? r.registrar.optional : false,
@@ -4058,7 +4502,7 @@ function servicePresenceProbeOf (index, state, ref) {
     }
     via = 'sole implementor'
   }
-  if (impls.length !== 1) return null // none or ambiguous: the call stays unknown
+  if (impls.length !== 1 || !impls[0]) return null // absent, ambiguous or unread descriptor
   const implInfo = index.get(impls[0])
   const m = implInfo && implInfo.codes.find((c) => c.method === ref.name && c.desc === ref.desc && c.code)
   const reach = presenceReachOf(index, implInfo, m, 0, new Set())
@@ -4342,7 +4786,9 @@ function deriveModRootRegistrations (index, state, record) {
         state.rootStack.length = 0
         invokeLambda(index, state, opts, lam, [{ k: 'param', i: 0 }], () => {}, trace ? { onCall: trace } : {})
       } catch (err) {
-        diagnostics.errors.push(`mod-root listener ${site} failed (${err.message})`)
+        const message = `mod-root listener ${site} failed (${err.message})`
+        diagnostics.errors.push(message)
+        if (resolvedHere) giveUp(diagnostics, message, { kind: 'unseen', site, jar: index.jarOf(lam.impl.owner)?.label, wordOnly: true })
       }
       // every method the listener's chain executed on the way to a proven
       // registration is part of the machinery that claimed it
@@ -4389,13 +4835,17 @@ function deriveModRootRegistrations (index, state, record) {
     diagnostics.abstains.push(says)
     // HF171: one row a registration; the computed id is not proven and is not handed on as one
     // a registration proven optional writes no row: the server drops it, nothing to refuse for
-    for (const r of d.regs) if (!provenOptional(r)) noteUnprovenRegistration(diagnostics, says, r)
+    for (const r of d.regs) {
+      if (r.registrar?.origin) state.accountedRegistrarCalls.add(r.registrar.origin)
+      if (!provenOptional(r)) noteUnprovenRegistration(diagnostics, says, r)
+    }
   }
   const unresolvedSites = new Set()
   const rowSites = new Map() // site -> its row when that row is this lane's own (marked), else null
   for (const r of rows) {
     if (!r.unresolved) continue
     const site = `${r.site.split(' (mod-root')[0]}.${r.method} (via ${r.listenerSite})`
+    recordInputSign(diagnostics, r.idVal?.sign || r.registrar?.sign)
     const says = `${site}: the mod-root walk reached this registration without a provable id (a runtime class reference, an unreadable counter or an unresolved string) — unclaimed`
     // the sentence once a site, as before; one row a site, of its first registration that is not proven optional
     // (the server drops a proven-optional channel the client lacks: nothing to refuse for)
@@ -4406,6 +4856,7 @@ function deriveModRootRegistrations (index, state, record) {
     if (provenOptional(r)) continue
     const own = provenNarrowly(r)
     if (rowSites.has(site) && (own || rowSites.get(site) === null)) continue
+    if (r.registrar?.origin) state.accountedRegistrarCalls.add(r.registrar.origin)
     const marked = rowSites.has(site) ? diagnostics.unresolvedSites.indexOf(rowSites.get(site)) : -1
     if (marked >= 0) diagnostics.unresolvedSites.splice(marked, 1)
     const row = noteUnprovenRegistration(diagnostics, says, r)
@@ -4447,7 +4898,13 @@ function freshDerivationState (read, diagnostics, deps = null) {
     typeFieldsResolved: new Set(),
     helperCache: new Map(),
     wrapperCache: new Map(),
-    dispatched: new Set(),
+    registrarMethods: new Set(),
+    accountedRegistrarCalls: new Set(),
+    unreadRegistrarCalls: new Set(),
+    followedHandoffs: new Set(),
+    deferredBranches: 0,
+    branchMethods: new Map(),
+    missedHandoffs: new Map(),
     allClassNames: read.allClassNames,
     diagnostics
   }
@@ -4471,9 +4928,13 @@ function packCensusOf (read) {
  */
 function readNeoForgeJarUnits (jarPaths, opts = {}) {
   const started = Date.now()
-  const index = makeClassIndex()
   const diagnostics = { jars: [], abstains: [], errors: [], registrations: 0, presenceGates: [] }
-  for (const p of jarPaths) collectJarClasses(p, index, diagnostics, path.basename(p))
+  const index = makeClassIndex(diagnostics)
+  diagnostics.jarsRead = 0
+  for (const [i, p] of jarPaths.entries()) {
+    if (collectJarClasses(p, index, diagnostics, path.basename(p))) diagnostics.jarsRead++
+    if (opts?.onJarRead) opts.onJarRead(diagnostics.jarsRead, i + 1)
+  }
   for (const u of index.units) u.view = unitViewOf(u) // HF145: a unit's identity for a kept result = its content and the class names it provides
   const versionByModId = Object.create(null)
   for (const j of diagnostics.jars) for (const id of j.modIds || []) if (j.modVersion && !versionByModId[id]) versionByModId[id] = j.modVersion
@@ -4512,7 +4973,7 @@ function readNeoForgeJarUnits (jarPaths, opts = {}) {
   }
   stretch(2, passStart)
   read.modRootResolved = gateState.modRootResolved || new Set()
-  // HF106: the classes / listener methods a mod root subscribes only under a JVM flag join the gate map
+  read.rootRegistrarCoverage = registrarCoverageOf(gateState, read.rootRegistrations)
   for (const [k, g] of (gateState.jvmGates || new Map())) if (!read.gates.has(k)) read.gates.set(k, g)
   read.readMs = Date.now() - started
   return read
@@ -4620,19 +5081,21 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
   const rootResolved = (key) => { const v = read.modRootResolved.has(key); deps.rootResolved[key] = v; return v }
   // entry points: any method whose descriptor takes the registrar event
   const entryMethods = []
+  const registrarCalls = []
   for (const name of seedNamesOf(index, state)) {
     const bytes = index.rawBytes(name)
     if (!bytes || !bytes.includes(EVENT_TYPE)) continue
     const info = index.get(name)
     if (!info) continue
+    registrarCalls.push(...registrarCallsOf(info))
     for (const m of info.codes) {
       if (m.desc.includes(`L${EVENT_TYPE};`)) entryMethods.push({ info, method: m })
     }
   }
 
   const registrations = [...seedRegistrations]
+  const diagnosedMethods = new Set()
   const unseenEntries = [] // HF175: entries whose registrar or event left the walk with no registration reached
-  const silentSentences = new Set() // HF175: the sentences of the entries that reached no registration
   const silentEntries = []
   const presenceGates = read.gates
   const censusHas = (modId) => { const v = ALWAYS_PRESENT_MOD_IDS.has(modId) || diagnostics.jars.some((j) => (j.modIds || []).includes(modId)); deps.present[modId] = v; return v }
@@ -4655,6 +5118,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // kind alone (a static registration subscribed only under a JVM flag is
     // never registered on a player's game); the mod-presence kind stays an
     // instance-hosted fact as before. A listener method gated by name wins.
+    const methodKey = `${info.className}.${method.method}${method.desc}`
     const isStaticEntry = (method.flags & 0x0008) !== 0
     const methodGateKey = `${info.className}#${method.method}${method.desc}`
     const gateRow = presenceGates.get(methodGateKey) || presenceGates.get(info.className) || null
@@ -4667,12 +5131,14 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       const claimed = gate.whenPresent ? present : !present
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, kind: 'mod_presence', modId: gate.modId, present, whenPresent: gate.whenPresent, claimed, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
       if (!claimed) {
+        diagnosedMethods.add(methodKey)
         giveUp(diagnostics, `${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} subscribes it only when ${gate.probe} answers ${gate.whenPresent ? 'loaded' : 'not loaded'} for "${gate.modId}", and "${gate.modId}" is ${present ? '' : 'not '}in the jar census — not claimed`, { kind: 'unread', jar: state.unitJar, site: `${info.className}.${method.method}` })
         continue
       }
     }
     if (gate && gate.kind === 'jvm_property') {
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, kind: 'jvm_property', present: false, probe: gate.probe, gateSite: gate.site })
+      diagnosedMethods.add(methodKey)
       giveUp(diagnostics, `${info.className}.${method.method}: registrations gated on a JVM flag — ${gate.site} subscribes it only under a jvm_property read by ${gate.probe}; a launch flag is absent on a player's game (client and integrated server alike), so its channels are left unclaimed`, { kind: 'unread', jar: state.unitJar, site: `${info.className}.${method.method}` })
       continue
     }
@@ -4680,6 +5146,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       const present = censusHas(gate.modId)
       diagnostics.presenceGates.push({ site: `${info.className}.${method.method}`, modId: gate.modId, present, holder: gate.holder, probe: gate.probe, gateSite: gate.site })
       if (!present) {
+        diagnosedMethods.add(methodKey)
         giveUp(diagnostics, `${info.className}.${method.method}: registrations gated on mod presence — ${gate.site} keys ${gate.holder.split('/').pop()}("${gate.modId}") whose ${gate.probe} decides construction, and "${gate.modId}" is not in the jar census (${diagnostics.jars.length} jars) — this entry's channels unclaimed (the server registers them only with that mod loaded)`, { kind: 'unread', jar: state.unitJar, site: `${info.className}.${method.method}` })
         continue
       }
@@ -4689,6 +5156,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     let reachedWithId = 0
     const abstainStart = diagnostics.abstains.length
     const siteStart = (diagnostics.unresolvedSites || []).length // HF171: the rows move with their sentences
+    const branchesBefore = state.deferredBranches
     const regStart = registrations.length
     simulate(index, info, method, state, { onRegistration: (r) => { reached++; if (r.id) reachedWithId++; record(r) }, recordPutstatic: false, locals })
     // HF16-R2: the linear walk's abstains for an entry the deep pass takes
@@ -4700,7 +5168,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // elements are the truth the guess lacked).
     if (reached === 0) {
       silentEntries.push({ info, method, linearAbstains: diagnostics.abstains.splice(abstainStart), linearSites: (diagnostics.unresolvedSites || []).splice(siteStart) })
-    } else if (reachedWithId === 0 && entryRegistries(index, info, method).any) {
+    } else if (state.deferredBranches !== branchesBefore || (reachedWithId === 0 && entryRegistries(index, info, method).any)) {
       silentEntries.push({ info, method, soft: true, linearAbstains: diagnostics.abstains.splice(abstainStart), linearSites: (diagnostics.unresolvedSites || []).splice(siteStart), linearRegs: registrations.slice(regStart) })
     }
   }
@@ -4729,7 +5197,11 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // HF43-r: an entry the mod-root walk ran to a proven registration (it is
     // on the chain a listener's registrations came through) is resolved —
     // no deep re-walk, no "never reaches" line against claimed channels.
-    if (rootResolved(`${info.className}.${method.method}${method.desc}`)) continue
+    const entryKey = `${info.className}.${method.method}${method.desc}`
+    if (rootResolved(entryKey)) {
+      (diagnostics.modRootCovered = diagnostics.modRootCovered || []).push(entryKey)
+      continue
+    }
     // a lambda body's enclosing entry reports for it — when there IS one: a
     // listener lambda registered from a plain `init(IEventBus)` (the
     // STATIC-REGISTRAR shape: geckolib's `bus.addListener(this::onRegister)`)
@@ -4783,17 +5255,19 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     if (registrations.length === before && !entry.soft) {
       const says = `${info.className}.${method.method}: the registrar never reaches a registration (deep walk incl. ${registries.size + own.size} static registr${registries.size + own.size === 1 ? 'y' : 'ies'}) — no channel claimed from this entry`
       diagnostics.abstains.push(says)
-      silentSentences.add(says)
       // HF175: an entry that asks the event for a registrar, or hands the event on, and reaches no registration lost it to code the
       // walk did not see - registrations may exist there. Its row is written at the unit's end (below), unless another reader of
       // this unit claimed from the entry's class. An entry that does neither registers nothing: the sentence alone, as before
-      if (entryMayRegister(info, method)) unseenEntries.push({ says, cls: info.className, site: `${info.className}.${method.method}` })
+      if (entryMayRegister(info, method)) unseenEntries.push({ says, cls: info.className, desc: method.desc, site: `${info.className}.${method.method}` })
     }
     // HF175: the deep walk of this entry FAILED after it had met a registration (the reader throws nowhere by itself: bytes it
     // did not expect). What followed was never walked, and when an id was proven before the failure the linear walk's rows of
     // the entry were dropped above. One row of the entry says so (kind unseen, this lane's own). A walk that failed before it
     // met any registration is the entry that reaches none: its sentence and its row are written just above, as before
-    if (deepFailed && registrations.length > before) noteUnresolvedSite(diagnostics, deepFailed, { kind: 'unseen', jar: state.unitJar, site: `${info.className}.${method.method}`, wordOnly: true })
+    if (deepFailed && registrations.length > before) {
+      diagnosedMethods.add(`${info.className}.${method.method}${method.desc}`)
+      noteUnresolvedSite(diagnostics, deepFailed, { kind: 'unseen', jar: state.unitJar, site: `${info.className}.${method.method}`, wordOnly: true })
+    }
   }
 
   const markers = discoverFlowMarkers(index, entryMethods)
@@ -4829,6 +5303,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       continue
     }
     if (version === null) {
+      recordInputSign(diagnostics, reg.registrar?.sign)
       const metaVersion = metaVersionFor(reg.registrar && reg.registrar.namespace, reg.jar)
       if (optional) {
         // HF175: only a PROVEN optional is safely unclaimed. An optional() the walk
@@ -4878,6 +5353,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
       seedNames: () => seedNamesOf(index, state),
       walkLinear,
       registrationMethods: REGISTRATION_METHODS,
+      recordOptionalWrapper: (info, m) => recordOptionalWrapper(index, read, info, m, state.accountedRegistrarCalls),
       resolveNamespaceHelper,
       resolveReslocValue: (v) => resolveReslocValue(index, v, state),
       concatWithConstants,
@@ -4895,13 +5371,17 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
   // HF11 AGGREGATOR pass: resolve id-less registrations from their jar-wide
   // population contexts (see the shape header above); leftovers abstain with
   // honest optionality wording so P5 surfaces only real negotiation risk.
-  const agg = resolveAggregatedRegistrations(index, state, pendingAgg)
+  // Retry undecided branches with the call-site bindings the aggregator
+  // actually found. A speculative arm supplies no registration of its own.
+  const pendingBranches = [...state.branchMethods.values()].map(methodCtx => ({ methodCtx }))
+  const agg = resolveAggregatedRegistrations(index, state, [...pendingAgg, ...pendingBranches])
   phaseNow = 2
   for (const row of agg.rows) {
     let version = row.version
     let versionSource = row.versionSource
     let versionFrom = row.versionFrom || null
     if (version === null) {
+      recordInputSign(diagnostics, row.inputSign)
       const metaVersion = metaVersionFor(row.namespace, row.jar)
       if (row.optional) {
         // HF175: as above, for a registration several call sites share
@@ -4936,8 +5416,11 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     // iterated with the real elements) is derived, not abstained — the entry
     // pass met it with an empty registration object
     if (rootResolved(sk)) { (diagnostics.modRootCovered = diagnostics.modRootCovered || []).push(sk); continue }
-    if (abstainedSiteKeys.has(`${sk}#${reg.method}`)) continue
-    abstainedSiteKeys.add(`${sk}#${reg.method}`)
+    if (reg.registrar?.origin) state.accountedRegistrarCalls.add(reg.registrar.origin)
+    const siteKey = reg.instruction || `${sk}#${reg.method}`
+    if (abstainedSiteKeys.has(siteKey)) continue
+    abstainedSiteKeys.add(siteKey)
+    recordInputSign(diagnostics, reg.idVal?.sign || reg.registrar?.sign)
     const opt = provenOptional(reg)
     const undecided = !opt && !!(reg.registrar && reg.registrar.optional)
     const partially = agg.resolvedSites.has(sk) ? ' (partially aggregated — remainder unresolved)' : ''
@@ -5018,17 +5501,20 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     const outer = u.cls.split('$')[0]
     const names = (text) => { const at = typeof text === 'string' ? text.indexOf(outer) : -1; return at >= 0 && !/[A-Za-z0-9_/]/.test(text.charAt(at + outer.length)) }
     if (claims.some((c) => names(c.source)) || diagnostics.abstains.some((a) => a !== u.says && names(a)) || (diagnostics.unresolvedSites || []).some((x) => names(x.site))) continue
-    noteUnresolvedSite(diagnostics, u.says, { kind: 'unseen', jar: state.unitJar, site: u.site, wordOnly: true })
+    const method = u.site + u.desc
+    diagnosedMethods.add(method)
+    const ask = registrarCalls.find(call => call.unique && call.method === method && state.missedHandoffs.has(call.site))
+    noteUnresolvedSite(diagnostics, u.says, { kind: 'unseen', jar: state.unitJar, site: ask?.site || u.site, wordOnly: true })
   }
-  const heldNothing = claims.length === 0 && listenOnlyNamed.length === 0 && registrations.length === 0 &&
-    (diagnostics.unresolvedSites || []).length === 0 && diagnostics.abstains.every((a) => silentSentences.has(a)) &&
-    !(listen && ((listen.factory || []).length > 0 || (listen.fabric || []).length > 0 || (listen.container || []).length > 0))
-  if (heldNothing) {
-    const asker = eventAskerOf(index, unit)
-    if (asker) giveUp(diagnostics, `${asker}: this jar asks the event for a payload registrar in code no entry of it leads to — nothing of its registrations was read`, { kind: 'unseen', jar: state.unitJar, site: asker, wordOnly: true })
+  if (diagnostics.inputSigns && platformHelper.resolvedInputs?.size) {
+    diagnostics.inputSigns = diagnostics.inputSigns.filter(sign => !platformHelper.resolvedInputs.has(sign.site))
+    if (!diagnostics.inputSigns.length) delete diagnostics.inputSigns
   }
+  const coverage = registrarCoverageOf(state, registrations)
+  // A single ask in an already diagnosed entry has its row. Its overloads
+  // and other instructions in the same method are independent.
+  coverage.calls = registrarCalls.filter(call => !call.unique || !diagnosedMethods.has(call.method))
 
-  // HF73b r2 the absence facts (the index's law above)
   deps.missed = [...index.missed].sort()
   deps.packCensus = index.packScanned ? packCensusOf(read) : null
   // HF145: the pack queries this unit asked, the services lists it read, and the pack it was derived in (by view)
@@ -5044,6 +5530,7 @@ function deriveUnitBody (read, unit, state, diagnostics, deps, metaVersionFor, s
     trail: [...index.trail].sort(),
     deps,
     claims,
+    registrarCoverage: coverage,
     listenOnlyNamed,
     listen,
     // HF105 item B: the helper classes whose registrar sites this unit's
@@ -5142,6 +5629,7 @@ function assembleNeoForgeComponents (read, perJar) {
     diagnostics.abstains = diagnostics.abstains.filter((a) => !(resolvedSite(a) && unresolvedKind(a)))
     diagnostics.unresolvedSites = diagnostics.unresolvedSites.filter((s) => !(resolvedSite(s.says) && unresolvedKind(s.says))) // HF171: a row leaves with its sentence
   }
+  reportUnreadRegistrars(diagnostics, read, perJar)
   const components = {
     configuration: [...byProtocol.configuration.values()],
     play: [...byProtocol.play.values()]

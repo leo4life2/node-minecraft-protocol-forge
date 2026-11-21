@@ -84,8 +84,7 @@ function nestedArtifactLabel (entryName, manifest) {
  * every entry under either root (subfolders included) plus every .jar the
  * loader manifest names. Each row: { entry, relPath, artifact, meta }.
  */
-function nestedJarEntriesOf (buf, entries) {
-  const manifest = readNestedManifest(buf, entries)
+function nestedJarEntriesOf (buf, entries, manifest = readNestedManifest(buf, entries)) {
   const out = []
   for (const entry of entries || []) {
     const name = entry.name

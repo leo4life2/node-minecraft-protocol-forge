@@ -27,15 +27,17 @@ function zipCentralEntries (buf) {
   let off = buf.readUInt32LE(eocd + 16)
   const entries = []
   for (let i = 0; i < count; i++) {
-    if (off + 46 > buf.length || buf.readUInt32LE(off) !== 0x02014b50) break
+    if (off + 46 > eocd || buf.readUInt32LE(off) !== 0x02014b50) throw new Error('incomplete zip central directory')
     const nameLen = buf.readUInt16LE(off + 28)
+    const next = off + 46 + nameLen + buf.readUInt16LE(off + 30) + buf.readUInt16LE(off + 32)
+    if (next > eocd) throw new Error('truncated zip directory entry')
     entries.push({
       name: buf.toString('utf8', off + 46, off + 46 + nameLen),
       method: buf.readUInt16LE(off + 10),
       csize: buf.readUInt32LE(off + 20),
       localOff: buf.readUInt32LE(off + 42)
     })
-    off += 46 + nameLen + buf.readUInt16LE(off + 30) + buf.readUInt16LE(off + 32)
+    off = next
   }
   return entries
 }
@@ -44,8 +46,34 @@ function zipEntryData (buf, entry) {
   const off = entry.localOff
   if (buf.readUInt32LE(off) !== 0x04034b50) throw new Error('bad zip local header')
   const start = off + 30 + buf.readUInt16LE(off + 26) + buf.readUInt16LE(off + 28)
-  const raw = buf.slice(start, start + entry.csize)
+  if (start + entry.csize > buf.length) throw new Error('truncated zip entry')
+  if (entry.method !== 0 && entry.method !== 8) throw new Error('unsupported zip compression')
+  const raw = buf.subarray(start, start + entry.csize)
   return entry.method === 0 ? raw : zlib.inflateRawSync(raw)
+}
+
+// CONSTANT_Utf8 stores UTF-16 code units in modified UTF-8 (JVMS 4.4.7).
+// The common BMP case uses Node's decoder. A replacement, NUL or surrogate
+// requires checking the actual bytes, including both halves of a surrogate pair.
+function classUtf8 (bytes, start, length) {
+  const end = start + length
+  const text = bytes.toString('utf8', start, end)
+  if (end <= bytes.length && !/[\u0000\ud800-\udfff\ufffd]/.test(text)) return text
+  let decoded = ''
+  let i = start
+  while (true) {
+    if (i === end) return decoded
+    if (i >= bytes.length) break
+    const a = bytes[i++]
+    if (a > 0 && a < 0x80) { decoded += String.fromCharCode(a); continue }
+    if (i >= end || (bytes[i] & 0xc0) !== 0x80) break
+    const b = bytes[i++]
+    if (a === 0xc0 && b === 0x80) { decoded += '\0'; continue }
+    if (a >= 0xc2 && a <= 0xdf) { decoded += String.fromCharCode(((a & 31) << 6) | (b & 63)); continue }
+    if (a < 0xe0 || a > 0xef || (a === 0xe0 && b < 0xa0) || i >= end || (bytes[i] & 0xc0) !== 0x80) break
+    decoded += String.fromCharCode(((a & 15) << 12) | ((b & 63) << 6) | (bytes[i++] & 63))
+  }
+  throw Object.assign(new Error(`invalid modified UTF-8 at class byte ${start}`), { code: 'INVALID_CLASS_UTF8', offset: start })
 }
 
 // - minimal .class parser: constant pool + per-method flags/descriptor/Code -
@@ -57,7 +85,7 @@ function parseClassFile (b) {
   for (let i = 1; i < cpCount; i++) {
     const tag = b[o]
     switch (tag) {
-      case 1: { const len = b.readUInt16BE(o + 1); cp[i] = { tag, str: b.toString('utf8', o + 3, o + 3 + len) }; o += 3 + len; break }
+      case 1: { const len = b.readUInt16BE(o + 1); cp[i] = { tag, str: classUtf8(b, o + 3, len) }; o += 3 + len; break }
       case 7: cp[i] = { tag, nameIndex: b.readUInt16BE(o + 1) }; o += 3; break
       case 8: cp[i] = { tag, strIndex: b.readUInt16BE(o + 1) }; o += 3; break
       case 16: case 19: case 20: o += 3; break
@@ -71,6 +99,7 @@ function parseClassFile (b) {
       default: return null // unknown tag: not a class file we can read
     }
   }
+  const flags = b.readUInt16BE(o)
   const className = cp[cp[b.readUInt16BE(o + 2)].nameIndex].str
   const superIndex = b.readUInt16BE(o + 4)
   const superName = superIndex && cp[superIndex] ? cpUtf8(cp, cp[superIndex].nameIndex) : null
@@ -143,7 +172,24 @@ function parseClassFile (b) {
     const code = m.attrs.find((a) => a.name === 'Code')
     if (!code) continue
     const codeLen = b.readUInt32BE(code.start + 4)
-    codes.push({ method: m.name, desc: m.desc, flags: m.flags, code: b.slice(code.start + 8, code.start + 8 + codeLen) })
+    const end = code.start + code.len
+    const codeEnd = code.start + 8 + codeLen
+    let pos = codeEnd
+    if (codeEnd + 4 > end || end > b.length) throw new Error('invalid Code length')
+    const handlerCount = b.readUInt16BE(pos)
+    pos += 2
+    const handlers = []
+    for (let i = 0; i < handlerCount; i++) {
+      if (pos + 8 > end) throw new Error('truncated exception table')
+      const start = b.readUInt16BE(pos)
+      const stop = b.readUInt16BE(pos + 2)
+      const target = b.readUInt16BE(pos + 4)
+      const type = b.readUInt16BE(pos + 6)
+      if (start >= stop || stop > codeLen || target >= codeLen || (type && cp[type]?.tag !== 7)) throw new Error('invalid exception table')
+      handlers.push({ start, end: stop, target, type: type ? cpClassName(cp, type) : null })
+      pos += 8
+    }
+    codes.push({ method: m.name, desc: m.desc, flags: m.flags, code: b.subarray(code.start + 8, codeEnd), handlers })
   }
   // class-level attributes: BootstrapMethods is how invokedynamic call sites
   // (lambda suppliers in DeferredRegister registrations) resolve to their
@@ -183,7 +229,7 @@ function parseClassFile (b) {
       o += 6 + len
     }
   }
-  return { className, superName, interfaces, cp, codes, methods, fields, bootstrapMethods, annotations, classAnnotationsAt, classInvisibleAnnotationsAt, bytes: b }
+  return { className, flags, superName, interfaces, cp, codes, methods, fields, bootstrapMethods, annotations, classAnnotationsAt, classInvisibleAnnotationsAt, bytes: b }
 }
 
 // --- RuntimeVisibleAnnotations reader (JVMS 4.7.16) ------------------------

@@ -313,6 +313,9 @@ function deriveAnnotationRegistries (index, state, entryMethods, giveUp = null) 
     }
     if (!idiom) continue // not this shape; the interpreter shapes own the site
 
+    // This reader accounts for the entry that supplies the registry version,
+    // including its own diagnostics when the reflective shape is incomplete.
+    state.registrarMethods?.add(`${siteClass}.${entryMethod.method}${entryMethod.desc}`)
     const site = `${siteClass}.${idiom.method.method}`
 
     // 2a. annotation type: the last ldc class constant before getAnnotation

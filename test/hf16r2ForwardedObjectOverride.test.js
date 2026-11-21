@@ -1,15 +1,7 @@
 'use strict'
-// HF16-R2 rider: a generic functional interface (kotlin Function1.invoke) with
-// MORE than 12 scanned implementors is narrowed to the overrides that CARRY the
-// registrar. An override that forwards its Object argument into another class
-// (Helper.reg(Object) doing the checkcast) never names the registrar type in
-// its own bytes. Pre-rider it was dropped with a debug line only: a sibling
-// carrying override still registered, so the entry-level "never reaches"
-// abstain stayed silent and the forwarded override's channels vanished.
-// Rider: (a) the carrying test is widened ONE hop — an Object argument passed
-// to a method whose declaring class names the registrar is followed; (b) any
-// site that drops overrides while walking others abstains with the dropped
-// count named — never silently.
+// A generic Function1 with many overrides. A statically unknown field can
+// hold any implementation. An allocated receiver can forward its Object
+// argument through one or more relays to the registrar checkcast.
 const assert = require('assert')
 const fs = require('fs')
 const os = require('os')
@@ -49,7 +41,7 @@ function packets (P, ids) { // static TYPE per packet, built in <clinit> from a 
 // registers `pkt` on the registrar already on the stack
 const register = (a, P, pkt) => a.getstatic(pkt, 'TYPE', `L${TYPE};`).aconstNull().aconstNull().invokevirtual(REG, 'playToServer', REG_DESC).pop()
 
-function jar (P, { hops }) {
+function jar (P, { hops, allocated = false }) {
   const net = `${P}/Net`
   const entries = [{ name: 'META-INF/neoforge.mods.toml', data: Buffer.from('[[mods]]\nmodId="synthfo"\nversion="2.0.0"\n') }]
   // the entry: event.registrar("3") handed to a Function1 held in a static field
@@ -60,7 +52,18 @@ function jar (P, { hops }) {
       fields: [{ name: 'fn', desc: `L${F1};`, flags: 0x000a }],
       methods: [
         { name: '<init>', desc: '()V', flags: 0x0002, code: (a) => objInit(a) },
-        { name: 'onRegister', desc: `(L${EVENT};)V`, flags: 0x0019, code: (a) => a.aload(0).ldcStr('3').invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`).astore(1).getstatic(net, 'fn', `L${F1};`).aload(1).invokeinterface(F1, 'invoke', OO, 2).pop().ret() }
+        {
+          name: 'onRegister', desc: `(L${EVENT};)V`, flags: 0x0019,
+          code (a) {
+            a.aload(0).ldcStr('3').invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`).astore(1)
+            if (allocated) {
+              for (const cls of [`${P}/Fwd`, `${P}/Carrier`]) {
+                a.new_(cls).dup().invokespecial(cls, '<init>', '()V').aload(1).invokeinterface(F1, 'invoke', OO, 2).pop()
+              }
+            } else a.getstatic(net, 'fn', `L${F1};`).aload(1).invokeinterface(F1, 'invoke', OO, 2).pop()
+            a.ret()
+          }
+        }
       ]
     })
   })
@@ -126,21 +129,18 @@ function jar (P, { hops }) {
 }
 
 const claims = (r) => r.components.play.map((c) => c.id).sort()
-const dropAbstains = (r) => r.diagnostics.abstains.filter((s) => s.includes(`${F1}.invoke${OO}`) && /dropped/.test(s))
 
-describe('HF16-R2 rider: forwarded-as-Object registrar overrides under the >12 bound', function () {
-  it('one hop: the override forwarding its Object argument to a class that names the registrar is followed — both siblings claim; the 13 noise overrides are dropped with their count named', () => {
-    const r = deriveNeoForgeComponents([jar('synth/fo1', { hops: 0 })])
-    assert.deepStrictEqual(claims(r), ['synthfo:one', 'synthfo:two'])
-    const d = dropAbstains(r)
-    assert.strictEqual(d.length, 1, JSON.stringify(r.diagnostics.abstains))
-    assert.ok(/\b13\b/.test(d[0]) && d[0].includes('synth/fo1'), d[0])
-  })
-  it('two hops: the forwarding override is beyond the one-hop widening — its channel is NOT silently lost: the drop abstain names 14 dropped at the site, the carrying sibling still claims', () => {
-    const r = deriveNeoForgeComponents([jar('synth/fo2', { hops: 1 })])
-    assert.deepStrictEqual(claims(r), ['synthfo:two'])
-    const d = dropAbstains(r)
-    assert.strictEqual(d.length, 1, JSON.stringify(r.diagnostics.abstains))
-    assert.ok(/\b14\b/.test(d[0]), d[0])
-  })
+describe('HF16-R2 forwarded-as-Object registrar overrides', function () {
+  for (const hops of [0, 1]) {
+    it(`an unknown receiver among 15 alternatives remains unread with ${hops} extra relays`, () => {
+      const r = deriveNeoForgeComponents([jar('synth/fo', { hops })])
+      assert.deepStrictEqual(claims(r), [])
+      assert.ok(r.diagnostics.unresolvedSites.some(s => s.kind === 'unseen' && s.site === `synth/fo/Net.onRegister(L${EVENT};)V@3`), JSON.stringify(r.diagnostics.unresolvedSites))
+    })
+    it(`two allocated receivers both register through ${hops} extra relays`, () => {
+      const r = deriveNeoForgeComponents([jar('synth/fo', { hops, allocated: true })])
+      assert.deepStrictEqual(claims(r), ['synthfo:one', 'synthfo:two'])
+      assert.deepStrictEqual(r.diagnostics.unresolvedSites || [], [])
+    })
+  }
 })

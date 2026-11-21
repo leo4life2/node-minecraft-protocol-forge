@@ -134,6 +134,7 @@ function registrarMethodTable (index, cls, h) {
       }
       if (op !== 0x2b) argLoaded = argLoaded && (op === 0xb6 || op === 0xb9) ? false : argLoaded
     })
+    if (regMethod && optional && argType) h.recordOptionalWrapper?.(info, m)
     if (regMethod) table[`${m.method}${m.desc}`] = { regMethod, optional, versioned, argType }
   }
   return table
@@ -194,11 +195,12 @@ function reslocOfTypeField (index, state, owner, field, h) {
 function derivePlatformHelperRegistrations (index, state, h) {
   const rows = []
   const abstains = []
+  const resolvedInputs = new Set()
   const resolvedClasses = new Set()
   state.platformHelperCache = state.platformHelperCache || new Map()
   state.platformHelperFieldIds = state.platformHelperFieldIds || new Map()
   for (const pattern of PATTERNS.patterns || []) {
-    if (pattern.shape === 'list-provider') { deriveListProviderRows(index, state, pattern, h, rows, abstains, resolvedClasses); continue }
+    if (pattern.shape === 'list-provider') { deriveListProviderRows(index, state, pattern, h, rows, abstains, resolvedClasses, resolvedInputs); continue }
     if (pattern.shape === 'builder-counter') { deriveBuilderCounterRows(index, state, pattern, h, rows, abstains, resolvedClasses); continue }
     if (pattern.shape !== 'consumer-registrar' || typeof pattern.entryDesc !== 'string') continue
     const descBytes = Buffer.from(pattern.entryDesc)
@@ -251,6 +253,7 @@ function derivePlatformHelperRegistrations (index, state, h) {
             const id = reslocOfTypeField(index, state, field.owner, field.name, h)
             if (!id) { abstains.push(`${site}: ${call.name} with unresolved payload type id (${field.owner}.${field.name}) — unclaimed`); return }
             const spec = h.registrationMethods[entry.regMethod]
+            state.registrarMethods?.add(`${helper.registrarClass}.${call.name}${call.desc}`)
             rows.push({
               id,
               version,
@@ -267,7 +270,7 @@ function derivePlatformHelperRegistrations (index, state, h) {
       }
     }
   }
-  return { rows, abstains, resolvedClasses }
+  return { rows, abstains, resolvedClasses, resolvedInputs }
 }
 
 // HF127 R1 - THE LIST-PROVIDER LOOP (pattern row shape 'list-provider'):
@@ -323,7 +326,7 @@ function staticListElementsOf (index, state, owner, name, desc, h) {
   return out
 }
 
-function deriveListProviderRows (index, state, pattern, h, rows, abstains, resolvedClasses) {
+function deriveListProviderRows (index, state, pattern, h, rows, abstains, resolvedClasses, resolvedInputs) {
   if (pattern.idRule !== 'list-provider' || pattern.versionRule !== 'registrar-string-constant' || typeof pattern.providerDesc !== 'string') return
   const providerBytes = Buffer.from(pattern.providerDesc)
   for (const cls of h.seedNames()) {
@@ -361,14 +364,15 @@ function deriveListProviderRows (index, state, pattern, h, rows, abstains, resol
         } else if (ref.owner === ITERATOR_TYPE && ref.name === 'next') {
           element = looping
         } else if (ref.owner === TYPE_AND_CODEC && ref.name === 'type') {
-          typed = element
+          typed = element && { provider: element, typeSite: `${site}${m.desc}@${pc}` }
         } else if (ref.owner === REGISTRAR_TYPE && h.registrationMethods[ref.name] && ref.desc.startsWith(`(L${PAYLOAD_TYPE};`)) {
-          if (typed) regs.push({ provider: typed, regMethod: ref.name })
+          if (typed) regs.push({ ...typed, regMethod: ref.name })
           typed = null
         }
         lastStr = null
       })
       if (regs.length === 0) continue
+      state.registrarMethods?.add(site + m.desc)
       const version = (!versionUnknown && versions.size === 1) ? [...versions][0] : null
       let complete = true
       for (const reg of regs) {
@@ -376,6 +380,7 @@ function deriveListProviderRows (index, state, pattern, h, rows, abstains, resol
         if (version === null) { abstains.push(`${site}: list-provider loop over ${via} without one constant registrar version — unclaimed`); complete = false; continue }
         const elements = staticListElementsOf(index, state, reg.provider.owner, reg.provider.name, reg.provider.desc, h)
         if (!elements) { abstains.push(`${site}: list-provider loop over ${via} whose list the bytes do not prove static — unclaimed`); complete = false; continue }
+        resolvedInputs.add(reg.typeSite) // this accessor reads exactly the elements of the static list
         const spec = h.registrationMethods[reg.regMethod]
         for (const f of elements) {
           const id = reslocOfTypeField(index, state, f.owner, f.name, h)
@@ -508,20 +513,23 @@ function resolveBuilderCounterShape (index, state, builderType, h) {
   }
   if (subs.length !== 1) return null
   const sub = subs[0]
-  let languageKeyRegistrar = false; let optionalGuarded = false; let optionalBare = false
+  const registrarMethods = new Set()
+  let optionalGuarded = false; let optionalBare = false
   const regMethods = new Set()
   for (const m of sub.codes) {
     if (!m.code) continue
     const ev = invokesOf(sub, m, h)
     for (let i = 0; i < ev.length; i++) {
       const e = ev[i]
-      if (e.op === 0xb6 && e.ref.owner === EVENT_TYPE && e.ref.name === 'registrar' && ev[i - 1] && ev[i - 1].ref && ev[i - 1].ref.owner === RESLOC_TYPE && ev[i - 1].ref.name === 'toLanguageKey' && ev[i - 2] && ev[i - 2].op === 0xb4 && ev[i - 2].ref.name === channelField) languageKeyRegistrar = true
+      if (e.op === 0xb6 && e.ref.owner === EVENT_TYPE && e.ref.name === 'registrar' && ev[i - 1] && ev[i - 1].ref && ev[i - 1].ref.owner === RESLOC_TYPE && ev[i - 1].ref.name === 'toLanguageKey' && ev[i - 2] && ev[i - 2].op === 0xb4 && ev[i - 2].ref.name === channelField) {
+        registrarMethods.add(`${sub.className}.${m.method}${m.desc}`)
+      }
       if (e.op === 0xb6 && e.ref.owner === REGISTRAR_TYPE && e.ref.name === 'optional') { if (optionalField && ev.slice(0, i).some((x) => x.op === 0xb4 && x.ref.name === optionalField)) optionalGuarded = true; else optionalBare = true }
       if ((e.op === 0xb6 || e.op === 0xb9) && e.ref.owner === REGISTRAR_TYPE && h.registrationMethods[e.ref.name] && e.ref.desc.startsWith(`(L${PAYLOAD_TYPE};`)) regMethods.add(e.ref.name)
     }
   }
-  if (!languageKeyRegistrar || optionalBare || regMethods.size !== 1) return null
-  const shape = { builderType, impl: impl.className, sub: sub.className, channelPath, order, recipe, optionalMethod: optionalGuarded ? optionalMethod : null, regMethod: [...regMethods][0], feeds: (name, desc) => feeds(builderType, name, desc, 0) }
+  if (registrarMethods.size === 0 || optionalBare || regMethods.size !== 1) return null
+  const shape = { builderType, registrarMethods, impl: impl.className, sub: sub.className, channelPath, order, recipe, optionalMethod: optionalGuarded ? optionalMethod : null, regMethod: [...regMethods][0], feeds: (name, desc) => feeds(builderType, name, desc, 0) }
   state.platformHelperCache.set(key, shape)
   return shape
 }
@@ -567,7 +575,11 @@ function deriveBuilderCounterRows (index, state, pattern, h, rows, abstains, res
         if (!complete) { abstains.push(`${site}: numbered-id builder ${shape.impl.split('/').pop()} whose id recipe did not fold - unclaimed`); continue }
         const spec = h.registrationMethods[shape.regMethod]
         for (const id of ids) rows.push({ id, version: `${modId}.${shape.channelPath}`, flow: spec.flow, optional, protocols: spec.protocols, source: `${pattern.sourceWord} ${shape.impl} via ${site} (${shape.regMethod}; numbered in the helper's freeze order; version from the channel's language key)`, jar: info.jar })
-        if (ids.length > 0) { resolvedClasses.add(shape.impl); resolvedClasses.add(shape.sub) }
+        if (ids.length > 0) {
+          resolvedClasses.add(shape.impl)
+          resolvedClasses.add(shape.sub)
+          for (const method of shape.registrarMethods) state.registrarMethods?.add(method)
+        }
       }
     }
   }

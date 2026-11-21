@@ -22,6 +22,8 @@ const os = require('os')
 const path = require('path')
 const D = require('../src/client/neoForgePayloadDerivation')
 const J = require('./helpers/hf175Jars')
+const { dispatchJar, registrationSignJar } = require('./helpers/hf175Dispatch')
+const { buildClass, buildJar } = require('./helpers/synthJar')
 
 const GOLDEN = JSON.parse(fs.readFileSync(path.join(__dirname, 'fixtures', 'hf175', 'base-golden.json'), 'utf8'))
 const JARS = {
@@ -163,12 +165,239 @@ describe('HF175: the word of a reading, its remaining places', function () {
     })
   })
 
+  describe('registrar call coverage', () => {
+    const entry = 'fixture/Entry'
+    const event = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
+    const registrar = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
+    const type = 'net/minecraft/network/protocol/common/custom/CustomPacketPayload$Type'
+    const id = 'net/minecraft/resources/Identifier'
+    const bus = 'net/neoforged/bus/api/IEventBus'
+    const consumer = 'Ljava/util/function/Consumer;'
+    const listener = '(L' + event + ';)V'
+    const array = '([Ljava/lang/Object;)V'
+
+    function inspect (shape) {
+      const asks = []
+      function ask (a, method) {
+        a.ldcStr('7')
+        asks.push(entry + '.' + method + '@' + a.bytes.length)
+        a.invokevirtual(event, 'registrar', '(Ljava/lang/String;)L' + registrar + ';')
+      }
+      function forward (a, owner) {
+        const object = a.cp.cls('java/lang/Object')
+        a.iconst(1).raw([0xbd, object >> 8, object & 255]).dup().iconst(0).aload(1).raw([0x53])
+          .invokestatic(owner, 'forward', array)
+      }
+      const methods = [
+        {
+          name: '<init>',
+          desc: '(L' + bus + ';)V',
+          flags: 1,
+          code (a) {
+            a.aload(0).invokespecial('java/lang/Object', '<init>', '()V').aload(1)
+              .invokedynamic(0, 'accept', '()' + consumer).invokeinterface(bus, 'addListener', '(' + consumer + ')V', 2).ret()
+          }
+        },
+        {
+          name: 'onPayloads',
+          desc: listener,
+          flags: 9,
+          code (a) {
+            ask(a.aload(0), 'onPayloads' + listener)
+            a.astore(1)
+            forward(a, entry)
+            if (shape === 'second call') {
+              ask(a.aload(0), 'onPayloads' + listener)
+              a.astore(1)
+            }
+            if (shape === 'missing constructor') {
+              a.new_('fixture/Missing').dup().aload(1).invokespecial('fixture/Missing', '<init>', '(L' + registrar + ';)V').pop()
+            }
+            if (shape === 'lost helper' || shape === 'second call') forward(a, 'fixture/Missing')
+            a.ret()
+          }
+        },
+        {
+          name: 'forward',
+          desc: array,
+          flags: 9,
+          code (a) {
+            a.aload(0).iconst(0).aaload().checkcast(registrar).new_(type).dup().ldcStr('fixture').ldcStr('covered')
+              .invokestatic(id, 'fromNamespaceAndPath', '(Ljava/lang/String;Ljava/lang/String;)L' + id + ';')
+              .invokespecial(type, '<init>', '(L' + id + ';)V').aconstNull().aconstNull()
+              .invokevirtual(registrar, 'playToClient', '(L' + type + ';Ljava/lang/Object;Ljava/lang/Object;)L' + registrar + ';').pop().ret()
+          }
+        }
+      ]
+      if (shape === 'unvisited') {
+        const desc = '(Ljava/lang/Object;)V'
+        methods.push({
+          name: 'other',
+          desc,
+          flags: 9,
+          code (a) {
+            ask(a.aload(0).checkcast(event), 'other' + desc)
+            a.astore(1)
+            forward(a, entry)
+            a.ret()
+          }
+        })
+      }
+      const data = buildClass({
+        name: entry,
+        methods,
+        annotations: [{ type: 'Lnet/neoforged/fml/common/Mod;', elements: [{ name: 'value', string: 'fixture' }] }],
+        bootstrapMethods: [{ owner: entry, name: 'onPayloads', desc: listener }]
+      })
+      const jar = path.join(dir, 'hand-off.jar')
+      fs.writeFileSync(jar, buildJar([
+        { name: 'META-INF/neoforge.mods.toml', data: Buffer.from('[[mods]]\nmodId="fixture"\nversion="1"\n') },
+        { name: entry + '.class', data }
+      ]))
+      const { diagnostics, components } = D.deriveNeoForgeComponents([jar])
+      assert.deepStrictEqual(diagnostics.errors, [])
+      assert.deepStrictEqual(components.play.map(c => [c.id, c.version, c.flow, c.optional]), [['fixture:covered', '7', 'clientbound', false]])
+      return { asks, sites: (diagnostics.unresolvedSites || []).map(s => [s.kind, s.site, s.wordOnly]) }
+    }
+
+    it('a registrar forwarded in an array to a recorded registration leaves the reading complete', () => {
+      assert.deepStrictEqual(inspect('covered').sites, [])
+    })
+    it('an unvisited registrar call in the same class keeps the reading partial and names its instruction', () => {
+      const { asks, sites } = inspect('unvisited')
+      assert.deepStrictEqual(sites, [['unseen', asks[1], true]])
+    })
+    it('a second registrar call in the same listener has its own bytecode offset and needs its own registration', () => {
+      const { asks, sites } = inspect('second call')
+      assert.deepStrictEqual(sites, [['unseen', asks[1], true]])
+    })
+    it('a missing constructor that receives the same registrar keeps its call unread', () => {
+      const { asks, sites } = inspect('missing constructor')
+      assert.deepStrictEqual(sites, [['unseen', asks[0], true]])
+    })
+    it('a registrar sent to a missing helper keeps the reading partial even when its other hand-off registered', () => {
+      const { asks, sites } = inspect('lost helper')
+      assert.deepStrictEqual(sites, [['unseen', asks[0], true]])
+    })
+  })
+
+  describe('registration signs', () => {
+    function probe (shape) {
+      const file = path.join(dir, 'sign.jar')
+      fs.writeFileSync(file, registrationSignJar(shape))
+      const { components, diagnostics } = D.deriveNeoForgeComponentsPerJar([file])
+      const signs = [...(diagnostics.unresolvedSites || []), ...(diagnostics.inputSigns || [])]
+      return { claims: components.play.map(c => [c.id, c.version]), signs, diagnostics }
+    }
+
+    for (const [shape, reason] of [['catch', 'exception handler'], ['catch local', 'exception handler'],
+      ['guarded registration', 'undecided branch'], ['switched registration', 'undecided switch'], ['branch', 'undecided branch'], ['switch', 'undecided switch'],
+      ['call registrar', 'unresolved result'], ['call id', 'unresolved result'], ['call version', 'unresolved result'], ['erased call', 'unresolved result'], ['bad text', 'invalid modified UTF-8']]) {
+      it(`reports ${shape} at the affected input or instruction`, () => {
+        const { claims, signs } = probe(shape)
+        assert.ok(signs.some(s => s.reason?.startsWith(reason) && /@\d+$/.test(s.site)), JSON.stringify(signs))
+        assert.deepStrictEqual(claims, shape === 'bad text' ? [] : [['fixture:base', '1']])
+      })
+    }
+    for (const [shape, version] of [['unrelated catch', '1'], ['unused call', '1'], ['decided', 'A'], ['text', '1😀']]) {
+      it(`reads ${shape} completely with its exact tuples`, () => {
+        const { claims, signs } = probe(shape)
+        assert.deepStrictEqual(signs, [])
+        assert.deepStrictEqual(claims, [['fixture:base', '1'], ['fixture:late', version]])
+      })
+    }
+    it('records the nested jar whose class entry could not be decompressed', () => {
+      const name = 'lost/Setup.class'
+      const inner = buildJar([{ name, data: buildClass({ name: 'lost/Setup', methods: [] }) }])
+      const central = inner.indexOf(Buffer.from('504b0102', 'hex'))
+      inner.writeUInt16LE(99, central + 10)
+      const outer = path.join(dir, 'compressed.jar')
+      fs.writeFileSync(outer, buildJar([{ name: 'META-INF/jarjar/inner.jar', data: inner }]))
+      const { diagnostics } = D.deriveNeoForgeComponentsPerJar([outer])
+      assert.deepStrictEqual(diagnostics.unresolvedSites.map(s => [s.jar, s.site, s.reason]), [
+        ['compressed.jar!inner.jar', name, 'unreadable class entry']
+      ])
+      assert.strictEqual(diagnostics.jarsRead, 0)
+    })
+    it('names the first nested jar beyond the read limit', () => {
+      let data = registrationSignJar('unused call')
+      for (let i = 0; i < 4; i++) data = buildJar([{ name: 'META-INF/jarjar/inner.jar', data }])
+      const file = path.join(dir, 'outer.jar')
+      fs.writeFileSync(file, data)
+      const { diagnostics } = D.deriveNeoForgeComponentsPerJar([file])
+      const skipped = (diagnostics.unresolvedSites || []).filter(s => s.reason === 'nested jar below depth limit')
+      assert.deepStrictEqual(skipped.map(s => s.jar), ['outer.jar' + '!inner.jar'.repeat(4)])
+      assert.strictEqual(diagnostics.jarsRead, 0)
+    })
+  })
+
+  // Optional public fixture corpus. Each digest pins all phase/id/flow/version/
+  // optional tuples plus the listen-only list from the verified round-two read.
+  const fixtureRoot = process.env.MINEPAL_PACK_READER_FIXTURES
+  const publicCase = fixtureRoot ? it : it.skip
+  for (const [rig, jar, count, hash] of [
+    ['hf16r', null, 40, '055838802ad221910f534a1b7736fc30446b74478a2b7b0e8d718790f19a3478'],
+    ['hf16r', 'epic-fight-21.17.3.1-mc1.21.1-neoforge.jar', 40, '055838802ad221910f534a1b7736fc30446b74478a2b7b0e8d718790f19a3478'],
+    ['hf16r', 'invincible-21.15.8.2-mc1.21.1-neoforge.jar', 0, '643d5437104296e21d906ecb15b2c96ad278f20cfc4af53b12bb6069bd853726'],
+    ['neo263m', null, 13, 'ec7fa56b305c197295cef7fbab22f9eacbd2701ffa35236d0b8d93ded5d419fb'],
+    ['neo263m', 'Jade-mc26.3-NeoForge-26.3.5.jar', 6, 'ce713d6642ffbfe26ae609f3e48997ffc876c19c687c94182d7325a3493b6453'],
+    ['neo263m', 'appleskin-neoforge-mc26.3-3.0.10.jar', 3, '23bcb80e230f6cce5dac6d3ac87e435e4b96755ec2bce0531a3fcb3f69c001c3'],
+    ['neo263m', 'carryon-neoforge-26.3-2.12.2.jar', 4, '9ff35084a033cbedd991a93a27842d33f9f79c88b00367216928b5eb9a53fc3e']
+  ]) {
+    publicCase(`keeps the complete reading and every claim of ${jar || rig}`, () => {
+      const mods = path.join(fixtureRoot, rig, 'mods')
+      const names = jar ? [jar] : fs.readdirSync(mods).filter(n => n.endsWith('.jar')).sort()
+      const { components, diagnostics, listenOnly } = D.deriveNeoForgeComponentsPerJar(names.map(n => path.join(mods, n)))
+      assert.deepStrictEqual(diagnostics.errors, [])
+      assert.deepStrictEqual(diagnostics.unresolvedSites || [], [])
+      assert.deepStrictEqual(diagnostics.inputSigns || [], [])
+      const tuples = Object.entries(components).flatMap(([phase, values]) => values.map(c => [phase, c.id, c.flow, c.version, c.optional]))
+      tuples.sort((a, b) => JSON.stringify(a) < JSON.stringify(b) ? -1 : 1)
+      assert.strictEqual(tuples.length, count)
+      const wireFacts = JSON.stringify([tuples, [...listenOnly].sort()])
+      assert.strictEqual(require('crypto').createHash('sha256').update(wireFacts).digest('hex'), hash)
+    })
+  }
+
+  describe('registrar dispatch proof', () => {
+    function check (shape, claims, unresolved) {
+      const { jar, sites } = dispatchJar(shape)
+      const file = path.join(dir, 'dispatch.jar')
+      fs.writeFileSync(file, jar)
+      const { components, diagnostics } = D.deriveNeoForgeComponentsPerJar([file])
+      assert.deepStrictEqual(diagnostics.errors, [])
+      const remaining = diagnostics.unresolvedSites || []
+      assert.deepStrictEqual(remaining.map(r => [r.kind, r.site]), unresolved ? [[unresolved === 'id' ? 'registration' : 'unseen', sites[unresolved]]] : [])
+      assert.deepStrictEqual(components.play.map(c => [c.id, c.version, c.flow, c.optional]).sort(),
+        claims.map(([id, version = '1']) => ['fixture:' + id, version, 'clientbound', false]).sort())
+    }
+
+    it('an unknown receiver cannot dispatch to the interface default', () => check('unknown override', [['base']], '1'))
+    it('one present service provider cannot satisfy two listed providers', () => check('missing provider', [['base']], '1'))
+    it('findFirst still needs every listed provider to be present', () => check('first only', [['base']], '1'))
+    it('alternative implementations add no unconditional claim', () => check('abstract alternatives', [['base']], '1'))
+    it('registrations in exclusive branch arms stay unclaimed', () => check('branch calls', [['base']], '1'))
+    it('a receiver selected by an unknown branch stays undecided at the join', () => check('branch receiver', [['base']], '1'))
+    it('a branch before the registrar ask cannot choose its later receiver', () => check('earlier receiver', [['base']], '1'))
+    it('two present service providers leave the receiver undecided', () => check('two providers', [['base']], '1'))
+    it('one listed and present service provider covers the call', () => check('one provider', [['base'], ['first']]))
+    it('an allocated receiver uses only its own override', () => check('known receiver', [['second'], ['extra']]))
+    it('a service declaration cannot bind an unrelated receiver', () => check('unrelated service', [['base']], '1'))
+    it('a factory return type with a subclass cannot prove the receiver', () => check('factory bound', [['base']], '1'))
+    it('an allocated receiver inherits the most specific interface default', () => check('specific default', [['child']]))
+    it('a reassigned registrar field uses the new version', () => check('field', [['first'], ['second', '2']]))
+    it('a captured registrar escaping the reader leaves its ask unread', () => check('capture', [['base']], '1'))
+    it('only the second of two asks is unread', () => check('second ask', [['base']], '2'))
+    it('a runtime ID names the registration instruction in the callee', () => check('runtime id', [['base']], 'id'))
+    it('a direct registration still covers its ask', () => check('plain', [['base']]))
+  })
+
   describe('K2 nothing of a registration was seen', () => {
     it('S1 the registrar never reaches a registration: its sentence as before and ONE row of its jar (kind unseen, the entry)', () => {
       const r = read('k-silent.jar')
       assert.deepStrictEqual(r.diagnostics.abstains, GOLDEN['k-silent.jar'].abstains, 'the sentence is the one of before')
       assert.deepStrictEqual(rows(r), [['unseen', 'k-silent.jar', null, null, null, null, null]])
-      assert.strictEqual(r.diagnostics.unresolvedSites[0].site, `${J.INIT}.onRegister`)
+      assert.strictEqual(r.diagnostics.unresolvedSites[0].site, `${J.INIT}.onRegister(Lnet/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent;)V@3`)
       assert.strictEqual(r.diagnostics.unresolvedSites[0].says, r.diagnostics.abstains[0])
     })
     it('S1t the twin, the registrar reaches its registration and the id and the version are constants: claimed, no row', () => {
@@ -179,7 +408,7 @@ describe('HF175: the word of a reading, its remaining places', function () {
     it('J1 a jar whose class asks the event for a registrar in a method that does not take the event (no entry leads to it): the reading held nothing of it; now ONE row of the jar (kind unseen, the class)', () => {
       const r = read('k-late.jar')
       assert.deepStrictEqual(rows(r), [['unseen', 'k-late.jar', null, null, null, null, null]])
-      assert.strictEqual(r.diagnostics.unresolvedSites[0].site, J.LATE)
+      assert.strictEqual(r.diagnostics.unresolvedSites[0].site, J.LATE + '.accept(Ljava/lang/Object;)V@6')
       assert.strictEqual(r.diagnostics.abstains.length, 1)
       everyRowNamesItsSentence(r)
     })
@@ -337,7 +566,7 @@ describe('HF175: the word of a reading, its remaining places', function () {
       const r = read('k-thrown-early.jar')
       assert.deepStrictEqual(r.components.play, [])
       assert.strictEqual(r.diagnostics.errors.filter((e) => /^deep walk of .*onRegister failed/.test(e)).length, 1, JSON.stringify(r.diagnostics.errors))
-      assert.deepStrictEqual(r.diagnostics.unresolvedSites.map((s) => [s.kind, s.jar, s.site, s.wordOnly === true]), [['unseen', 'k-thrown-early.jar', `${J.INIT}.onRegister`, true]])
+      assert.deepStrictEqual(r.diagnostics.unresolvedSites.map((s) => [s.kind, s.jar, s.site, s.wordOnly === true]), [['unseen', 'k-thrown-early.jar', `${J.INIT}.onRegister(Lnet/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent;)V@3`, true]])
       assert.strictEqual(sentences(r, /never reaches a registration/), 1)
       assert.strictEqual(r.diagnostics.unresolvedSites[0].says, r.diagnostics.abstains[0])
     })

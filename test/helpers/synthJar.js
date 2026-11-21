@@ -251,8 +251,10 @@ function buildClass (spec) {
 
   const methods = spec.methods.map((m) => {
     const asm = new Asm(cp)
-    m.code(asm)
-    const row = { nameIdx: cp.utf8(m.name), descIdx: cp.utf8(m.desc), flags: m.flags != null ? m.flags : 0x0009, body: asm.code() }
+    if (m.code) m.code(asm)
+    else if (!(m.flags & 0x0400)) throw new Error('a concrete fixture method needs a body: ' + m.name)
+    const row = { nameIdx: cp.utf8(m.name), descIdx: cp.utf8(m.desc), flags: m.flags != null ? m.flags : 0x0009, body: m.code ? asm.code() : null }
+    row.handlers = (m.handlers || []).map(h => [h.start, h.end, h.target, h.type ? cp.cls(h.type) : 0])
     // HF172: a method's own RuntimeVisibleAnnotations (an injector on a mixin's handler)
     if (m.annotations && m.annotations.length > 0) { row.annoName = cp.utf8('RuntimeVisibleAnnotations'); row.anno = annotationsBody(cp, m.annotations) }
     return row
@@ -267,7 +269,7 @@ function buildClass (spec) {
   parts.push(head, ...cp.entries)
 
   const mid = Buffer.alloc(8)
-  mid.writeUInt16BE(0x21, 0)
+  mid.writeUInt16BE(spec.flags ?? 0x21, 0)
   mid.writeUInt16BE(thisIdx, 2)
   mid.writeUInt16BE(superIdx, 4)
   mid.writeUInt16BE(ifaceIdxs.length, 6)
@@ -305,8 +307,12 @@ function buildClass (spec) {
     mh.writeUInt16BE(m.flags, 0)
     mh.writeUInt16BE(m.nameIdx, 2)
     mh.writeUInt16BE(m.descIdx, 4)
+    if (!m.body) { // abstract interface declaration has no Code attribute
+      parts.push(mh)
+      continue
+    }
     mh.writeUInt16BE(m.anno ? 2 : 1, 6) // attributes: Code, and the method's annotations when it has any
-    const codeLen = 12 + m.body.length
+    const codeLen = 12 + m.body.length + 8 * m.handlers.length
     const ah = Buffer.alloc(6)
     ah.writeUInt16BE(codeAttr, 0)
     ah.writeUInt32BE(codeLen, 2)
@@ -314,7 +320,7 @@ function buildClass (spec) {
     cb.writeUInt16BE(8, 0) // max_stack
     cb.writeUInt16BE(8, 2) // max_locals
     cb.writeUInt32BE(m.body.length, 4)
-    const tail = Buffer.alloc(4) // exception_table_length=0, attributes_count=0
+    const tail = Buffer.concat([u16(m.handlers.length), ...m.handlers.flat().map(u16), u16(0)])
     parts.push(mh, ah, cb, m.body, tail)
     if (m.anno) {
       const h = Buffer.alloc(6)

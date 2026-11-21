@@ -45,7 +45,7 @@
 // READ-ONLY, JARS-ONLY: requires only crypto and the jar primitives.
 
 const crypto = require('crypto')
-const { zipEntryData, parseClassFile } = require('./jarAnalysis')
+const { zipEntryData } = require('./jarAnalysis')
 
 const WINDOW_HASH = 0x9E3779B1
 const ORD_SPAN = 2097152 // 2^21 class ordinals per hash in a packed pair
@@ -159,7 +159,7 @@ function installClassFacts (index) {
     if (index.parsedPeek && index.parsedPeek(name) !== undefined) return index.parsedPeek(name)
     const r = raw.get(name)
     if (!r) return null
-    try { return parseClassFile(bytesOf(r)) } catch { return null }
+    return index.parseEntry(name, r)
   }
 
   let ordinals = null

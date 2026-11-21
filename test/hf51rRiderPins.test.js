@@ -3,10 +3,8 @@
 // names; builders in helpers/hf51rJars.js):
 //   MED-1 the mods.toml fallback receipt is TRUE: an unfoldable registrar(x)
 //         argument is "registrar argument unresolved", never "unversioned"
-//   MED-2 instanceof over a chain the index cannot finish (an element whose
-//         base is a library class the jar does not carry) is UNKNOWN, not a
-//         decided "no" — the guarded registration is derived, never skipped
-//         silently (both the if-body and the guard-continue forms)
+//   MED-2 an incomplete superclass chain leaves instanceof undecided.
+//         The registrar site reports the unresolved guard in both forms.
 //   MED-3 a keyed store filled by put() counts and iterates its ENTRIES — an
 //         upsert under one key is one element for size()/values()
 //   LOW   a helper's own conditional never makes the caller's later
@@ -37,22 +35,19 @@ describe('HF51-rider — MED-1: the mods.toml fallback receipt names the unresol
   })
 })
 
-describe('HF51-rider — MED-2: instanceof over an unindexed base is UNKNOWN, the guarded registration is derived', function () {
+describe('HF51-rider — MED-2: instanceof over an unindexed base leaves the registration undecided', function () {
   it('control: the deep walk itself derives the element (no instanceof test)', () => {
     const { play, abstains } = derive(J.instanceofUnindexedBaseJar, 'plain')
     assert.ok(play['inst:chan'], abstains.join(' | '))
   })
-  it('`if (e instanceof IReg) register(e)` with e extending a base the jar does not carry: derived, not skipped', () => {
-    const { play, abstains } = derive(J.instanceofUnindexedBaseJar, 'body')
-    assert.ok(play['inst:chan'], 'RED on the lane commit — decided 0 skipped the body: ' + abstains.join(' | '))
-    assert.strictEqual(play['inst:chan'].version, '1')
-    assert.ok(!abstains.some((a) => /unresolved payload type id/.test(a)), abstains.join(' | '))
-  })
-  it('`if (!(e instanceof IReg)) continue; register(e)` (the guard form): the walk keeps the productive arm', () => {
-    const { play, abstains } = derive(J.instanceofUnindexedBaseJar, 'guard')
-    assert.ok(play['inst:chan'], 'RED on the lane commit — the guard `continue` was taken: ' + abstains.join(' | '))
-    assert.ok(!abstains.some((a) => /unresolved payload type id/.test(a)), abstains.join(' | '))
-  })
+  for (const form of ['body', 'guard']) {
+    it(`an unknown instanceof test withholds the conditional registration (${form})`, () => {
+      const { r, play } = derive(J.instanceofUnindexedBaseJar, form)
+      assert.deepStrictEqual(Object.keys(play), [])
+      const sites = r.diagnostics.unresolvedSites || []
+      assert.ok(sites.some(s => s.kind === 'unseen' && /on(Body|Guard)\(.*\)V@\d+$/.test(s.site)), JSON.stringify(sites))
+    })
+  }
 })
 
 describe('HF51-rider — MED-3: a keyed store counts its entries', function () {

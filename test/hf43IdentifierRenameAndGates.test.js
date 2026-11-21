@@ -268,13 +268,8 @@ describe('HF130 R2 — the handler-select ternary is not a gate', function () {
     assert.ok(ids(deriveNeoForgeComponents([ELYTRA, PRESENCE_STUB])).includes(BOOST))
   })
 
-  // HF130 r2 (verify r1 HIGH): the arm a goto jumps over is WALKED, never
-  // skipped - a dist test whose two arms each register through a static
-  // helper (`if (dist == CLIENT) ClientSide.reg(r) else ServerSide.reg(r)`)
-  // claims both helpers' messages, as the base did; round 1 skipped the else
-  // arm because it held no DIRECT registrar call and dropped the server
-  // message with no abstain. The registration after the join still reads its
-  // receiver and arguments at the right slots (the stack is reconciled).
+  // An undecided distribution withholds both side-specific registrations.
+  // Two distinct, proven dispatches through the same branch exercise both.
   it('both arms of a dist test register through helpers: both messages are claimed, the registration after the join too, nothing abstains', () => {
     const EVENT = 'net/neoforged/neoforge/network/event/RegisterPayloadHandlersEvent'
     const REG = 'net/neoforged/neoforge/network/registration/PayloadRegistrar'
@@ -294,7 +289,7 @@ describe('HF130 R2 — the handler-select ternary is not a gate', function () {
       name: `${PKG}/${name}`,
       methods: [{ name: 'reg', desc: `(L${REG};)V`, flags: 0x0009, code: (a) => a.aload(0).getstatic(`${PKG}/${msg}`, 'TYPE', `L${TYPE};`).aconstNull().aconstNull().invokevirtual(REG, method, REG_DESC).pop().ret() }]
     })
-    const init = buildClass({
+    const init = sides => buildClass({
       name: `${PKG}/ModInit`,
       methods: [{
         name: 'onRegister',
@@ -302,27 +297,31 @@ describe('HF130 R2 — the handler-select ternary is not a gate', function () {
         flags: 0x0009,
         code: (a) => {
           a.aload(0).ldcStr('1').invokevirtual(EVENT, 'registrar', `(Ljava/lang/String;)L${REG};`).astore(1)
-          // if (FMLEnvironment.dist == Dist.CLIENT) ClientSide.reg(r); else ServerSide.reg(r);
-          a.getstatic(ENV, 'dist', `L${DIST};`).getstatic(DIST, 'CLIENT', `L${DIST};`)
-          a.raw([0xa6, 0x00, 0x0a]) // if_acmpne -> the else arm (aload_1 1 + invokestatic 3 + goto 3 = 7, plus this instruction's 3)
-          a.aload(1).invokestatic(`${PKG}/ClientSide`, 'reg', `(L${REG};)V`)
-          a.goto_(7) // over the else arm (aload_1 1 + invokestatic 3, plus this instruction's 3)
-          a.aload(1).invokestatic(`${PKG}/ServerSide`, 'reg', `(L${REG};)V`)
+          for (const side of sides) {
+            if (side === null) a.getstatic(ENV, 'dist', `L${DIST};`)
+            else a.getstatic(DIST, side, `L${DIST};`)
+            a.getstatic(DIST, 'CLIENT', `L${DIST};`).raw([0xa6, 0x00, 0x0a])
+            a.aload(1).invokestatic(`${PKG}/ClientSide`, 'reg', `(L${REG};)V`).goto_(7)
+            a.aload(1).invokestatic(`${PKG}/ServerSide`, 'reg', `(L${REG};)V`)
+          }
           // the join: an unconditional registration reads the registrar from local 1
           return a.aload(1).getstatic(`${PKG}/Cs`, 'TYPE', `L${TYPE};`).aconstNull().aconstNull().invokevirtual(REG, 'playToServer', REG_DESC).pop().ret()
         }
       }]
     })
-    const jar = tmpJar('synthdist.jar', buildJar([
+    const jar = sides => tmpJar('synthdist.jar', buildJar([
       { name: 'META-INF/neoforge.mods.toml', data: Buffer.from(`[[mods]]\nmodId="${NS}"\nversion="1.0.0"\n`) },
       { name: `${PKG}/Sc.class`, data: holder('Sc', 'sc') },
       { name: `${PKG}/Srv.class`, data: holder('Srv', 'srv') },
       { name: `${PKG}/Cs.class`, data: holder('Cs', 'cs') },
       { name: `${PKG}/ClientSide.class`, data: side('ClientSide', 'Sc', 'playToClient') },
       { name: `${PKG}/ServerSide.class`, data: side('ServerSide', 'Srv', 'playToServer') },
-      { name: `${PKG}/ModInit.class`, data: init }
+      { name: `${PKG}/ModInit.class`, data: init(sides) }
     ]))
-    const r = deriveNeoForgeComponents([jar])
+    const undecided = deriveNeoForgeComponents([jar([null])])
+    assert.deepStrictEqual(undecided.components.play.map(c => c.id), [`${NS}:cs`])
+    assert.deepStrictEqual(undecided.diagnostics.unresolvedSites.map(s => [s.kind, s.site]), [['unseen', `${PKG}/ModInit.onRegister(L${EVENT};)V@3`]])
+    const r = deriveNeoForgeComponents([jar(['CLIENT', 'DEDICATED_SERVER'])])
     const rows = r.components.play.filter((c) => c.id.startsWith(`${NS}:`)).map((c) => [c.id, c.flow, c.version, !!c.optional]).sort((a, b) => (a[0] < b[0] ? -1 : 1))
     assert.deepStrictEqual(rows, [[`${NS}:cs`, 'serverbound', '1', false], [`${NS}:sc`, 'clientbound', '1', false], [`${NS}:srv`, 'serverbound', '1', false]], `abstains: ${r.diagnostics.abstains.join(' | ')}`)
     assert.deepStrictEqual(r.diagnostics.abstains, [])
